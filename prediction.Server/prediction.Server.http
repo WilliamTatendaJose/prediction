@@ -1,0 +1,46 @@
+@prediction.Server_HostAddress = http://localhost:5270
+
+GET {{prediction.Server_HostAddress}}/api/inputdata/
+Accept: application/json
+
+###
+POST  {{prediction.Server_HostAddress}}/api/predict/
+Content-Type: application/json
+{
+    "Class": "Abnormal",
+    "Timestamp":"2024-07-04 10:30:00",
+    "UserID": "User123",
+    "LocationID": "Room 101",
+    "Input":"Keypad",
+    "AccessMethod": "Biometrics",
+    "AccessStatus": "Failure",
+    "DayOfWeek": "Tuesday",
+    "HourOfDay": 10,
+    "IsHoliday": "True",
+    "DoorSensorStatus": "Closed",
+    "VibrationSensorReading": 1,
+    "Temperature": 24.0,
+    "Humidity": 42
+}
+###
+Get  {{prediction.Server_HostAddress}}/api/predict/
+
+###
+POST  {{prediction.Server_HostAddress}}/api/inputdaata/
+Content-Type: application/json
+{
+    "Class": "Abnormal",
+    "Timestamp":"2024-07-04 10:30:00",
+    "UserID": "User123",
+    "LocationID": "Room 101",
+    "Input":"Keypad",
+    "AccessMethod": "Biometrics",
+    "AccessStatus": "Failure",
+    "DayOfWeek": "Tuesday",
+    "HourOfDay": 10,
+    "IsHoliday": "True",
+    "DoorSensorStatus": "Closed",
+    "VibrationSensorReading": 1,
+    "Temperature": 24.0,
+    "Humidity": 42
+}
