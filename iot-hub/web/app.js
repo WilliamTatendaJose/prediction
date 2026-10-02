@@ -23,7 +23,7 @@ async function api(path, opts = {}) {
 }
 
 let me = { authEnabled: false, identity: { role: 'admin' } };
-const canManage = () => !me.authEnabled || me.identity?.role === 'admin';
+const canManage = () => !me.authEnabled || ['admin', 'superadmin'].includes(me.identity?.role);
 const canOperate = () => canManage() || me.identity?.role === 'operator';
 
 function showLogin(msg) {

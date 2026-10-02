@@ -197,7 +197,7 @@ func (h *aclHook) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 	if !write {
 		return id.Can(auth.Subscribe, "")
 	}
-	if id.Role == auth.Admin {
+	if id.Role == auth.Admin || id.Role == auth.Superadmin {
 		return true
 	}
 	// Others may publish only sensor data, and only for their sensors:

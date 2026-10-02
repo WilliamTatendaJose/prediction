@@ -22,7 +22,8 @@ func TestCanMatrix(t *testing.T) {
 		{svc, Read, "", true}, {svc, Subscribe, "", true}, {svc, Ingest, "access-1-ml", true},
 		{svc, Ingest, "access-1", false}, {svc, Define, "x-ml", true}, {svc, Manage, "", false},
 		{view, Read, "", true}, {view, Subscribe, "", true}, {view, Ingest, "env-1", false}, {view, Manage, "", false},
-		{adm, Manage, "", true}, {adm, Ingest, "anything", true},
+		{adm, Manage, "", true}, {adm, Ingest, "anything", true}, {adm, Platform, "", false},
+		{&Identity{Role: Superadmin}, Platform, "", true},
 		{nil, Read, "", false},
 	}
 	for _, c := range cases {
@@ -103,8 +104,8 @@ func TestStoreLifecycle(t *testing.T) {
 
 func TestAdminToken(t *testing.T) {
 	s := New("", "boot")
-	if id, ok := s.Authenticate("boot"); !ok || id.Role != Admin {
-		t.Fatal("admin token")
+	if id, ok := s.Authenticate("boot"); !ok || id.Role != Superadmin || !id.Can(Platform, "") || !id.InTenant("any") {
+		t.Fatal("the -token identity is the superadmin")
 	}
 	if _, ok := s.Authenticate(""); ok {
 		t.Fatal("empty token accepted")

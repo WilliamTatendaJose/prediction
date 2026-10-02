@@ -175,7 +175,7 @@ func TestCookieLoginAndCSRF(t *testing.T) {
 		t.Fatalf("bad login: %d", code)
 	}
 	code, m := do(t, c, "POST", e.url+"/api/login", "", `{"token":"`+adminTok+`"}`)
-	if code != 200 || m["role"] != "admin" {
+	if code != 200 || m["role"] != "superadmin" {
 		t.Fatalf("login: %d %v", code, m)
 	}
 	if code, _ := do(t, c, "GET", e.url+"/api/sensors", "", ""); code != 200 {

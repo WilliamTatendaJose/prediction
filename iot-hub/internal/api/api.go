@@ -73,7 +73,9 @@ type Server struct {
 	Reporter      *notify.Notifier  // optional: shift report targets
 	PublicURL     string            // linked from reports
 	Backups       *backup.Scheduler // optional
-	started       time.Time
+	// SelfService: may tenant admins issue device credentials? nil = yes.
+	SelfService func() bool
+	started     time.Time
 }
 
 func (s *Server) Handler() http.Handler {
@@ -127,6 +129,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
 	mux.HandleFunc("POST /api/devices", s.require(auth.Manage, s.addDevice))
 	mux.HandleFunc("DELETE /api/devices/{id}", s.require(auth.Manage, s.deleteDevice))
+	mux.HandleFunc("PATCH /api/devices/{id}", s.require(auth.Manage, s.updateDevice))
+	mux.HandleFunc("POST /api/devices/{id}/rotate", s.require(auth.Manage, s.rotateDevice))
+	mux.HandleFunc("GET /api/devices/{id}/keys", s.require(auth.Manage, s.deviceKeys))
+	mux.HandleFunc("POST /api/devices/{id}/sas", s.require(auth.Manage, s.deviceSAS))
 	if s.Web != nil {
 		// The dashboard shell holds no data, so it loads without a token
 		// and shows a login form when the API answers 401.
