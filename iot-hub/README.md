@@ -421,6 +421,34 @@ registerTile('big-number', {
 
 Option types are `number`, `text` and `select` (`choices: [[value, label]]`). `sensorOptional: true` lets a tile watch all sensors, and `noField: true` hides the field picker.
 
+## Grafana and the full stack
+
+[`deploy/`](deploy/) runs the hub with PostgreSQL and Grafana:
+
+```bash
+cd deploy && cp .env.example .env   # set every password; compose refuses to start without them
+docker compose up -d                # hub :8080 / MQTT :1883, Grafana :3000
+```
+
+- **Least-privilege database roles** ([`postgres/01-roles.sh`](deploy/postgres/01-roles.sh), run once on first start):
+  - the superuser is used only for initialisation
+  - the hub connects as `iothub`, which owns its tables but is not a superuser
+  - Grafana connects as `grafana_ro`: SELECT only, read-only transactions, 30 s statement timeout
+- **Provisioned data source and dashboard** ("IoT Hub — overview"), picking a sensor and field:
+  - summary stats (mean, min, max, std, samples) for the time range
+  - average with a min–max band from the 1-minute rollups, with anomaly episodes as annotations
+  - anomalies by sensor, the anomaly log, and the text-state change log (e.g. door open/close)
+  - an active-anomaly count
+- **Roles of the two dashboards.** Use Grafana for ad-hoc analysis, comparisons and reports. The hub's own dashboard stays the live operations view (sub-second updates, forecasts, writes).
+
+**Tested here:**
+- **Roles script:** run as superuser before any tables existed, as Docker's init does. The hub then created its tables as `iothub`.
+- **Queries:** every dashboard query ran as `grafana_ro` against 24 h of hub-written data, with Grafana's macros (`$__unixEpochFrom/To`, `$__interval_ms`, variables) expanded:
+  - correct values: rollup stats match the data; a 10-minute interval gives 145 buckets with the injected spike as the bucket maximum
+- **Write protection:** writes are refused by `grafana_ro` twice over. With read-only transactions switched off, table and schema privileges still deny INSERT, DELETE, CREATE and DROP.
+- **Compose:** `docker compose config` validates.
+- **Not tested:** Grafana itself (it couldn't be downloaded here) and a real `docker compose up` (no Docker daemon). The panel JSON follows Grafana's schema 39, but treat the first start as the check, and adjust panel options in the UI if a field doesn't render as intended.
+
 ## Efficiency, by design
 
 | Choice | Effect |

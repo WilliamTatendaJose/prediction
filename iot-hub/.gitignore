@@ -1,3 +1,4 @@
 /data/
 /iothub
 /simulate
+/deploy/.env

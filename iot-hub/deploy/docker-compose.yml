@@ -1,0 +1,52 @@
+# Hub + PostgreSQL + Grafana. Usage:  cp .env.example .env  (edit)  &&  docker compose up -d
+# Hub dashboard: http://localhost:8080   Grafana: http://localhost:3000 (admin / $GRAFANA_ADMIN_PASSWORD)
+services:
+  postgres:
+    image: postgres:16-alpine          # or timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: iothub
+      POSTGRES_USER: postgres                 # superuser: used only by the init script
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      IOTHUB_DB_PASSWORD: ${IOTHUB_DB_PASSWORD:?set in .env}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/01-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d iothub"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  iothub:
+    build: ..
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      IOTHUB_DB: postgres://iothub:${IOTHUB_DB_PASSWORD}@postgres:5432/iothub?sslmode=disable
+      IOTHUB_TOKEN: ${IOTHUB_TOKEN:?set in .env}
+      IOTHUB_DATA: /data/iothub.json
+      IOTHUB_AUTH_FILE: /data/devices.json
+    volumes:
+      - hubdata:/data
+    ports: ["8080:8080", "1883:1883"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    depends_on: [postgres]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+    ports: ["3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  hubdata:
+  grafana:
