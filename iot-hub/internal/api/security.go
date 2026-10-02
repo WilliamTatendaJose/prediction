@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +13,16 @@ import (
 )
 
 const cookieName = "iothub_token"
+
+type identityKey struct{}
+
+// actor is who made the request, for the audit log.
+func actor(r *http.Request) string {
+	if id, ok := r.Context().Value(identityKey{}).(*auth.Identity); ok && id != nil {
+		return id.ID
+	}
+	return "unknown"
+}
 
 // identity resolves the caller from "Authorization: Bearer <token>" or the
 // login cookie. viaCookie reports which, for the CSRF check.
@@ -36,7 +48,11 @@ func (s *Server) identity(r *http.Request) (id *auth.Identity, viaCookie, ok boo
 func (s *Server) require(a auth.Action, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if a == auth.Read && s.PublicRead {
-			next(w, r)
+			id, _, ok := s.identity(r)
+			if !ok {
+				id = &auth.Identity{ID: "public", Role: auth.Viewer}
+			}
+			next(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
 			return
 		}
 		id, viaCookie, ok := s.identity(r)
@@ -55,7 +71,7 @@ func (s *Server) require(a auth.Action, next http.HandlerFunc) http.HandlerFunc 
 			writeErr(w, http.StatusForbidden, errors.New(id.ID+" ("+string(id.Role)+") is not allowed to do this"))
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
 	}
 }
 
@@ -149,6 +165,7 @@ func (s *Server) addDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.audit(r, "device.add", req.ID, fmt.Sprintf("role=%s sensors=%v", req.Role, req.Sensors))
 	// The only time the token is ever shown.
 	writeJSON(w, http.StatusCreated, map[string]any{"id": req.ID, "role": req.Role, "sensors": req.Sensors, "token": token})
 }
@@ -162,5 +179,6 @@ func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 	if s.OnRevoke != nil {
 		s.OnRevoke(id) // drop live MQTT sessions
 	}
+	s.audit(r, "device.revoke", id, "")
 	w.WriteHeader(http.StatusNoContent)
 }

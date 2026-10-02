@@ -74,6 +74,7 @@ With no `-token` and no credentials file, the hub is **open**, and it logs a war
 | Role | HTTP | MQTT | Typical holder |
 |---|---|---|---|
 | `admin` | everything, including devices and dashboard layout | publish/subscribe anything | you |
+| `operator` | read; acknowledge and shelve alarms, write notes | subscribe only | shift staff, supervisors |
 | `service` | read; ingest and define **its** sensors | subscribe all; publish its sensors | the ML.NET bridge (`*-ml`) |
 | `device` | ingest to **its** sensors only | publish its sensors only | a PLC gateway, an ESP32 |
 | `viewer` | read only | subscribe only | a wall screen, a supervisor |
@@ -356,6 +357,30 @@ The bridge reconnects with backoff (up to 60 s) and logs only the first failure,
 **Running everything:** `dotnet run --project prediction.AppHost` starts the hub (via `go run`, so Go must be installed), `prediction.Server` with the bridge, the emulator and the React client under Aspire.
 
 Suggested tiles: a `state` tile on `access-1-ml.prediction` (normal value `Normal`), a `line` tile on `risk` (Y 0–1), and an `anomalies` tile on `access-1-ml`.
+
+## Alarm handling (acknowledge, shelve, audit)
+
+Anomaly episodes are alarms that people act on, loosely following ISA-18.2:
+
+- **Acknowledge**, with a verdict and an optional note. The verdict is *confirmed* (a real problem), *false alarm*, or *expected* (maintenance, changeover). The header badge counts **unacknowledged** active alarms: what still needs a person. Acknowledged ones stay visible until they clear.
+- **Notes:** a journal per episode ("replaced the float switch"), shown in the anomaly log.
+- **Shelve** a nuisance alarm for one sensor/field/kind, or a whole sensor:
+  - **Limits:** a **reason is required**, and the maximum is **7 days**, so a forgotten shelf can't silence a sensor forever.
+  - **While shelved:** episodes are still recorded and shown greyed, but don't notify or count as active.
+  - **Ending:** shelves expire on their own or can be removed early.
+- **Audit log** (`GET /api/audit`, admin): who acknowledged, shelved or noted what, plus configuration changes (sensor definitions, dashboard, devices).
+- **Training labels** (`GET /api/labels.csv?from=-90d`): every acknowledged episode with its verdict, ready to join with readings when a model is trained on real data. Free text is defused against spreadsheet formula injection.
+
+The `operator` role can do all of this but can't change configuration; viewers see the state only. Everything persists in the database and survives restarts; without a database it is kept in memory.
+
+| Method | Path | Role |
+|---|---|---|
+| POST | `/api/anomalies/{id}/ack` `{"verdict":"false_alarm","note":"…"}` | operator |
+| POST / GET | `/api/anomalies/{id}/notes` | operator / viewer |
+| GET / POST | `/api/shelves` `{"sensor","field","kind","duration":"8h","reason"}` | viewer / operator |
+| DELETE | `/api/shelves/{key}` | operator |
+| GET | `/api/audit?from=-30d` | admin |
+| GET | `/api/labels.csv?from=-90d` | viewer |
 
 ## Notifications
 

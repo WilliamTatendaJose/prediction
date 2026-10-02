@@ -4,6 +4,7 @@
 //
 //	admin    everything, including device and dashboard management
 //	service  read, subscribe, ingest and define matching sensors (e.g. the ML bridge)
+//	operator read, plus acknowledge/shelve alarms and write notes
 //	device   ingest/publish to matching sensors only
 //	viewer   read-only (dashboard, API reads, MQTT subscribe)
 //
@@ -32,13 +33,16 @@ import (
 type Role string
 
 const (
-	Admin   Role = "admin"
-	Service Role = "service"
-	Device  Role = "device"
-	Viewer  Role = "viewer"
+	Admin    Role = "admin"
+	Operator Role = "operator"
+	Service  Role = "service"
+	Device   Role = "device"
+	Viewer   Role = "viewer"
 )
 
-func (r Role) Valid() bool { return r == Admin || r == Service || r == Device || r == Viewer }
+func (r Role) Valid() bool {
+	return r == Admin || r == Operator || r == Service || r == Device || r == Viewer
+}
 
 type Action int
 
@@ -48,6 +52,7 @@ const (
 	Ingest                  // HTTP data / MQTT publish for a sensor
 	Define                  // create/update/delete a sensor definition
 	Manage                  // dashboard layout, devices
+	Operate                 // acknowledge/shelve alarms, notes
 )
 
 // Identity is an authenticated caller.
@@ -87,6 +92,8 @@ func (i *Identity) Can(a Action, sensor string) bool {
 		}
 	case Device:
 		return a == Ingest && i.matches(sensor)
+	case Operator:
+		return a == Read || a == Subscribe || a == Operate
 	case Viewer:
 		return a == Read || a == Subscribe
 	}
@@ -172,7 +179,7 @@ func (s *Store) Add(id string, role Role, sensors []string, note string) (string
 		return "", fmt.Errorf("%w: id must match %s and not be reserved", ErrInvalid, idRe)
 	}
 	if !role.Valid() {
-		return "", fmt.Errorf("%w: role must be admin, service, device or viewer", ErrInvalid)
+		return "", fmt.Errorf("%w: role must be admin, operator, service, device or viewer", ErrInvalid)
 	}
 	for _, p := range sensors {
 		if _, err := path.Match(p, ""); err != nil {

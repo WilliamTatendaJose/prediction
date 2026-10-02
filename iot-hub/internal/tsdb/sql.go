@@ -77,6 +77,13 @@ func (s *sqlDB) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS anomalies (id TEXT PRIMARY KEY, sensor TEXT NOT NULL, field TEXT NOT NULL, kind TEXT NOT NULL, start_ts BIGINT NOT NULL, end_ts BIGINT, value DOUBLE PRECISION, score DOUBLE PRECISION, message TEXT)`,
 		`CREATE INDEX IF NOT EXISTS anomalies_start ON anomalies (start_ts)`,
 		`CREATE INDEX IF NOT EXISTS anomalies_sensor ON anomalies (sensor, start_ts)`,
+		// Alarm handling. Separate tables, so older databases need no migration.
+		`CREATE TABLE IF NOT EXISTS alarm_acks (event_id TEXT PRIMARY KEY, by_actor TEXT NOT NULL, at BIGINT NOT NULL, verdict TEXT, note TEXT)`,
+		`CREATE TABLE IF NOT EXISTS alarm_notes (id ` + id + `, event_id TEXT NOT NULL, ts BIGINT NOT NULL, by_actor TEXT NOT NULL, text TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS alarm_notes_event ON alarm_notes (event_id, ts)`,
+		`CREATE TABLE IF NOT EXISTS alarm_shelves (key TEXT PRIMARY KEY, sensor TEXT NOT NULL, field TEXT NOT NULL, kind TEXT NOT NULL, until_ts BIGINT NOT NULL, by_actor TEXT NOT NULL, reason TEXT NOT NULL, created BIGINT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS audit_log (id ` + id + `, ts BIGINT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, detail TEXT)`,
+		`CREATE INDEX IF NOT EXISTS audit_log_ts ON audit_log (ts)`,
 	}
 	for _, q := range ddl {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -398,6 +405,16 @@ func (s *sqlDB) Events(ctx context.Context, eq EventQuery) ([]anomaly.Event, err
 	return out, rows.Err()
 }
 
+func (s *sqlDB) Event(ctx context.Context, id string) (anomaly.Event, bool, error) {
+	var e anomaly.Event
+	err := s.db.QueryRowContext(ctx, s.q(`SELECT id, sensor, field, kind, start_ts, COALESCE(end_ts, 0), COALESCE(value, 0), COALESCE(score, 0), COALESCE(message, '')
+		FROM anomalies WHERE id = ?`), id).Scan(&e.ID, &e.Sensor, &e.Field, &e.Kind, &e.Start, &e.End, &e.Value, &e.Score, &e.Message)
+	if errors.Is(err, sql.ErrNoRows) {
+		return e, false, nil
+	}
+	return e, err == nil, err
+}
+
 func (s *sqlDB) Prune(ctx context.Context, rawBefore, rollupBefore, eventsBefore int64) error {
 	ids := []int64{}
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM series`)
@@ -428,9 +445,141 @@ func (s *sqlDB) Prune(ctx context.Context, rawBefore, rollupBefore, eventsBefore
 		}
 	}
 	if eventsBefore > 0 {
-		if _, err := s.db.ExecContext(ctx, s.q(`DELETE FROM anomalies WHERE start_ts < ? AND end_ts IS NOT NULL`), eventsBefore); err != nil {
-			return err
+		for _, q := range []string{
+			`DELETE FROM anomalies WHERE start_ts < ? AND end_ts IS NOT NULL`,
+			`DELETE FROM audit_log WHERE ts < ?`,
+		} {
+			if _, err := s.db.ExecContext(ctx, s.q(q), eventsBefore); err != nil {
+				return err
+			}
+		}
+		// Acks and notes go with their episodes.
+		for _, q := range []string{
+			`DELETE FROM alarm_acks WHERE event_id NOT IN (SELECT id FROM anomalies)`,
+			`DELETE FROM alarm_notes WHERE event_id NOT IN (SELECT id FROM anomalies)`,
+		} {
+			if _, err := s.db.ExecContext(ctx, q); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// ---- alarm handling ---------------------------------------------------------
+
+func (s *sqlDB) SaveAck(ctx context.Context, eventID string, a anomaly.Ack) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO alarm_acks (event_id, by_actor, at, verdict, note) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (event_id) DO UPDATE SET by_actor = excluded.by_actor, at = excluded.at, verdict = excluded.verdict, note = excluded.note`),
+		eventID, a.By, a.At, a.Verdict, a.Note)
+	return err
+}
+
+func (s *sqlDB) Acks(ctx context.Context) (map[string]anomaly.Ack, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT event_id, by_actor, at, COALESCE(verdict, ''), COALESCE(note, '') FROM alarm_acks`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]anomaly.Ack{}
+	for rows.Next() {
+		var id string
+		var a anomaly.Ack
+		if err := rows.Scan(&id, &a.By, &a.At, &a.Verdict, &a.Note); err != nil {
+			return nil, err
+		}
+		out[id] = a
+	}
+	return out, rows.Err()
+}
+
+func (s *sqlDB) SaveNote(ctx context.Context, n anomaly.Note) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO alarm_notes (event_id, ts, by_actor, text) VALUES (?, ?, ?, ?)`), n.EventID, n.TS, n.By, n.Text)
+	return err
+}
+
+func (s *sqlDB) Notes(ctx context.Context, eventID string) ([]anomaly.Note, error) {
+	rows, err := s.db.QueryContext(ctx, s.q(`SELECT event_id, ts, by_actor, text FROM alarm_notes WHERE event_id = ? ORDER BY ts`), eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []anomaly.Note{}
+	for rows.Next() {
+		var n anomaly.Note
+		if err := rows.Scan(&n.EventID, &n.TS, &n.By, &n.Text); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqlDB) NoteCounts(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT event_id, COUNT(*) FROM alarm_notes GROUP BY event_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+func (s *sqlDB) SaveShelf(ctx context.Context, sh anomaly.Shelf) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO alarm_shelves (key, sensor, field, kind, until_ts, by_actor, reason, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (key) DO UPDATE SET until_ts = excluded.until_ts, by_actor = excluded.by_actor, reason = excluded.reason, created = excluded.created`),
+		sh.Key, sh.Sensor, sh.Field, sh.Kind, sh.Until, sh.By, sh.Reason, sh.Created)
+	return err
+}
+
+func (s *sqlDB) DeleteShelf(ctx context.Context, key string) error {
+	_, err := s.db.ExecContext(ctx, s.q(`DELETE FROM alarm_shelves WHERE key = ?`), key)
+	return err
+}
+
+func (s *sqlDB) Shelves(ctx context.Context) ([]anomaly.Shelf, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, sensor, field, kind, until_ts, by_actor, reason, created FROM alarm_shelves`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []anomaly.Shelf{}
+	for rows.Next() {
+		var sh anomaly.Shelf
+		if err := rows.Scan(&sh.Key, &sh.Sensor, &sh.Field, &sh.Kind, &sh.Until, &sh.By, &sh.Reason, &sh.Created); err != nil {
+			return nil, err
+		}
+		out = append(out, sh)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqlDB) SaveAudit(ctx context.Context, a anomaly.AuditEntry) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO audit_log (ts, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)`), a.TS, a.Actor, a.Action, a.Target, a.Detail)
+	return err
+}
+
+func (s *sqlDB) Audit(ctx context.Context, from int64, limit int) ([]anomaly.AuditEntry, error) {
+	rows, err := s.db.QueryContext(ctx, s.q(`SELECT ts, actor, action, target, COALESCE(detail, '') FROM audit_log WHERE ts >= ? ORDER BY ts DESC LIMIT ?`), from, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []anomaly.AuditEntry{}
+	for rows.Next() {
+		var a anomaly.AuditEntry
+		if err := rows.Scan(&a.TS, &a.Actor, &a.Action, &a.Target, &a.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }

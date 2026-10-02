@@ -31,6 +31,26 @@ type Event struct {
 	Value   float64 `json:"value"`         // value that opened the episode
 	Score   float64 `json:"score,omitempty"`
 	Message string  `json:"message"`
+
+	// Alarm handling, filled in by package alarm (never by the detector).
+	Ack     *Ack `json:"ack,omitempty"`
+	Shelved bool `json:"shelved,omitempty"`
+	Notes   int  `json:"notes,omitempty"`
+}
+
+// Verdicts recorded on acknowledgement. They double as training labels.
+const (
+	VerdictConfirmed  = "confirmed"   // a real problem
+	VerdictFalseAlarm = "false_alarm" // nothing was wrong
+	VerdictExpected   = "expected"    // known cause: maintenance, changeover, test
+)
+
+// Ack is an operator's acknowledgement of an episode.
+type Ack struct {
+	By      string `json:"by"`
+	At      int64  `json:"at"`
+	Verdict string `json:"verdict,omitempty"`
+	Note    string `json:"note,omitempty"`
 }
 
 // Rule is the per-field configuration (store.Field.Detect).
@@ -366,4 +386,34 @@ func dur(ms float64) string {
 		return d.Round(100 * time.Millisecond).String()
 	}
 	return d.Round(time.Second).String()
+}
+
+// Note is a journal entry on an episode ("replaced probe", "ack").
+type Note struct {
+	EventID string `json:"eventId"`
+	TS      int64  `json:"ts"`
+	By      string `json:"by"`
+	Text    string `json:"text"`
+}
+
+// Shelf suppresses notifications and active status for matching episodes
+// until Until. Empty Field/Kind match all.
+type Shelf struct {
+	Key     string `json:"key"`
+	Sensor  string `json:"sensor"`
+	Field   string `json:"field,omitempty"`
+	Kind    string `json:"kind,omitempty"`
+	Until   int64  `json:"until"`
+	By      string `json:"by"`
+	Reason  string `json:"reason"`
+	Created int64  `json:"created"`
+}
+
+// AuditEntry records who changed what.
+type AuditEntry struct {
+	TS     int64  `json:"ts"`
+	Actor  string `json:"actor"`
+	Action string `json:"action"`
+	Target string `json:"target"`
+	Detail string `json:"detail,omitempty"`
 }

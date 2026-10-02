@@ -21,6 +21,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
@@ -64,6 +66,7 @@ type Server struct {
 	OnRevoke      func(id string)
 	Connectors    func() []connect.Status // optional
 	Notifier      *notify.Notifier        // optional
+	Alarms        *alarm.Manager
 	started       time.Time
 }
 
@@ -93,6 +96,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/dashboard", s.require(auth.Manage, s.putDashboard))
 	mux.HandleFunc("GET /api/stream", read(s.stream))
 	mux.HandleFunc("GET /api/connectors", read(s.connectors))
+	if s.Alarms == nil {
+		s.Alarms = alarm.New(nil)
+	}
+	mux.HandleFunc("POST /api/anomalies/{eid}/ack", s.require(auth.Operate, s.ackEvent))
+	mux.HandleFunc("POST /api/anomalies/{eid}/notes", s.require(auth.Operate, s.addNote))
+	mux.HandleFunc("GET /api/anomalies/{eid}/notes", read(s.listNotes))
+	mux.HandleFunc("GET /api/shelves", read(s.listShelves))
+	mux.HandleFunc("POST /api/shelves", s.require(auth.Operate, s.shelve))
+	mux.HandleFunc("DELETE /api/shelves/{key}", s.require(auth.Operate, s.unshelve))
+	mux.HandleFunc("GET /api/audit", s.require(auth.Manage, s.auditLog))
+	mux.HandleFunc("GET /api/labels.csv", read(s.labels))
 	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))
 	mux.HandleFunc("POST /api/notifications/test", s.require(auth.Manage, s.testNotification))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
@@ -228,6 +242,9 @@ func (s *Server) putSensor(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	if b, err := json.Marshal(def.Fields); err == nil {
+		s.audit(r, "sensor.define", def.ID, string(b))
+	}
 	v, _ := s.Store.Get(def.ID)
 	writeJSON(w, http.StatusOK, v)
 }
@@ -240,6 +257,7 @@ func (s *Server) deleteSensor(w http.ResponseWriter, r *http.Request) {
 	if s.Detector != nil {
 		s.Detector.Forget(r.PathValue("id"))
 	}
+	s.audit(r, "sensor.delete", r.PathValue("id"), "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -296,6 +314,7 @@ func (s *Server) putDashboard(w http.ResponseWriter, r *http.Request) {
 		storeErr(w, err)
 		return
 	}
+	s.audit(r, "dashboard.save", "dashboard", fmt.Sprintf("%d bytes", len(body)))
 	w.WriteHeader(http.StatusNoContent)
 }
 

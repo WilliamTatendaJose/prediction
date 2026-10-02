@@ -162,8 +162,8 @@ func (n *Notifier) Targets() []*Target { return n.cfg.Targets }
 
 // Notify is called for every episode open/close. It never blocks.
 func (n *Notifier) Notify(e anomaly.Event) {
-	if len(n.cfg.Targets) == 0 || (len(n.cfg.Kinds) > 0 && !n.cfg.Kinds[e.Kind]) {
-		return
+	if len(n.cfg.Targets) == 0 || e.Shelved || (len(n.cfg.Kinds) > 0 && !n.cfg.Kinds[e.Kind]) {
+		return // shelved: an operator has taken this alarm out of service
 	}
 	key := e.Sensor + "\x00" + e.Field + "\x00" + e.Kind
 	now := time.Now()

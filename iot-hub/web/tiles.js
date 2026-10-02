@@ -11,7 +11,7 @@
 //   sensorOptional,        // true: may watch all sensors (cfg.sensor empty)
 //   noField,               // true: takes no field
 // ctx = { sensor, unit(field), history(field, limit) -> Promise<{t:[],v:[]}>,
-//         api(path) -> Promise<json>, invalidate() }
+//         api(path, opts) -> Promise<json>, can(action), invalidate() }
 // update() only records data; render() runs at most once per animation frame.
 // Optional anomaly(event) receives anomaly episodes for the tile's sensor
 // (or all sensors when cfg.sensor is empty).
@@ -526,21 +526,83 @@ registerTile('stats', {
 });
 
 // ---- anomalies: recent episodes, open ones first --------------------------
+const VERDICTS = [['confirmed', 'Confirmed problem'], ['false_alarm', 'False alarm'], ['expected', 'Expected (maintenance, changeover)']];
+const verdictLabel = Object.fromEntries(VERDICTS.map(([k, v]) => [k, v.split(' (')[0]]));
+
+function el_(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function select(name, choices) {
+  const s = el_('select'); s.name = name;
+  for (const [v, t] of choices) { const o = el_('option', null, t); o.value = v; s.append(o); }
+  return s;
+}
+
+// ---- anomalies: episode log with acknowledge / shelve / notes -------------
 registerTile('anomalies', {
-  label: 'Anomaly log',
+  label: 'Anomaly log (acknowledge, shelve)',
   sensorOptional: true,
   noField: true,
   defaultSize: { w: 2, h: 2 },
   options: [],
   create(el, cfg, ctx) {
-    const h = document.createElement('h2');
-    h.textContent = cfg.title || (cfg.sensor ? `Anomalies · ${ctx.sensor?.name || cfg.sensor}` : 'Anomalies');
-    const list = document.createElement('ul'); list.className = 'alog';
-    el.append(h, list);
-    let evs = [];
+    const h = el_('h2', null, cfg.title || (cfg.sensor ? `Anomalies · ${ctx.sensor?.name || cfg.sensor}` : 'Anomalies'));
+    const shelfBox = el_('div', 'shelves');
+    const list = el_('ul', 'alog');
+    el.append(h, shelfBox, list);
+    let evs = [], shelves = [], editing = null; // editing: {id, mode} while a form is open
     const q = cfg.sensor ? `&sensor=${encodeURIComponent(cfg.sensor)}` : '';
-    ctx.api(`/api/anomalies?limit=50${q}`).then((r) => { evs = r; ctx.invalidate(); }).catch(() => {});
+    const refresh = () => Promise.all([
+      ctx.api(`/api/anomalies?limit=50${q}`).then((r) => { evs = r; }),
+      ctx.api('/api/shelves').then((r) => { shelves = cfg.sensor ? r.filter((x) => x.sensor === cfg.sensor) : r; }),
+    ]).catch(() => {}).then(() => ctx.invalidate());
+    refresh();
     const ago = (ms) => { const s = (Date.now() - ms) / 1000; return s < 90 ? `${Math.round(s)}s ago` : s < 5400 ? `${Math.round(s / 60)}m ago` : s < 129600 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`; };
+    const clock = new Intl.DateTimeFormat(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    const post = (path, body) => ctx.api(path, { method: 'POST', body: JSON.stringify(body) });
+
+    function form(e, mode) {
+      const f = el_('form', 'aform');
+      const err = el_('div', 'sub');
+      if (mode === 'ack') {
+        const v = select('verdict', VERDICTS);
+        const n = el_('input'); n.name = 'note'; n.placeholder = 'Note (optional): what happened, what was done'; n.maxLength = 1000;
+        f.append(v, n);
+      } else if (mode === 'shelve') {
+        const scope = select('scope', [['field', `Only ${e.field || e.kind}`], ['sensor', `All of ${e.sensor}`]]);
+        const d = select('duration', [['1h', '1 hour'], ['8h', '8 hours (a shift)'], ['24h', '24 hours'], ['168h', '7 days']]);
+        const r = el_('input'); r.name = 'reason'; r.placeholder = 'Reason (required), e.g. sensor being replaced'; r.required = true; r.maxLength = 200;
+        f.append(scope, d, r);
+      } else {
+        const n = el_('input'); n.name = 'text'; n.placeholder = 'Add a note'; n.required = true; n.maxLength = 2000;
+        f.append(n);
+      }
+      const ok = el_('button', 'primary', mode === 'ack' ? 'Acknowledge' : mode === 'shelve' ? 'Shelve' : 'Add note');
+      const cancel = el_('button', null, 'Cancel'); cancel.type = 'button';
+      cancel.onclick = () => { editing = null; ctx.invalidate(); };
+      f.append(ok, cancel, err);
+      f.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const d = Object.fromEntries(new FormData(f));
+        try {
+          if (mode === 'ack') await post(`/api/anomalies/${encodeURIComponent(e.id)}/ack`, { verdict: d.verdict, note: d.note });
+          else if (mode === 'note') await post(`/api/anomalies/${encodeURIComponent(e.id)}/notes`, { text: d.text });
+          else await post('/api/shelves', { sensor: e.sensor, field: d.scope === 'field' ? e.field : '', kind: d.scope === 'field' ? e.kind : '', duration: d.duration, reason: d.reason });
+          editing = null;
+          refresh();
+        } catch (x) { err.textContent = x.message; }
+      };
+      return f;
+    }
+
+    async function showNotes(e, box) {
+      const ns = await ctx.api(`/api/anomalies/${encodeURIComponent(e.id)}/notes`).catch(() => []);
+      box.replaceChildren(...ns.map((n) => el_('div', 'note', `${clock.format(n.ts)} · ${n.by}: ${n.text}`)));
+    }
+
     return {
       update() {},
       anomaly(ev) {
@@ -548,19 +610,53 @@ registerTile('anomalies', {
         if (i >= 0) evs[i] = ev; else evs.unshift(ev);
         if (evs.length > 50) evs.length = 50;
       },
+      alarmsChanged() { refresh(); },
       render() {
+        if (editing) return; // never rebuild under someone's typing
+        shelfBox.replaceChildren();
+        for (const sh of shelves) {
+          const row = el_('div', 'shelf');
+          const what = `${sh.sensor}${sh.field ? '.' + sh.field : ' (all fields)'}${sh.kind ? ' · ' + sh.kind : ''}`;
+          row.append(el_('span', null, `Shelved: ${what} until ${clock.format(sh.until)} — ${sh.reason} (${sh.by})`));
+          if (ctx.can('operate')) {
+            const b = el_('button', null, 'Unshelve');
+            b.onclick = async () => { await ctx.api(`/api/shelves/${encodeURIComponent(sh.key)}`, { method: 'DELETE' }).catch(() => {}); refresh(); };
+            row.append(b);
+          }
+          shelfBox.append(row);
+        }
         list.replaceChildren();
-        const sorted = [...evs].sort((a, b) => (!a.end - !b.end) * -1 || b.start - a.start);
-        if (!sorted.length) { const li = document.createElement('li'); li.className = 'sub'; li.textContent = 'No anomalies recorded.'; list.append(li); }
+        // Unacknowledged active first, then acknowledged active, then history.
+        const rank = (e) => (e.end ? 3 : e.shelved ? 2 : e.ack ? 1 : 0);
+        const sorted = [...evs].sort((a, b) => rank(a) - rank(b) || b.start - a.start);
+        if (!sorted.length) list.append(el_('li', 'sub', 'No anomalies recorded.'));
         for (const e of sorted.slice(0, 30)) {
-          const li = document.createElement('li');
-          const st = statusEl(); setStatus(st, e.end ? ['muted', 'Resolved'] : ['critical', 'Active']);
-          const kind = document.createElement('b'); kind.textContent = `${e.kind} · ${e.sensor}${e.field ? '.' + e.field : ''}`;
-          const msg = document.createElement('div'); msg.className = 'msg'; msg.textContent = e.message;
-          const when = document.createElement('span'); when.className = 'sub';
+          const li = el_('li');
+          const st = statusEl();
+          setStatus(st, e.end ? ['muted', 'Resolved'] : e.shelved ? ['muted', 'Shelved'] : e.ack ? ['warning', 'Acknowledged'] : ['critical', 'Active']);
+          const kind = el_('b', null, `${e.kind} · ${e.sensor}${e.field ? '.' + e.field : ''}`);
           const secs = (e.end - e.start) / 1000;
-          when.textContent = e.end ? `${ago(e.start)} · lasted ${secs < 1 ? '<1s' : secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + 'm'}` : `since ${ago(e.start)}`;
+          const when = el_('span', 'sub', e.end ? `${ago(e.start)} · lasted ${secs < 1 ? '<1s' : secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + 'm'}` : `since ${ago(e.start)}`);
+          const msg = el_('div', 'msg', e.message);
           li.append(st, kind, when, msg);
+          if (e.ack) {
+            li.append(el_('div', 'msg ack', `✓ ${e.ack.by}${e.ack.verdict ? ' · ' + verdictLabel[e.ack.verdict] : ''}${e.ack.note ? ' · ' + e.ack.note : ''}`));
+          }
+          const actions = el_('div', 'msg actions');
+          if (ctx.can('operate')) {
+            for (const [mode, label] of [[e.ack ? 'ack' : 'ack', e.ack ? 'Change verdict' : 'Acknowledge'], ['note', 'Note'], ...(e.end || e.shelved ? [] : [['shelve', 'Shelve']])]) {
+              const b = el_('button', null, label);
+              b.onclick = () => { editing = { id: e.id, mode }; li.append(form(e, mode)); };
+              actions.append(b);
+            }
+          }
+          if (e.notes) {
+            const b = el_('button', 'link', `${e.notes} note${e.notes > 1 ? 's' : ''}`);
+            const box = el_('div', 'msg');
+            b.onclick = () => showNotes(e, box);
+            actions.append(b);
+            li.append(actions, box);
+          } else if (actions.childElementCount) li.append(actions);
           list.append(li);
         }
       },

@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
@@ -181,6 +182,21 @@ func main() {
 		pipe.Writer, an.DB, srv.Writer = writer, db, writer
 		log.Info("database", "url", redact(*dbURL), "rawRetention", *rawKeep, "rollupRetention", *rollupKeep)
 	}
+
+	// Alarm handling: acks, notes, shelves, audit log (persisted with a DB).
+	var alarmStore tsdb.AlarmStore
+	if an.DB != nil {
+		alarmStore = an.DB
+	}
+	alarms := alarm.New(alarmStore)
+	if err := alarms.Load(ctx); err != nil {
+		log.Error("load alarm state", "err", err)
+		os.Exit(1)
+	}
+	alarms.OnChange = func(kind string) {
+		hub.Publish(&stream.Msg{Event: "alarms", Data: []byte(`{"kind":"` + kind + `"}`)})
+	}
+	pipe.Alarms, an.Alarms, srv.Alarms = alarms, alarms, alarms
 
 	var notifier *notify.Notifier
 	if len(notifySpecs) > 0 {

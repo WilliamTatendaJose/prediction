@@ -8,6 +8,7 @@ import (
 	"context"
 	"math"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
@@ -17,6 +18,34 @@ type Service struct {
 	Store    *store.Store
 	DB       tsdb.DB // nil = memory only
 	Detector *anomaly.Detector
+	Alarms   *alarm.Manager // optional: adds ack/shelved/notes to events
+}
+
+func (s *Service) decorate(evs []anomaly.Event) []anomaly.Event {
+	if s.Alarms != nil {
+		return s.Alarms.Decorate(evs)
+	}
+	return evs
+}
+
+// Event finds one episode: open/recent ones from the detector (authoritative
+// for what is open), older ones from the database.
+func (s *Service) Event(ctx context.Context, id string) (anomaly.Event, bool, error) {
+	if s.Detector != nil {
+		for _, e := range s.Detector.Recent() {
+			if e.ID == id {
+				return s.decorate([]anomaly.Event{e})[0], true, nil
+			}
+		}
+	}
+	if s.DB != nil {
+		e, ok, err := s.DB.Event(ctx, id)
+		if ok {
+			e = s.decorate([]anomaly.Event{e})[0]
+		}
+		return e, ok, err
+	}
+	return anomaly.Event{}, false, nil
 }
 
 // Series is columnar: index i of every slice describes bucket i.
@@ -139,7 +168,8 @@ func (s *Service) memSeries(sensor, field string, from, to, bucket int64) ([]tsd
 // come from the detector, which is authoritative for what is open now.
 func (s *Service) Events(ctx context.Context, q tsdb.EventQuery) ([]anomaly.Event, error) {
 	if s.DB != nil && !q.ActiveOnly {
-		return s.DB.Events(ctx, q)
+		evs, err := s.DB.Events(ctx, q)
+		return s.decorate(evs), err
 	}
 	out := []anomaly.Event{}
 	if s.Detector == nil {
@@ -158,5 +188,5 @@ func (s *Service) Events(ctx context.Context, q tsdb.EventQuery) ([]anomaly.Even
 			break
 		}
 	}
-	return out, nil
+	return s.decorate(out), nil
 }

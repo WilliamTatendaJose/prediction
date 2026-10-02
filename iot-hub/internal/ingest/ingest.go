@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
@@ -23,6 +24,8 @@ type Pipeline struct {
 	// OnEvent receives every anomaly open/close (e.g. MQTT publish). Set
 	// before ingestion starts.
 	OnEvent func(anomaly.Event)
+	// Alarms marks episodes as shelved/acknowledged before they go out.
+	Alarms *alarm.Manager
 }
 
 // Handle accepts either a JSON object of fields ({"temp":21.5,"door":"open"})
@@ -79,6 +82,9 @@ func (p *Pipeline) HandleValues(sensor string, ts int64, values map[string]any) 
 // Emit distributes anomaly episodes to the live stream, the database and
 // OnEvent.
 func (p *Pipeline) Emit(evs []anomaly.Event) {
+	if p.Alarms != nil {
+		evs = p.Alarms.Decorate(evs)
+	}
 	for _, e := range evs {
 		if msg, err := json.Marshal(e); err == nil {
 			p.Hub.Publish(&stream.Msg{Event: "anomaly", Sensor: e.Sensor, Data: msg})

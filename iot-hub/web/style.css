@@ -126,3 +126,15 @@ dialog select[multiple] { height: 90px; }
 .alog li b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .alog li .msg { grid-column: 2 / -1; color: var(--ink-2); }
 [hidden] { display: none !important; }
+
+.alerts[data-level="acked"]::before { background: var(--warning); color: #0b0b0b; }
+.shelves .shelf { display: flex; gap: 8px; align-items: center; justify-content: space-between; font-size: 12px; color: var(--ink-2);
+  background: var(--page); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
+.alog .ack { color: var(--ink-2); }
+.alog .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+.alog .actions button { padding: 1px 8px; font-size: 11px; }
+.alog button.link { border: 0; background: none; color: var(--s1); padding: 1px 2px; text-decoration: underline; }
+.alog .note { font-size: 11px; color: var(--ink-2); padding-left: 8px; border-left: 2px solid var(--grid); margin-top: 2px; }
+.aform { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0; }
+.aform input { flex: 1 1 200px; }
+.aform .sub { flex-basis: 100%; color: var(--critical); }

@@ -24,6 +24,7 @@ async function api(path, opts = {}) {
 
 let me = { authEnabled: false, identity: { role: 'admin' } };
 const canManage = () => !me.authEnabled || me.identity?.role === 'admin';
+const canOperate = () => canManage() || me.identity?.role === 'operator';
 
 function showLogin(msg) {
   const d = $('login');
@@ -92,6 +93,7 @@ function mountTile(cfg) {
   } else {
     const ctx = {
       sensor,
+      can: (a) => (a === 'operate' ? canOperate() : a === 'manage' ? canManage() : true),
       api,
       unit: (f) => sensor?.fields?.[f]?.unit || '',
       history: (f, limit) => api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/history?field=${encodeURIComponent(f)}&limit=${limit}`).catch(() => ({ t: [], v: [] })),
@@ -149,9 +151,10 @@ function connect() {
       } else if (cfg.field in r.v) { inst.update(r.t, r.v[cfg.field]); invalidate(id); }
     }
   };
+  es.addEventListener('alarms', onAlarmsChanged);
   es.addEventListener('anomaly', (ev) => {
     const a = JSON.parse(ev.data);
-    if (a.end) active.delete(a.id); else active.set(a.id, a);
+    if (a.end || a.shelved) active.delete(a.id); else active.set(a.id, a);
     renderAlerts();
     for (const [id, { cfg, inst }] of live) {
       if (inst.anomaly && (!cfg.sensor || cfg.sensor === a.sensor)) { inst.anomaly(a); invalidate(id); }
@@ -159,18 +162,30 @@ function connect() {
   });
 }
 
+// Someone acknowledged or shelved: refresh counts and alarm tiles.
+function onAlarmsChanged() {
+  loadActive();
+  for (const [id, { inst }] of live) if (inst.alarmsChanged) { inst.alarmsChanged(); invalidate(id); }
+}
+
 async function loadActive() {
   const list = await api('/api/anomalies?active=1&limit=1000').catch(() => []);
   active.clear();
-  for (const a of list) active.set(a.id, a);
+  for (const a of list) if (!a.shelved) active.set(a.id, a);
   renderAlerts();
 }
 
+// The badge counts what still needs a person: active, unshelved, unacknowledged.
 function renderAlerts() {
   const el = $('alerts');
-  el.hidden = active.size === 0;
-  el.textContent = `${active.size} active anomal${active.size === 1 ? 'y' : 'ies'}`;
-  el.title = [...active.values()].slice(0, 10).map((a) => `${a.sensor}${a.field ? '.' + a.field : ''}: ${a.message}`).join('\n');
+  const open = [...active.values()];
+  const unacked = open.filter((a) => !a.ack);
+  el.hidden = open.length === 0;
+  el.dataset.level = unacked.length ? 'unacked' : 'acked';
+  el.textContent = unacked.length
+    ? `${unacked.length} unacknowledged alarm${unacked.length === 1 ? '' : 's'}`
+    : `${open.length} active (acknowledged)`;
+  el.title = open.slice(0, 10).map((a) => `${a.ack ? '✓ ' : ''}${a.sensor}${a.field ? '.' + a.field : ''}: ${a.message}`).join('\n');
 }
 
 function markStale() {

@@ -66,6 +66,7 @@ type DB interface {
 	Series(ctx context.Context, sensor, field string, from, to, bucket int64) ([]Bucket, error)
 	Stats(ctx context.Context, sensor, field string, from, to int64) (Stats, error)
 	Events(ctx context.Context, q EventQuery) ([]anomaly.Event, error)
+	Event(ctx context.Context, id string) (anomaly.Event, bool, error)
 	// Latest calls fn for every series with its newest numeric points (up to
 	// limit, oldest first) and its newest text value, for restoring live
 	// state after a restart.
@@ -73,6 +74,7 @@ type DB interface {
 	// CloseOpenEvents ends episodes left open by a previous run.
 	CloseOpenEvents(ctx context.Context, at int64) error
 	Prune(ctx context.Context, rawBefore, rollupBefore, eventsBefore int64) error
+	AlarmStore
 	Close() error
 }
 
@@ -241,4 +243,18 @@ func AutoBucket(from, to int64, target int) int64 {
 		}
 	}
 	return steps[len(steps)-1] * ((want + steps[len(steps)-1] - 1) / steps[len(steps)-1])
+}
+
+// AlarmStore persists acknowledgements, notes, shelves and the audit log.
+type AlarmStore interface {
+	SaveAck(ctx context.Context, eventID string, a anomaly.Ack) error
+	Acks(ctx context.Context) (map[string]anomaly.Ack, error)
+	SaveNote(ctx context.Context, n anomaly.Note) error
+	Notes(ctx context.Context, eventID string) ([]anomaly.Note, error)
+	NoteCounts(ctx context.Context) (map[string]int, error)
+	SaveShelf(ctx context.Context, s anomaly.Shelf) error
+	DeleteShelf(ctx context.Context, key string) error
+	Shelves(ctx context.Context) ([]anomaly.Shelf, error)
+	SaveAudit(ctx context.Context, a anomaly.AuditEntry) error
+	Audit(ctx context.Context, from int64, limit int) ([]anomaly.AuditEntry, error)
 }
