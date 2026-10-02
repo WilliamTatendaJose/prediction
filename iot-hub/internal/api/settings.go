@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 )
@@ -111,4 +112,79 @@ func (s *Server) testTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"result": "sent"})
+}
+
+// JobsStore is a tenant's stream jobs (implemented by the tenant runtime).
+type JobsStore interface {
+	List() any
+	Put(id string, raw []byte) error
+	Delete(id string) error
+	Test(ctx context.Context, raw []byte, from, to int64) (any, error)
+}
+
+func (s *Server) listJobs(w http.ResponseWriter, _ *http.Request) {
+	if s.Jobs == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Jobs.List())
+}
+
+// putJob: PUT /api/jobs/{job} {"query": "...", "enabled": true, "lateness": "5s"}
+func (s *Server) putJob(w http.ResponseWriter, r *http.Request) {
+	if s.Jobs == nil {
+		writeErr(w, http.StatusNotFound, errors.New("stream jobs are not available"))
+		return
+	}
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<10))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	id := r.PathValue("job")
+	if err := s.Jobs.Put(id, b); err != nil {
+		storeErr(w, err)
+		return
+	}
+	s.audit(r, "job.put", id, string(b))
+	writeJSON(w, http.StatusOK, s.Jobs.List())
+}
+
+func (s *Server) deleteJob(w http.ResponseWriter, r *http.Request) {
+	if s.Jobs == nil {
+		writeErr(w, http.StatusNotFound, errors.New("stream jobs are not available"))
+		return
+	}
+	id := r.PathValue("job")
+	if err := s.Jobs.Delete(id); err != nil {
+		storeErr(w, err)
+		return
+	}
+	s.audit(r, "job.delete", id, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// testJob: POST /api/jobs/test?from=-6h&to=now {"query": "..."} replays
+// stored history through the query and returns what it would output.
+func (s *Server) testJob(w http.ResponseWriter, r *http.Request) {
+	if s.Jobs == nil {
+		writeErr(w, http.StatusNotFound, errors.New("stream jobs are not available"))
+		return
+	}
+	from, to, err := rangeParams(r, 6*time.Hour, time.Second)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<10))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	res, err := s.Jobs.Test(r.Context(), b, from, to)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }

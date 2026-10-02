@@ -81,6 +81,7 @@ type Server struct {
 	// Settings: alert targets, escalation, reports, shifts (optional).
 	Settings    SettingsStore
 	Escalations func() any
+	Jobs        JobsStore
 
 	liveMu  sync.RWMutex // guards Notifier, Reporter, Shifts, Location after start
 	started time.Time
@@ -137,6 +138,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings/targets/{target}", s.require(auth.Manage, s.putTarget))
 	mux.HandleFunc("DELETE /api/settings/targets/{target}", s.require(auth.Manage, s.deleteTarget))
 	mux.HandleFunc("POST /api/settings/targets/{target}/test", s.require(auth.Manage, s.testTarget))
+	mux.HandleFunc("GET /api/jobs", read(s.listJobs))
+	mux.HandleFunc("POST /api/jobs/test", s.require(auth.Manage, s.testJob))
+	mux.HandleFunc("PUT /api/jobs/{job}", s.require(auth.Manage, s.putJob))
+	mux.HandleFunc("DELETE /api/jobs/{job}", s.require(auth.Manage, s.deleteJob))
 	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))
 	mux.HandleFunc("POST /api/notifications/test", s.require(auth.Manage, s.testNotification))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))

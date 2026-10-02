@@ -421,6 +421,9 @@ Formulas may use **measured** fields only, which keeps calculations free of chai
 **Formulas:**
 - **Operators:** `+ - * / % ^` and parentheses.
 - **Functions:** `abs sqrt min max round(x, digits) clamp(x, lo, hi) if(cond, a, b)`.
+- **Comparisons and logic:**
+  - `< <= > >= = == != <>` and `and or not` (or `&& || !`) give 1 or 0, e.g. `if(level > 90 and pump = 0, 1, 0)`.
+  - `and`/`or` short-circuit, so `flow > 0 and level / flow > 2` never divides by zero.
 - **Inputs:** booleans count as 1/0.
 - **Safety:** formulas are parsed by a small parser (no code is executed) and validated when the definition is saved.
 - **Bad results:** a missing input, division by zero or a non-finite result produces *no* value rather than a wrong one.
@@ -652,6 +655,80 @@ curl https://hub:8443/api/settings -H "$A"     # targets redacted, with sent/fai
   - a target that passed configuration but points at a local server is stopped at dial time, for both HTTP and SMTP;
   - with the guard off, local delivery works.
 - **Single-tenant binary:** `-notify` still delivers, and shows up as target `notify-1` in `/api/settings`.
+
+## Stream jobs (as in Azure Stream Analytics)
+
+A **job** is a small SQL-like query that runs continuously over incoming readings, aggregates them in time windows, and writes the results to a derived sensor, raises alarms, or posts to a webhook.
+
+```sql
+-- 5-minute average level per tank, as sensors avg-tank-1, avg-tank-2, …
+SELECT avg(level) AS level_avg INTO [avg-{sensor}] FROM [tank-*]
+GROUP BY sensor, TumblingWindow(minute, 5)
+
+-- energy used per hour, updated every 15 minutes, from a meter's running kWh total
+SELECT increase(kwh) AS kwh_last_hour INTO [plant.energy] FROM [meter-*]
+GROUP BY HoppingWindow(minute, 60, 15)
+
+-- alarm when a door opens more than 5 times in 10 minutes; it clears by itself
+SELECT count(open) INTO alert FROM [door-3] WHERE value = 1
+GROUP BY SlidingWindow(minute, 10) HAVING count > 5
+
+-- post oven peaks above 250 °C to a named settings target
+SELECT max(temp) INTO webhook:ops-teams FROM [oven-*]
+GROUP BY sensor, TumblingWindow(second, 30) HAVING value > 250
+```
+
+```bash
+curl -X PUT https://hub:8443/api/jobs/tank-avg -H "$A" -d '{"enabled":true,"lateness":"10s","query":"SELECT avg(level) INTO [avg-{sensor}] FROM [tank-*] GROUP BY sensor, TumblingWindow(minute, 5)"}'
+curl -X POST 'https://hub:8443/api/jobs/test?from=-6h' -H "$A" -d '{"query":"…"}'   # dry run over stored history: what it would output
+curl https://hub:8443/api/jobs -H "$A"         # status: in, filtered, out, late, dropped, errors, last output, open windows/alerts
+curl -X DELETE https://hub:8443/api/jobs/tank-avg -H "$A"
+```
+
+| Clause | |
+|---|---|
+| `SELECT agg(field) [AS name]` | `avg min max sum count stddev first last delta increase`. `increase` sums the rises of a running total (counters, kWh) and counts a drop as a reset, so a meter restart doesn't produce a negative |
+| `INTO` | `[sensor]` or `[prefix-{sensor}]` (`.field` optional): a derived sensor that works like any other (tiles, history, detection, MQTT). `alert`: a `rule` alarm per group while `HAVING` holds, which can be acknowledged, notified and escalated, and clears when it stops holding. `webhook:<target id>` |
+| `FROM [glob]` | sensors by id or glob |
+| `WHERE` | filter on `value` (or the field by name) |
+| `GROUP BY [sensor,] window` | `TumblingWindow(unit, n)`, `HoppingWindow(unit, size, hop)`, `SlidingWindow(unit, n)`; units `second minute hour day` |
+| `HAVING` | condition on `value`, `count` or the alias; `AVG(level) > 80` also works |
+
+**Time and lateness:**
+- **Event time.** Windows follow the readings' own timestamps.
+- **Closing.** A window closes when readings show time has passed its end plus `lateness` (default 5 s), or, if readings stop, when the wall clock has.
+- **Late readings** that arrive after that are counted as `late` and dropped.
+- **Backfill.** Readings arriving in a burst with old timestamps (store-and-forward) are windowed correctly, because closing follows their timestamps, not arrival.
+
+**Safety:**
+- **No loops.** A job's output may not be any enabled job's input (one step, no chains), so jobs can't feed each other. This is checked when saving, including templated names like `{sensor}-5m`, and enforced again when writing.
+- **Bounded memory.** Tumbling and hopping windows keep only running aggregates. Sliding windows keep their readings, up to 10 000 per group. A job holds at most 20 000 open windows. Hopping is limited to 60 windows per reading. Anything over a limit is counted as `dropped`, never unbounded.
+- **Quotas.** Derived readings don't count against the tenant's message quota, but jobs do have a quota (`maxJobs`, default 50).
+
+**Throughput** (measured, one core, race detector off):
+- **Tumbling, grouped by sensor over 500 sensors:** 0.5 µs per reading (3 allocations).
+- **Sliding, 10 000 readings in the window:** 1.1 µs.
+
+The first versions measured 35 µs and 118 µs. Two fixes brought them down: closing windows only when one is due, rather than scanning on every reading; and keeping sliding aggregates incremental, with monotonic queues for min and max.
+
+**Tested:**
+- **Compiler:** 17 bad queries are refused with reasons, including a templated output that would feed its own input.
+- **Windows and aggregates:**
+  - tumbling per sensor, with in-lateness reordering and a late reading dropped;
+  - hopping `increase` across a meter reset, closed by the wall clock, with each window checked against a hand calculation (4, 8, 6 kWh);
+  - every aggregate against hand values.
+- **Alerts, loop guard and webhooks:**
+  - a sliding alert raises, then clears when readings stop;
+  - removing a job clears its alarms;
+  - the loop guard blocks an output that would feed another job;
+  - webhook rows go out only when `HAVING` holds.
+- **Incremental sliding aggregates** match a naive recomputation over 20 000 random pushes and evictions. A mutation check confirmed that test fails if the min queue is broken.
+- **End to end through the gateway:**
+  - a derived sensor from live readings;
+  - a rule alarm that can be acknowledged;
+  - a dry run that writes nothing;
+  - chain and quota refusals;
+  - jobs surviving a restart.
 
 ## Shift reports
 

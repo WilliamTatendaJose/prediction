@@ -322,6 +322,13 @@ func (m *settingsMgr) RemoveTarget(id string) error {
 	return m.set(s) // fails (400) if notify/escalation/reports still use it
 }
 
+// target finds a target and the webhook secret (for job outputs).
+func (m *settingsMgr) target(id string) (*notify.Target, string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.targets[id], m.cur.WebhookSecret
+}
+
 // TestTarget sends a test message to one target.
 func (m *settingsMgr) TestTarget(ctx context.Context, id string) error {
 	m.mu.Lock()

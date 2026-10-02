@@ -25,7 +25,7 @@ type Event struct {
 	ID      string  `json:"id"`
 	Sensor  string  `json:"sensor"`
 	Field   string  `json:"field,omitempty"`
-	Kind    string  `json:"kind"`          // range | spike | stale
+	Kind    string  `json:"kind"`          // range | spike | stale | rule
 	Start   int64   `json:"start"`         // ms
 	End     int64   `json:"end,omitempty"` // ms; 0 while open
 	Value   float64 `json:"value"`         // value that opened the episode
@@ -98,6 +98,9 @@ type Detector struct {
 	sensors map[string]*sensorState
 	recent  []Event // ring of closed episodes
 	rhead   int
+	// external: episodes raised by other components (stream job rules),
+	// keyed by the raiser; they are listed and closed like any other.
+	external map[string]*Event
 }
 
 func New(cfg Config) *Detector {
@@ -120,12 +123,39 @@ func New(cfg Config) *Detector {
 		cfg.Recent = 200
 	}
 	return &Detector{
-		cfg:     cfg,
-		alpha:   2 / float64(cfg.Window+1),
-		fields:  map[string]*fieldState{},
-		sensors: map[string]*sensorState{},
-		recent:  make([]Event, 0, cfg.Recent),
+		cfg:      cfg,
+		alpha:    2 / float64(cfg.Window+1),
+		fields:   map[string]*fieldState{},
+		sensors:  map[string]*sensorState{},
+		recent:   make([]Event, 0, cfg.Recent),
+		external: map[string]*Event{},
 	}
+}
+
+// Raise opens an episode for key unless one is already open; it returns
+// the new episode (ok) or nothing when it was already open.
+func (d *Detector) Raise(key, sensor, field, kind string, ts int64, v float64, msg string) (Event, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.external[key] != nil {
+		return Event{}, false
+	}
+	e := open(sensor, field, kind, ts, v, 0, msg)
+	e.ID = fmt.Sprintf("%s.%d", key, ts) // unique per raiser, even on the same sensor and time
+	d.external[key] = e
+	return *e, true
+}
+
+// Clear closes key's open episode, if any.
+func (d *Detector) Clear(key string, ts int64) (Event, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.external[key]
+	if e == nil {
+		return Event{}, false
+	}
+	delete(d.external, key)
+	return d.close(e, ts), true
 }
 
 func open(sensor, field, kind string, ts int64, v, score float64, msg string) *Event {
@@ -362,6 +392,9 @@ func (d *Detector) Active() []Event {
 		if s.stale != nil {
 			out = append(out, *s.stale)
 		}
+	}
+	for _, e := range d.external {
+		out = append(out, *e)
 	}
 	d.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Start > out[j].Start })

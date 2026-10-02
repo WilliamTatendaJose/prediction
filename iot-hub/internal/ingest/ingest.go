@@ -33,6 +33,8 @@ type Pipeline struct {
 	// Admit enforces the tenant's message quota; nil = unlimited. It is
 	// called once per message, before any work.
 	Admit func() error
+	// Observe sees every stored reading (stream jobs).
+	Observe func(store.Reading)
 }
 
 // ErrQuota: the tenant's message rate or daily quota is used up.
@@ -59,6 +61,12 @@ func (p *Pipeline) HandleValues(sensor string, ts int64, values map[string]any) 
 			return store.Reading{}, err
 		}
 	}
+	return p.HandleDerived(sensor, ts, values)
+}
+
+// HandleDerived ingests values computed by the hub itself (stream job
+// outputs): like HandleValues, but not counted against the message quota.
+func (p *Pipeline) HandleDerived(sensor string, ts int64, values map[string]any) (store.Reading, error) {
 	if ts <= 0 {
 		ts = time.Now().UnixMilli()
 	}
@@ -107,6 +115,9 @@ func (p *Pipeline) HandleValues(sensor string, ts int64, values map[string]any) 
 				p.Emit(p.Detector.Observe(sensor, k, r.TS, x, p.Store.Rule(sensor, k)))
 			}
 		}
+	}
+	if p.Observe != nil {
+		p.Observe(r)
 	}
 	return r, nil
 }

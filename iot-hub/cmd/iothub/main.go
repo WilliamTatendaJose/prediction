@@ -254,6 +254,7 @@ func main() {
 		// Flags seed the settings; once an admin saves settings through
 		// the API, settings.json is the source and these flags are ignored.
 		o.SettingsPath = filepath.Join(filepath.Dir(*dataPath), "settings.json")
+		o.JobsPath = filepath.Join(filepath.Dir(*dataPath), "jobs.json")
 		seed := &o.Seed
 		seed.WebhookSecret = *notifySecret
 		seed.Notify = tenant.NotifyCfg{Resolved: *notifyResolved, CooldownMin: int(notifyCooldown.Minutes()), PerMinute: *notifyRate}

@@ -29,6 +29,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/escalate"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/jobs"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/report"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
@@ -60,6 +61,8 @@ type Options struct {
 	// Seed is used until the tenant saves its own settings (SettingsPath).
 	Seed         Settings
 	SettingsPath string
+	JobsPath     string
+	MaxJobs      func() int
 	PublicURL    string
 
 	BackupDir   string
@@ -92,6 +95,7 @@ type Runtime struct {
 	Writer    *tsdb.Writer
 	API       *api.Server
 	Escalate  *escalate.Engine
+	Jobs      *jobs.Engine
 	Limiter   *Limiter
 	Handler   http.Handler
 
@@ -176,9 +180,12 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		log.Debug("calculated field", "sensor", sensor, "field", field, "err", err)
 	}
 
+	// The detector also tracks alerts raised by stream jobs, so it exists
+	// even when automatic detection is off.
+	r.Detector = anomaly.New(o.AnomalyCf)
+	r.Analytics.Detector, r.API.Detector = r.Detector, r.Detector
 	if o.Anomaly {
-		r.Detector = anomaly.New(o.AnomalyCf)
-		r.Pipe.Detector, r.Analytics.Detector, r.API.Detector = r.Detector, r.Detector, r.Detector
+		r.Pipe.Detector = r.Detector
 	}
 
 	h := o.Hooks
@@ -201,7 +208,7 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		restoreLive(ctx, r.DB, st, r.Detector, o.Capacity, log)
 	}
 	r.goRun(func() { st.RunPersist(ctx, time.Second, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) }) })
-	if det := r.Detector; det != nil {
+	if det := r.Pipe.Detector; det != nil {
 		r.goRun(func() {
 			t := time.NewTicker(10 * time.Second)
 			defer t.Stop()
@@ -216,12 +223,7 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		})
 	}
 	// Settings: alert targets, escalation, reports, shifts, time zone.
-	r.Escalate = escalate.New(func() []anomaly.Event {
-		if r.Detector == nil {
-			return nil
-		}
-		return r.Alarms.Decorate(r.Detector.Active())
-	})
+	r.Escalate = escalate.New(func() []anomaly.Event { return r.Alarms.Decorate(r.Detector.Active()) })
 	r.settings = &settingsMgr{path: o.SettingsPath, apply: r.applySettings}
 	r.API.Settings = r.settings
 	r.API.Escalations = func() any { return r.Escalate.Recent() }
@@ -240,6 +242,48 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 	}
 	r.settings.mu.Unlock()
 	r.goRun(func() { r.Escalate.Run(ctx, 30*time.Second) })
+
+	// Stream jobs: windowed aggregates into derived sensors, alerts or
+	// webhooks.
+	hooks := make(chan hookJob, 256)
+	r.Jobs = jobs.New(jobs.Outputs{
+		Sensor: func(sensor string, ts int64, v map[string]any) error {
+			rd, err := r.Pipe.HandleDerived(sensor, ts, v)
+			if err == nil && r.API.OnIngest != nil {
+				r.API.OnIngest(rd)
+			}
+			return err
+		},
+		Raise: func(key, sensor, field string, ts int64, v float64, msg string) {
+			if e, ok := r.Detector.Raise(key, sensor, field, "rule", ts, v, msg); ok {
+				r.Pipe.Emit([]anomaly.Event{e})
+			}
+		},
+		Clear: func(key string, ts int64) {
+			if e, ok := r.Detector.Clear(key, ts); ok {
+				r.Pipe.Emit([]anomaly.Event{e})
+			}
+		},
+		Webhook: func(target string, row jobs.Row) {
+			select {
+			case hooks <- hookJob{target, row}:
+			default: // a slow endpoint must not stall ingestion
+				r.log.Warn("job webhook queue full: row dropped", "job", row.Job)
+			}
+		},
+	})
+	maxJobs := o.MaxJobs
+	if maxJobs == nil {
+		maxJobs = func() int { return MaxJobsDefault }
+	}
+	jm := &jobsMgr{path: o.JobsPath, engine: r.Jobs, maxJobs: maxJobs, store: st, an: r.Analytics}
+	if err := jm.load(); err != nil {
+		return fail(err)
+	}
+	r.API.Jobs = jm
+	r.Pipe.Observe = r.Jobs.Observe
+	r.goRun(func() { r.Jobs.Run(ctx) })
+	r.goRun(func() { r.sendHooks(ctx, hooks) })
 	if o.BackupDir != "" {
 		r.API.Backups = &backup.Scheduler{Dir: o.BackupDir, Every: o.BackupEvery, Keep: o.BackupKeep, DB: r.DB,
 			Config: func() backup.Config { return backup.Export(st, o.Creds, true) },
@@ -279,6 +323,31 @@ func (r *Runtime) Close() {
 			r.DB.Close()
 		}
 	})
+}
+
+type hookJob struct {
+	target string
+	row    jobs.Row
+}
+
+// sendHooks delivers job rows to settings targets, one at a time.
+func (r *Runtime) sendHooks(ctx context.Context, in <-chan hookJob) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case h := <-in:
+			t, secret := r.settings.target(h.target)
+			if t == nil {
+				r.log.Warn("job webhook: unknown target", "job", h.row.Job, "target", h.target)
+				continue
+			}
+			n := notify.New(notify.Config{Secret: secret})
+			m := notify.Message{Status: "job", Title: "Stream job " + h.row.Job,
+				Text: fmt.Sprintf("%s = %.4g (%s, %d readings)", h.row.Field, h.row.Value, h.row.Group, h.row.Count), Report: h.row, Severity: "info"}
+			n.SendTo(ctx, []*notify.Target{t}, m)
+		}
+	}
 }
 
 // running is a notifier with its delivery loop.
