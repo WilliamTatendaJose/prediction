@@ -18,7 +18,7 @@ public class InputDataController : ControllerBase
     public InputDataController(ILogger<InputDataController> logger, PredictionEnginePool<PredictionModel.ModelInput, PredictionModel.ModelOutput> predictionEnginePool)
     {
         _logger = logger;
-        predictionEnginePool = _predictionEnginePool;
+        _predictionEnginePool = predictionEnginePool;
      
     }
 

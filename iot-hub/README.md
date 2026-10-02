@@ -158,6 +158,49 @@ curl -X PUT localhost:8080/api/sensors/tank-1 -d '{
 
 Real sensor noise is usually heavier-tailed than Gaussian. With `persist=1`, a 5 Hz sensor would raise about 30 false alerts an hour. The cost of `persist=2` is that a single-sample glitch goes unreported; set `persist: 1` on fields where those matter. Detector state is in memory, so after a restart each field re-learns for `warmup` samples, and episodes left open by the previous run are closed in the database.
 
+## ML.NET integration
+
+The access-control classifier in `prediction.Server` is connected through MQTT. Neither side calls the other directly:
+
+```
+AccessControlEmulator ─POST─► hub /api/sensors/access-1/data ─► iot/access-1 (MQTT)
+                                                                     │
+prediction.Server  Services/IotHubBridge.cs ◄────────────────────────┘
+   PredictionEnginePool.Predict(...)
+   └─► iot/access-1-ml  {"prediction":"Abnormal","confidence":0.92,"risk":0.92,"p_Normal":0.08,"p_Abnormal":0.92,"ts":…}
+                       └─► hub: charts, database, anomaly when risk > 0.5
+```
+
+- **What gets scored.** The bridge subscribes to `iot/+` and scores any JSON message that has `AccessMethod`, `AccessStatus` and `LocationID` (configurable). Any number of access sensors works with no per-sensor setup.
+- **Input mapping.** Payload fields map onto `ModelInput` by name, case-insensitively.
+  - Missing numbers are passed as missing; the model's own `ReplaceMissingValues` step imputes them.
+  - `Timestamp`, `HourOfDay` and `DayOfWeek` are derived from the reading time when absent. The hub turns a `Timestamp` field into the reading time, so it is usually absent from the republished payload.
+- **Output.** Each event produces:
+  - `prediction`: the class, as text state
+  - `p_<class>`: each class probability
+  - `confidence`: the top probability
+  - `risk`: 1 − P(`Normal`)
+- **Self-registration.** The first result per sensor registers `{sensor}-ml` with the hub: name, 0–1 ranges, and a **range rule on `risk`**. That rule turns "the model thinks this access is abnormal" into a hub anomaly episode. Spike detection is off for probabilities, which jump by nature.
+- **SignalR.** Results are also sent on the existing SignalR `Prediction` message, so current clients keep working.
+
+Configuration lives in `prediction.Server/appsettings.json` under `IotHub`, or in environment variables like `IotHub__Host`:
+
+| Key | Default | |
+|---|---|---|
+| `Enabled` | `true` | |
+| `Host` / `Port` | `localhost` / `1883` | hub MQTT broker |
+| `Token` | — | the hub's `IOTHUB_TOKEN`, if set |
+| `RequiredFields` | `AccessMethod, AccessStatus, LocationID` | message must have these to be scored |
+| `NormalLabel` | `Normal` | the model's classes are `Normal`, `Abnormal` |
+| `RiskThreshold` | `0.5` | risk above this opens an anomaly |
+| `HubUrl` | `http://localhost:8080` | for self-registration; empty skips it |
+
+The bridge reconnects with backoff (up to 60 s) and logs only the first failure, so it can start before the hub. The emulator posts to the hub when `IOTHUB_URL` is set (default `http://localhost:8080`), with `EMULATOR_INTERVAL_SECONDS` controlling its rate.
+
+**Running everything:** `dotnet run --project prediction.AppHost` starts the hub (via `go run`, so Go must be installed), `prediction.Server` with the bridge, the emulator and the React client under Aspire.
+
+Suggested tiles: a `state` tile on `access-1-ml.prediction` (normal value `Normal`), a `line` tile on `risk` (Y 0–1), and an `anomalies` tile on `access-1-ml`.
+
 ## Dashboard tiles
 
 | Tile | Shows |
@@ -225,7 +268,7 @@ Without the database (`-db ""`): 20 MB RSS and 2.2% CPU at the same 1,000 msgs/s
 ## Limits and next steps
 
 - **Auth is a single shared token.** Reads (dashboard, stream, analytics) are open. Put it behind a reverse proxy with TLS, or add per-device credentials, before exposing it beyond a LAN.
-- **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits. A multi-sensor model (e.g. the ML.NET model in this repo, subscribed to `iot/#`) can publish its own findings back as a sensor.
+- **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits, and models (see ML.NET integration) for multi-field judgements.
 - **No notifications yet.** Anomalies go to the dashboard, the database and MQTT. Email/Slack/webhook delivery would be a small subscriber on `iot-events/anomaly/#` or an `OnEvent` hook.
 - **Statistics are mean/std/min/max.** No percentiles: they don't merge across rollups, so they would need raw scans or sketches.
 - **The embedded broker is a single node.** To use an existing broker (Mosquitto, EMQX), run with `-mqtt ""` and add a small subscriber that calls `Pipeline.Handle`.

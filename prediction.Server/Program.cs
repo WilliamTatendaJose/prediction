@@ -1,5 +1,6 @@
 using Microsoft.Extensions.ML;
 using prediction.Server.Hubs;
+using prediction.Server.Services;
 using Prediction_Server;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -8,6 +9,11 @@ builder.AddServiceDefaults();
 
 // Add services to the container.
 builder.Services.AddSignalR();
+
+// Scores IoT hub access events with the model and publishes results back.
+builder.Services.Configure<IotHubOptions>(builder.Configuration.GetSection("IotHub"));
+builder.Services.AddHttpClient();
+builder.Services.AddHostedService<IotHubBridge>();
 
 builder.Services.AddControllers();
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
