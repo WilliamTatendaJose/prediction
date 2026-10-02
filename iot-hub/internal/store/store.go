@@ -1,0 +1,398 @@
+// Package store holds sensor definitions, recent readings and the dashboard
+// layout. Readings live only in fixed-size in-memory rings, so memory use is
+// bounded by MaxSensors * MaxFields * Capacity * 12 bytes. Definitions and the
+// dashboard are persisted to a JSON file.
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"sync"
+	"time"
+)
+
+var (
+	ErrNotFound = errors.New("not found")
+	ErrLimit    = errors.New("limit reached")
+	ErrInvalid  = errors.New("invalid")
+)
+
+var idRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
+func ValidID(s string) bool { return idRe.MatchString(s) }
+
+type Field struct {
+	Label string   `json:"label,omitempty"`
+	Unit  string   `json:"unit,omitempty"`
+	Min   *float64 `json:"min,omitempty"`
+	Max   *float64 `json:"max,omitempty"`
+}
+
+type Sensor struct {
+	ID       string           `json:"id"`
+	Name     string           `json:"name,omitempty"`
+	Kind     string           `json:"kind,omitempty"`
+	Location string           `json:"location,omitempty"`
+	Fields   map[string]Field `json:"fields"`
+}
+
+// SensorView is a definition plus its latest state.
+type SensorView struct {
+	Sensor
+	Last     map[string]any `json:"last"`
+	LastSeen int64          `json:"lastSeen"`
+}
+
+// Reading is one ingested sample; the JSON shape is what the live stream sends.
+type Reading struct {
+	Sensor string         `json:"s"`
+	TS     int64          `json:"t"`
+	Values map[string]any `json:"v"`
+}
+
+type Options struct {
+	Path         string // persistence file; empty disables persistence
+	Capacity     int    // points kept per field
+	MaxSensors   int
+	MaxFields    int // per sensor
+	AutoRegister bool
+}
+
+type entry struct {
+	def    Sensor
+	series map[string]*Ring
+	last   map[string]any
+	seen   int64
+}
+
+type Store struct {
+	opts      Options
+	mu        sync.RWMutex
+	sensors   map[string]*entry
+	dashboard json.RawMessage
+	dirty     chan struct{}
+}
+
+func New(opts Options) *Store {
+	if opts.Capacity <= 0 {
+		opts.Capacity = 1024
+	}
+	if opts.MaxSensors <= 0 {
+		opts.MaxSensors = 500
+	}
+	if opts.MaxFields <= 0 {
+		opts.MaxFields = 16
+	}
+	return &Store{
+		opts:      opts,
+		sensors:   map[string]*entry{},
+		dashboard: json.RawMessage(`{"tiles":[]}`),
+		dirty:     make(chan struct{}, 1),
+	}
+}
+
+func (s *Store) markDirty() {
+	select {
+	case s.dirty <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) newEntry(def Sensor) *entry {
+	if def.Fields == nil {
+		def.Fields = map[string]Field{}
+	}
+	return &entry{def: def, series: map[string]*Ring{}, last: map[string]any{}}
+}
+
+func (e *entry) view() SensorView {
+	last := make(map[string]any, len(e.last))
+	for k, v := range e.last {
+		last[k] = v
+	}
+	def := e.def
+	def.Fields = make(map[string]Field, len(e.def.Fields))
+	for k, v := range e.def.Fields {
+		def.Fields[k] = v
+	}
+	return SensorView{Sensor: def, Last: last, LastSeen: e.seen}
+}
+
+func (s *Store) List() []SensorView {
+	s.mu.RLock()
+	out := make([]SensorView, 0, len(s.sensors))
+	for _, e := range s.sensors {
+		out = append(out, e.view())
+	}
+	s.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *Store) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sensors)
+}
+
+func (s *Store) Get(id string) (SensorView, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.sensors[id]
+	if !ok {
+		return SensorView{}, ErrNotFound
+	}
+	return e.view(), nil
+}
+
+// Upsert creates or replaces a sensor definition, keeping its data.
+func (s *Store) Upsert(def Sensor) error {
+	if !ValidID(def.ID) {
+		return fmt.Errorf("%w: id must match %s", ErrInvalid, idRe)
+	}
+	if len(def.Fields) > s.opts.MaxFields {
+		return fmt.Errorf("%w: max %d fields", ErrLimit, s.opts.MaxFields)
+	}
+	for k := range def.Fields {
+		if !ValidID(k) {
+			return fmt.Errorf("%w: field %q", ErrInvalid, k)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.sensors[def.ID]
+	if !ok {
+		if len(s.sensors) >= s.opts.MaxSensors {
+			return fmt.Errorf("%w: max %d sensors", ErrLimit, s.opts.MaxSensors)
+		}
+		s.sensors[def.ID] = s.newEntry(def)
+	} else {
+		if def.Fields == nil {
+			def.Fields = map[string]Field{}
+		}
+		// Fields already carrying data stay registered so they remain visible.
+		for k := range e.last {
+			if _, ok := def.Fields[k]; !ok {
+				def.Fields[k] = e.def.Fields[k]
+			}
+		}
+		e.def = def
+	}
+	s.markDirty()
+	return nil
+}
+
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sensors[id]; !ok {
+		return ErrNotFound
+	}
+	delete(s.sensors, id)
+	s.markDirty()
+	return nil
+}
+
+// Ingest records values for a sensor. Numbers and booleans are stored as time
+// series; strings are kept as latest state only. ts <= 0 means now.
+func (s *Store) Ingest(id string, ts int64, values map[string]any) (Reading, error) {
+	if !ValidID(id) {
+		return Reading{}, fmt.Errorf("%w: sensor id", ErrInvalid)
+	}
+	if ts <= 0 {
+		ts = time.Now().UnixMilli()
+	}
+	clean := make(map[string]any, len(values))
+	for k, v := range values {
+		if !ValidID(k) {
+			continue
+		}
+		switch x := v.(type) {
+		case float64:
+			clean[k] = x
+		case bool:
+			clean[k] = x
+		case string:
+			if len(x) > 256 {
+				x = x[:256]
+			}
+			clean[k] = x
+		} // nested objects, arrays and nulls are ignored
+	}
+	if len(clean) == 0 {
+		return Reading{}, fmt.Errorf("%w: no usable values", ErrInvalid)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.sensors[id]
+	if !ok {
+		if !s.opts.AutoRegister {
+			return Reading{}, ErrNotFound
+		}
+		if len(s.sensors) >= s.opts.MaxSensors {
+			return Reading{}, fmt.Errorf("%w: max %d sensors", ErrLimit, s.opts.MaxSensors)
+		}
+		e = s.newEntry(Sensor{ID: id, Name: id})
+		s.sensors[id] = e
+		s.markDirty()
+	}
+	for k, v := range clean {
+		if _, known := e.def.Fields[k]; !known {
+			if !s.opts.AutoRegister || len(e.def.Fields) >= s.opts.MaxFields {
+				delete(clean, k)
+				continue
+			}
+			e.def.Fields[k] = Field{}
+			s.markDirty()
+		}
+		e.last[k] = v
+		var f float32
+		switch x := v.(type) {
+		case float64:
+			f = float32(x)
+		case bool:
+			if x {
+				f = 1
+			}
+		default:
+			continue
+		}
+		r := e.series[k]
+		if r == nil {
+			r = NewRing(s.opts.Capacity)
+			e.series[k] = r
+		}
+		r.Push(ts, f)
+	}
+	if len(clean) == 0 {
+		return Reading{}, fmt.Errorf("%w: no registered fields in payload", ErrInvalid)
+	}
+	if ts > e.seen {
+		e.seen = ts
+	}
+	return Reading{Sensor: id, TS: ts, Values: clean}, nil
+}
+
+func (s *Store) History(id, field string, limit int, since int64) ([]int64, []float32, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.sensors[id]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	r, ok := e.series[field]
+	if !ok {
+		return []int64{}, []float32{}, nil
+	}
+	ts, v := r.Last(limit, since)
+	return ts, v, nil
+}
+
+func (s *Store) Dashboard() json.RawMessage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dashboard
+}
+
+// SetDashboard stores the layout as opaque JSON: the server does not need to
+// know tile types, so new tiles are a frontend-only change.
+func (s *Store) SetDashboard(raw json.RawMessage) error {
+	if !json.Valid(raw) {
+		return fmt.Errorf("%w: dashboard is not valid JSON", ErrInvalid)
+	}
+	cp := append(json.RawMessage(nil), raw...)
+	s.mu.Lock()
+	s.dashboard = cp
+	s.mu.Unlock()
+	s.markDirty()
+	return nil
+}
+
+type persisted struct {
+	Sensors   []Sensor        `json:"sensors"`
+	Dashboard json.RawMessage `json:"dashboard"`
+}
+
+func (s *Store) Load() error {
+	if s.opts.Path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(s.opts.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var p persisted
+	if err := json.Unmarshal(b, &p); err != nil {
+		return fmt.Errorf("parse %s: %w", s.opts.Path, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range p.Sensors {
+		if ValidID(d.ID) {
+			s.sensors[d.ID] = s.newEntry(d)
+		}
+	}
+	if len(p.Dashboard) > 0 {
+		s.dashboard = p.Dashboard
+	}
+	return nil
+}
+
+// Save writes atomically (temp file + rename) so a crash never leaves a
+// truncated config.
+func (s *Store) Save() error {
+	if s.opts.Path == "" {
+		return nil
+	}
+	s.mu.RLock()
+	p := persisted{Dashboard: s.dashboard, Sensors: make([]Sensor, 0, len(s.sensors))}
+	for _, e := range s.sensors {
+		p.Sensors = append(p.Sensors, e.view().Sensor)
+	}
+	s.mu.RUnlock()
+	sort.Slice(p.Sensors, func(i, j int) bool { return p.Sensors[i].ID < p.Sensors[j].ID })
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.opts.Path), 0o755); err != nil {
+		return err
+	}
+	tmp := s.opts.Path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.opts.Path)
+}
+
+// RunPersist saves at most once per interval after changes, and once more on
+// shutdown.
+func (s *Store) RunPersist(ctx context.Context, interval time.Duration, logf func(string, ...any)) {
+	for {
+		select {
+		case <-ctx.Done():
+			if err := s.Save(); err != nil {
+				logf("persist: %v", err)
+			}
+			return
+		case <-s.dirty:
+			if err := s.Save(); err != nil {
+				logf("persist: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(interval):
+			}
+		}
+	}
+}

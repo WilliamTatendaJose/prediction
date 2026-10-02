@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IoT Hub</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>IoT Hub</h1>
+    <span class="conn" id="conn" data-state="idle">Connecting…</span>
+    <button id="theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    <button id="edit">Edit</button>
+    <button id="add" class="primary" hidden>Add tile</button>
+    <button id="save" class="primary" hidden>Save layout</button>
+  </header>
+  <main id="grid"></main>
+
+  <dialog id="dlg">
+    <form method="dialog" id="form">
+      <h3>Add tile</h3>
+      <label for="f-type">Tile type</label>
+      <select id="f-type" name="type"></select>
+      <label for="f-sensor">Sensor</label>
+      <select id="f-sensor" name="sensor"></select>
+      <label for="f-field">Field</label>
+      <select id="f-field" name="field"></select>
+      <label for="f-title">Title (optional)</label>
+      <input id="f-title" name="title" maxlength="80">
+      <div class="row2">
+        <div><label for="f-w">Width</label><select id="f-w" name="w"><option value="1">1</option><option value="2">2</option></select></div>
+        <div><label for="f-h">Height</label><select id="f-h" name="h"><option value="1">1</option><option value="2">2</option></select></div>
+      </div>
+      <div id="f-opts"></div>
+      <div class="actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="ok" class="primary">Add</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
