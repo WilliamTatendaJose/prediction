@@ -177,3 +177,33 @@ func TestLatest(t *testing.T) {
 		})
 	}
 }
+
+// A reading written twice (a retried upload) is stored once and counted
+// once in the rollups.
+func TestDuplicatesNotCounted(t *testing.T) {
+	ctx := context.Background()
+	for name, db := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			base := int64(1_790_000_000_000) - int64(1_790_000_000_000)%60000
+			pts := []Point{{Sensor: "dup", Field: "v", TS: base, Value: 10}, {Sensor: "dup", Field: "v", TS: base + 1000, Value: 20}}
+			for i := 0; i < 3; i++ {
+				if err := db.WritePoints(ctx, pts); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Also a duplicate inside one batch.
+			if err := db.WritePoints(ctx, []Point{{Sensor: "dup", Field: "v", TS: base + 2000, Value: 30}, {Sensor: "dup", Field: "v", TS: base + 2000, Value: 30}}); err != nil {
+				t.Fatal(err)
+			}
+			var n int64
+			var sum float64
+			sdb := db.(*sqlDB)
+			if err := sdb.db.QueryRow(sdb.q(`SELECT r.n, r.sum FROM rollup_1m r JOIN series s ON s.id = r.series WHERE s.sensor = ? AND r.minute = ?`), "dup", base).Scan(&n, &sum); err != nil {
+				t.Fatal(err)
+			}
+			if n != 3 || sum != 60 {
+				t.Fatalf("rollup n=%d sum=%v, want 3 and 60", n, sum)
+			}
+		})
+	}
+}

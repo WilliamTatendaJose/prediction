@@ -164,7 +164,6 @@ func (s *sqlDB) WritePoints(ctx context.Context, pts []Point) error {
 	defer tx.Rollback()
 
 	rows := make([]any, 0, len(pts)*4)
-	rollups := map[[2]int64]*agg{}
 	// Ids created in this transaction join the cache only after commit, so
 	// a rollback can never leave the cache pointing at a missing row.
 	ids := map[string]int64{}
@@ -190,27 +189,48 @@ func (s *sqlDB) WritePoints(ctx context.Context, pts []Point) error {
 			continue
 		}
 		rows = append(rows, id, p.TS, p.Value, nil)
-		k := [2]int64{id, p.TS - p.TS%60000}
-		a := rollups[k]
-		if a == nil {
-			a = &agg{series: id, minute: k[1], min: p.Value, max: p.Value}
-			rollups[k] = a
-		}
-		a.n++
-		a.sum += p.Value
-		a.sumsq += p.Value * p.Value
-		a.min = min(a.min, p.Value)
-		a.max = max(a.max, p.Value)
 	}
 
+	// Rollups are built only from the rows actually inserted (RETURNING),
+	// so a reading sent twice (a retried upload, a replayed backlog) is
+	// stored once and counted once.
+	rollups := map[[2]int64]*agg{}
 	for i := 0; i < len(rows); i += rowsPerStmt * 4 {
 		chunk := rows[i:min(i+rowsPerStmt*4, len(rows))]
 		q := `INSERT INTO readings (series, ts, value, text) VALUES ` +
 			strings.TrimSuffix(strings.Repeat("(?, ?, ?, ?),", len(chunk)/4), ",") +
-			` ON CONFLICT (series, ts) DO NOTHING`
-		if _, err := tx.ExecContext(ctx, s.q(q), chunk...); err != nil {
+			` ON CONFLICT (series, ts) DO NOTHING RETURNING series, ts, value`
+		res, err := tx.QueryContext(ctx, s.q(q), chunk...)
+		if err != nil {
 			return fmt.Errorf("insert readings: %w", err)
 		}
+		for res.Next() {
+			var id, ts int64
+			var v sql.NullFloat64
+			if err := res.Scan(&id, &ts, &v); err != nil {
+				res.Close()
+				return err
+			}
+			if !v.Valid {
+				continue // text
+			}
+			k := [2]int64{id, ts - ts%60000}
+			a := rollups[k]
+			if a == nil {
+				a = &agg{series: id, minute: k[1], min: v.Float64, max: v.Float64}
+				rollups[k] = a
+			}
+			a.n++
+			a.sum += v.Float64
+			a.sumsq += v.Float64 * v.Float64
+			a.min = min(a.min, v.Float64)
+			a.max = max(a.max, v.Float64)
+		}
+		if err := res.Err(); err != nil {
+			res.Close()
+			return fmt.Errorf("insert readings: %w", err)
+		}
+		res.Close()
 	}
 
 	ra := make([]any, 0, len(rollups)*7)

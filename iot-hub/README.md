@@ -1,10 +1,12 @@
 # IoT Hub
 
-A reusable sensor platform in one Go binary of ~16 MB (stripped):
+A reusable sensor platform in one Go binary of ~19 MB (stripped):
 
 - **Ingest** over an embedded **MQTT broker** (port 1883) or the **REST API**.
 - **Persist** to **SQLite** (embedded, default) or **PostgreSQL/TimescaleDB**, with automatic 1-minute rollups and retention.
 - **Analyse** with bucketed min/avg/max series and summary statistics over any time range.
+- **Run as a SaaS platform** (`-tenancy multi`): isolated tenants with quotas, Azure IoT Hub-style device keys and SAS tokens, and store-and-forward from edge hubs.
+- **Stream jobs** (as in Azure Stream Analytics): windowed SQL-like queries into derived sensors, alarms or webhooks.
 - **Detect anomalies** as data streams in: limit breaches, spikes and silent sensors. Each anomaly reaches the dashboard, the database and MQTT.
 - **Dashboard** with no build step: plain JS embedded in the binary. Tiles are plugins.
 
@@ -919,6 +921,55 @@ registerTile('big-number', {
 
 Option types are `number`, `text` and `select` (`choices: [[value, label]]`). `sensorOptional: true` lets a tile watch all sensors, and `noField: true` hides the field picker.
 
+## Store-and-forward (edge to cloud)
+
+An **edge hub** at a plant runs single-tenant mode next to the PLCs and keeps working when the internet doesn't. With `-forward` it also sends every reading to its tenant on a **cloud hub** (multi-tenant mode), much as Azure IoT Edge forwards to IoT Hub. Readings queue on disk while the link is down and go up in order when it's back.
+
+```bash
+# In the cloud (superadmin, or the tenant admin with self-service): one service identity per site.
+curl -X POST https://cloud.example.com/api/devices -H "$S" -H "X-Tenant: acme" \
+     -d '{"id":"edge-plant1","role":"service","sensors":["plant1.*"],"auth":"keys"}'
+# → connectionString: HostName=cloud.example.com;TenantId=acme;DeviceId=edge-plant1;SharedAccessKey=…
+
+# At the plant:
+iothub -connectors plc.json -forward "HostName=cloud.example.com;TenantId=acme;DeviceId=edge-plant1;SharedAccessKey=…" \
+       -forward-prefix plant1.
+curl http://edge:8080/api/forward     # queued bytes, sent, rejected, dropped, last error, connected
+```
+
+| Flag | Default | |
+|---|---|---|
+| `-forward` | — | connection string (the edge signs its own SAS tokens and renews them), or a URL with `-forward-token` |
+| `-forward-prefix` | — | prepended to sensor ids in the cloud, e.g. `plant1.`. Give the site's identity the pattern `plant1.*`, so one site can't write another's sensors |
+| `-forward-sensors` | `*` | which sensors to send |
+| `-forward-dir` | next to `-data` | queue directory |
+| `-forward-max-mb` | 1024 | disk cap. Beyond it the **oldest** unsent readings are dropped, and counted as `dropped` |
+
+**Delivery guarantees:**
+- **Nothing is forgotten before the cloud confirms it.** The queue is append-only segment files with a cursor saved after each confirmed batch. A restart of the edge, the cloud or the link resumes where it stopped.
+- **Exactly once, through lost replies.** Each batch's id comes from its position in the queue plus a random per-edge id. If a reply is lost after the cloud ingested the batch, the retry carries the same id and the cloud skips what it already has. Ids are scoped per identity, so two sites can't be confused. The database also ignores a repeated (sensor, time), and rollups count only rows actually stored.
+- **Order** is kept: oldest first, per edge.
+- **Quota stops** mid-batch report how far they got; the rest is sent later.
+- **Refusals don't lose data.** If the cloud refuses (revoked key, suspended tenant), the edge keeps the data and retries every minute.
+- **Bad readings don't block.** A reading the cloud rejects (outside the site's patterns, malformed) is skipped and counted, never retried forever.
+- **Retry pacing.** Retries back off from 1 s to 1 min with ±20 % jitter, so many sites don't hammer a cloud that is coming back.
+- **Cloud processing is normal.** Calculated fields, anomaly detection and stream jobs run on the backlog as on live data, in event time.
+
+**Durability:**
+- **Power cut:** the queue is fsynced every second, so a power cut can lose up to about a second of readings.
+- **Duplicate tracking:** the cloud remembers the last 10 000 batch ids per tenant in memory. After a cloud restart, a retried batch can reach the live buffers and stream jobs twice; the database still stores it once.
+
+**Tested** (`internal/forward`, a real hub API as the cloud, with injected faults):
+- **Outage with lost replies:** 2000 readings across an outage, an edge restart during the outage, and two replies dropped after the cloud ingested the batch. All 2000 arrived, with **no duplicates** and in order.
+- **Quota stop:** the cloud quota ran out after 150; the rest followed when it freed.
+- **Revoked key:** data was kept, nothing dropped.
+- **Disk cap:** a long outage with a tiny cap dropped the oldest. Delivered plus dropped equalled exactly 2000, with no duplicates.
+- **Wrong prefix:** readings outside the identity's patterns were rejected and counted, and the queue kept moving.
+- **End to end with the binaries:** a multi-tenant cloud and an edge configured only with the connection string. The cloud was stopped while 800 of 1000 readings arrived at the edge, then restarted. All 1000 arrived, 250 per sensor with the full value range.
+- **Bugs found by these tests:**
+  - **Inflated rollups.** A repeated reading was stored once but counted again in the 1-minute rollups. Rollups are now built from the inserted rows (`RETURNING`), with a regression test that fails on the old code (8 counted for 3 stored).
+  - **Slow recovery after an outage.** New data cut the backoff wait short, so retries ran every second and the backoff grew to its 5-minute cap within seconds of an outage. After the link returned, the edge could then wait up to 5 minutes. Backoff waits now ignore new data, and the cap is 1 minute.
+
 ## Grafana and the full stack
 
 [`deploy/`](deploy/) runs the hub with PostgreSQL and Grafana:
@@ -979,7 +1030,11 @@ Without the database (`-db ""`): 20 MB RSS and 2.2% CPU at the same 1,000 msgs/s
 ## Limits and next steps
 
 - **No per-IP rate limiting or lockout.** Tokens are 256-bit, so guessing is not feasible, but noisy scanners are not throttled. Put the hub behind a firewall or reverse proxy if it faces the internet.
-- **Device credentials are tokens, not client certificates.** Mutual TLS would bind identity to hardware keys; the listener supports it, but it isn't wired up.
+- **Device credentials are tokens or keys (SAS), not client certificates.** Mutual TLS (Azure's X.509 option) would bind identity to hardware keys; the listener supports it, but it isn't wired up.
+- **Multi-tenant mode runs on one node.** Every tenant's runtime lives in one process; the limit is memory (each tenant's live buffers) and one machine's CPU. Sharding tenants across nodes (by tenant id at a load balancer) is the next step if it outgrows that.
+- **No device twins or cloud-to-device commands.** Azure's desired/reported properties and direct methods aren't implemented; the hub is telemetry-in only.
+- **Grafana and multi-tenant PostgreSQL.** Each tenant has its own schema (`t_{id}`); the provisioned Grafana datasource reads the public schema only, so per-tenant dashboards need a datasource per schema.
+- **Stream jobs are one step.** A job can't read another job's output (no chains), and there are no joins between streams.
 - **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits, and models (see ML.NET integration) for multi-field judgements.
 - **Statistics are mean/std/min/max.** No percentiles: they don't merge across rollups, so they would need raw scans or sketches.
 - **The embedded broker is a single node.** To use an existing broker (Mosquitto, EMQX), run with `-mqtt ""` and add a small subscriber that calls `Pipeline.Handle`.

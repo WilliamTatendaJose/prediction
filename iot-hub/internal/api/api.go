@@ -82,8 +82,10 @@ type Server struct {
 	Settings    SettingsStore
 	Escalations func() any
 	Jobs        JobsStore
+	Forward     func() any // edge store-and-forward status (optional)
 
 	liveMu  sync.RWMutex // guards Notifier, Reporter, Shifts, Location after start
+	batches batches      // recent batch ids (idempotent retries)
 	started time.Time
 }
 
@@ -103,6 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/sensors/{id}", s.require(auth.Define, s.putSensor))
 	mux.HandleFunc("DELETE /api/sensors/{id}", s.require(auth.Define, s.deleteSensor))
 	mux.HandleFunc("POST /api/sensors/{id}/data", s.require(auth.Ingest, s.ingest))
+	mux.HandleFunc("POST /api/ingest/batch", s.requireAny(s.ingestBatch)) // per-line permission checks
 	mux.HandleFunc("POST /api/sensors/{id}/data/{field}", s.require(auth.Ingest, s.ingest))
 	mux.HandleFunc("GET /api/sensors/{id}/history", read(s.history))
 	mux.HandleFunc("GET /api/sensors/{id}/series", read(s.series))
@@ -139,6 +142,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/settings/targets/{target}", s.require(auth.Manage, s.deleteTarget))
 	mux.HandleFunc("POST /api/settings/targets/{target}/test", s.require(auth.Manage, s.testTarget))
 	mux.HandleFunc("POST /api/calc/test", read(s.calcTest))
+	mux.HandleFunc("GET /api/forward", s.require(auth.Manage, s.forwardStatus))
 	mux.HandleFunc("GET /api/jobs", read(s.listJobs))
 	mux.HandleFunc("POST /api/jobs/test", s.require(auth.Manage, s.testJob))
 	mux.HandleFunc("PUT /api/jobs/{job}", s.require(auth.Manage, s.putJob))

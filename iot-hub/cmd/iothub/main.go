@@ -26,6 +26,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/forward"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/gateway"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
@@ -118,6 +119,12 @@ func main() {
 	tenantRate := flag.Float64("tenant-rate", envFloat("IOTHUB_TENANT_RATE", 100), "multi: default messages per second per tenant (0 = unlimited)")
 	tenantDaily := flag.Int64("tenant-daily", int64(envInt("IOTHUB_TENANT_DAILY", 0)), "multi: default messages per day per tenant (0 = unlimited)")
 	allowPrivate := flag.Bool("allow-private-targets", env("IOTHUB_ALLOW_PRIVATE_TARGETS", "") == "true", "multi: let tenants send notifications to private/internal addresses (off: blocked against SSRF)")
+	fwdTo := flag.String("forward", env("IOTHUB_FORWARD", ""), "edge: forward readings to a cloud hub — a connection string (HostName=…;TenantId=…;DeviceId=…;SharedAccessKey=…) or a URL with -forward-token")
+	fwdToken := flag.String("forward-token", env("IOTHUB_FORWARD_TOKEN", ""), "edge: bearer token for -forward URL")
+	fwdDir := flag.String("forward-dir", env("IOTHUB_FORWARD_DIR", ""), "edge: queue directory (default next to -data)")
+	fwdMax := flag.Int("forward-max-mb", envInt("IOTHUB_FORWARD_MAX_MB", 1024), "edge: queue cap on disk; beyond it the oldest unsent readings are dropped")
+	fwdSensors := flag.String("forward-sensors", env("IOTHUB_FORWARD_SENSORS", "*"), "edge: which sensors to forward (glob)")
+	fwdPrefix := flag.String("forward-prefix", env("IOTHUB_FORWARD_PREFIX", ""), "edge: prefix for sensor ids in the cloud, e.g. plant1. (keeps sites apart)")
 	tenantDevices := flag.Int("tenant-devices", envInt("IOTHUB_TENANT_DEVICES", 1000), "multi: default maximum identities per tenant (0 = unlimited)")
 	flag.Parse()
 
@@ -222,8 +229,8 @@ func main() {
 		if *token == "" {
 			fatal(log, "tenancy", errors.New("multi-tenant mode needs -token (the superadmin token)"))
 		}
-		if *publicRead || *connectorsFile != "" || len(notifySpecs) > 0 || len(reportSpecs) > 0 {
-			fatal(log, "tenancy", errors.New("-public-read, -connectors, -notify and -report-to are single-tenant options: tenants configure notifications themselves, and PLC connectors run on an edge hub that forwards to its tenant"))
+		if *publicRead || *connectorsFile != "" || len(notifySpecs) > 0 || len(reportSpecs) > 0 || *fwdTo != "" {
+			fatal(log, "tenancy", errors.New("-public-read, -connectors, -notify, -report-to and -forward are single-tenant (edge) options: tenants configure notifications themselves, and PLC connectors run on an edge hub that forwards to its tenant"))
 		}
 		notify.BlockPrivateNetworks(!*allowPrivate)
 		plat := &tenant.Platform{
@@ -276,6 +283,30 @@ func main() {
 		if _, err := os.Stat(o.SettingsPath); err == nil && (len(notifySpecs) > 0 || len(reportSpecs) > 0) {
 			log.Warn("settings.json exists: -notify and -report-to are ignored (manage targets with /api/settings)", "file", o.SettingsPath)
 		}
+		var fwd *forward.Forwarder
+		if *fwdTo != "" {
+			fc := forward.Config{URL: *fwdTo, Token: *fwdToken}
+			if strings.Contains(*fwdTo, "SharedAccessKey=") {
+				var err error
+				if fc, err = forward.ParseConnectionString(*fwdTo); err != nil {
+					fatal(log, "forward", err)
+				}
+			} else if *fwdToken == "" {
+				fatal(log, "forward", errors.New("a -forward URL needs -forward-token (or use a connection string)"))
+			}
+			fc.Dir, fc.MaxBytes, fc.Sensors, fc.Prefix = *fwdDir, int64(*fwdMax)<<20, *fwdSensors, *fwdPrefix
+			if fc.Dir == "" {
+				fc.Dir = filepath.Join(filepath.Dir(*dataPath), "forward")
+			}
+			fc.Logf = func(f string, a ...any) { log.Warn(fmt.Sprintf(f, a...)) }
+			var err error
+			if fwd, err = forward.New(fc); err != nil {
+				fatal(log, "forward", err)
+			}
+			o.Forward = fwd.Add
+			o.ForwardStatus = func() any { return fwd.Status() }
+			log.Info("forwarding to the cloud", "url", fc.URL, "tenant", fc.Tenant, "as", fc.DeviceID, "queue", fc.Dir, "maxMB", *fwdMax)
+		}
 		rt, err := tenant.Open(ctx, auth.DefaultTenant, o)
 		if err != nil {
 			fatal(log, "start", err)
@@ -287,6 +318,11 @@ func main() {
 			log.Info("backups", "dir", *backupDir, "every", *backupEvery, "keep", *backupKeep)
 		}
 		handler, pipe, closeTenants = rt.Handler, rt.Pipe, rt.Close
+		if fwd != nil {
+			fctx, fstop := context.WithCancel(context.Background())
+			go fwd.Run(fctx)
+			closeTenants = func() { rt.Close(); fstop(); <-fwd.Done() } // flush the queue to disk last
+		}
 		if *connectorsFile != "" {
 			startConnectors(ctx, *connectorsFile, filepath.Dir(*authFile), rt, log)
 		}

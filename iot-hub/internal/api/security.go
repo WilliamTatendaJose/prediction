@@ -107,6 +107,27 @@ func (s *Server) require(a auth.Action, next http.HandlerFunc) http.HandlerFunc 
 	}
 }
 
+// requireAny authenticates (and checks tenant and CSRF) but leaves the
+// permission check to the handler (batches hold many sensors).
+func (s *Server) requireAny(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, viaCookie, ok := s.identity(r)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, errors.New("missing or invalid token"))
+			return
+		}
+		if viaCookie && r.Method != http.MethodGet && r.Header.Get("X-Requested-With") != "iothub" {
+			writeErr(w, http.StatusForbidden, errors.New("missing X-Requested-With header"))
+			return
+		}
+		if !id.InTenant(s.tenantID()) {
+			writeErr(w, http.StatusForbidden, errors.New("wrong tenant"))
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
+	}
+}
+
 // SecureHeaders adds browser hardening to every response.
 func SecureHeaders(next http.Handler, tls bool) http.Handler { return secureHeaders(next, tls) }
 

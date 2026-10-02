@@ -77,9 +77,12 @@ type Options struct {
 	MaxDevices    func() int
 	Limiter       *Limiter // nil = unlimited
 
-	Web    fs.FS // dashboard files (single-tenant; the gateway serves them otherwise)
-	Hooks  Hooks
-	Logger *slog.Logger
+	// Forward receives every stored reading (edge store-and-forward).
+	Forward       func(store.Reading)
+	ForwardStatus func() any
+	Web           fs.FS // dashboard files (single-tenant; the gateway serves them otherwise)
+	Hooks         Hooks
+	Logger        *slog.Logger
 }
 
 // Runtime is one tenant's running hub.
@@ -282,6 +285,10 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 	}
 	r.API.Jobs = jm
 	r.Pipe.Observe = r.Jobs.Observe
+	if fw := o.Forward; fw != nil {
+		r.Pipe.Observe = func(rd store.Reading) { r.Jobs.Observe(rd); fw(rd) }
+	}
+	r.API.Forward = o.ForwardStatus
 	r.goRun(func() { r.Jobs.Run(ctx) })
 	r.goRun(func() { r.sendHooks(ctx, hooks) })
 	if o.BackupDir != "" {
