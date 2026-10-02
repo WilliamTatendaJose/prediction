@@ -232,6 +232,105 @@ func (s *Store) Remove(id string) error {
 	return s.save()
 }
 
+// Credential is a stored identity as exported in a config backup: the hash,
+// never the token, so a restore keeps existing tokens working.
+type Credential struct {
+	Identity
+	Hash    string `json:"hash"`
+	Created int64  `json:"created"`
+	Note    string `json:"note,omitempty"`
+}
+
+// Persistent reports whether credentials are saved to a file.
+func (s *Store) Persistent() bool { return s.path != "" }
+
+func (s *Store) Export() []Credential {
+	s.mu.RLock()
+	out := make([]Credential, 0, len(s.byID))
+	for _, r := range s.byID {
+		out = append(out, Credential(*r))
+	}
+	s.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+var hashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// CheckImport validates credentials and reports which existing identities
+// an import would revoke: removed (replace) or given a different token.
+func (s *Store) CheckImport(creds []Credential, replace bool) (revoked []string, err error) {
+	seen, hashes := map[string]bool{}, map[string]bool{}
+	for _, c := range creds {
+		if !idRe.MatchString(c.ID) || c.ID == "admin" || c.ID == "anonymous" || seen[c.ID] {
+			return nil, fmt.Errorf("%w: credential id %q", ErrInvalid, c.ID)
+		}
+		if hashes[c.Hash] {
+			return nil, fmt.Errorf("%w: credential %q shares a token with another", ErrInvalid, c.ID)
+		}
+		seen[c.ID], hashes[c.Hash] = true, true
+		if !c.Role.Valid() || !hashRe.MatchString(c.Hash) {
+			return nil, fmt.Errorf("%w: credential %q: bad role or hash", ErrInvalid, c.ID)
+		}
+		for _, p := range c.Sensors {
+			if _, err := path.Match(p, ""); err != nil {
+				return nil, fmt.Errorf("%w: credential %q: bad sensor pattern %q", ErrInvalid, c.ID, p)
+			}
+		}
+		if (c.Role == Device || c.Role == Service) && len(c.Sensors) == 0 {
+			return nil, fmt.Errorf("%w: credential %q: %s needs a sensor pattern", ErrInvalid, c.ID, c.Role)
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byID := map[string]Credential{}
+	for _, c := range creds {
+		byID[c.ID] = c
+	}
+	if !replace {
+		for _, c := range creds {
+			if r, ok := s.byHash[c.Hash]; ok && r.ID != c.ID {
+				return nil, fmt.Errorf("%w: credential %q has the token of existing %q", ErrInvalid, c.ID, r.ID)
+			}
+		}
+	}
+	for id, r := range s.byID {
+		c, ok := byID[id]
+		if ok && c.Hash != r.Hash || !ok && replace {
+			revoked = append(revoked, id)
+		}
+	}
+	sort.Strings(revoked)
+	return revoked, nil
+}
+
+// Import adds or updates credentials (replace: and removes the rest).
+// Call CheckImport first; it returns the identities whose sessions must be
+// dropped.
+func (s *Store) Import(creds []Credential, replace bool) ([]string, error) {
+	revoked, err := s.CheckImport(creds, replace)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if replace {
+		s.byID, s.byHash = map[string]*record{}, map[string]*record{}
+	}
+	for _, c := range creds {
+		if old, ok := s.byID[c.ID]; ok {
+			delete(s.byHash, old.Hash)
+		}
+		r := record(c)
+		s.byID[c.ID] = &r
+		s.byHash[c.Hash] = &r
+	}
+	if len(creds) > 0 {
+		s.enabled = true
+	}
+	s.mu.Unlock()
+	return revoked, s.save()
+}
+
 // DeviceInfo is the listing shape: never includes the hash.
 type DeviceInfo struct {
 	Identity

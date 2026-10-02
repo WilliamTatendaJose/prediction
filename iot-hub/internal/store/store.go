@@ -161,6 +161,21 @@ func (s *Store) List() []SensorView {
 	return out
 }
 
+// MaxSensors is the configured sensor limit.
+func (s *Store) MaxSensors() int { return s.opts.MaxSensors }
+
+// Definitions returns every sensor definition, sorted by ID.
+func (s *Store) Definitions() []Sensor {
+	s.mu.RLock()
+	out := make([]Sensor, 0, len(s.sensors))
+	for _, e := range s.sensors {
+		out = append(out, e.view().Sensor)
+	}
+	s.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 func (s *Store) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -178,7 +193,8 @@ func (s *Store) Get(id string) (SensorView, error) {
 }
 
 // Upsert creates or replaces a sensor definition, keeping its data.
-func (s *Store) Upsert(def Sensor) error {
+// Validate checks a definition without storing it.
+func (s *Store) Validate(def Sensor) error {
 	if !ValidID(def.ID) {
 		return fmt.Errorf("%w: id must match %s", ErrInvalid, idRe)
 	}
@@ -206,6 +222,13 @@ func (s *Store) Upsert(def Sensor) error {
 				return fmt.Errorf("%w: oee field %q", ErrInvalid, f)
 			}
 		}
+	}
+	return nil
+}
+
+func (s *Store) Upsert(def Sensor) error {
+	if err := s.Validate(def); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -505,13 +528,7 @@ func (s *Store) Save() error {
 	if s.opts.Path == "" {
 		return nil
 	}
-	s.mu.RLock()
-	p := persisted{Dashboard: s.dashboard, Sensors: make([]Sensor, 0, len(s.sensors))}
-	for _, e := range s.sensors {
-		p.Sensors = append(p.Sensors, e.view().Sensor)
-	}
-	s.mu.RUnlock()
-	sort.Slice(p.Sensors, func(i, j int) bool { return p.Sensors[i].ID < p.Sensors[j].ID })
+	p := persisted{Dashboard: s.Dashboard(), Sensors: s.Definitions()}
 	b, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err

@@ -27,6 +27,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/backup"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
@@ -105,6 +106,9 @@ func main() {
 		reportSpecs = append(reportSpecs, v)
 		return nil
 	})
+	backupDir := flag.String("backup-dir", env("IOTHUB_BACKUP_DIR", ""), "directory for scheduled backups: SQLite snapshot + config (empty = off; use another disk)")
+	backupEvery := flag.Duration("backup-every", envDur("IOTHUB_BACKUP_EVERY", 24*time.Hour), "time between scheduled backups")
+	backupKeep := flag.Int("backup-keep", envInt("IOTHUB_BACKUP_KEEP", 7), "backups of each kind to keep")
 	notifySecret := flag.String("notify-secret", env("IOTHUB_NOTIFY_SECRET", ""), "HMAC secret for generic webhook signatures")
 	notifyKinds := flag.String("notify-kinds", env("IOTHUB_NOTIFY_KINDS", ""), "anomaly kinds to notify, comma-separated (empty = all)")
 	notifyResolved := flag.Bool("notify-resolved", env("IOTHUB_NOTIFY_RESOLVED", "true") == "true", "also notify when an episode resolves")
@@ -269,6 +273,24 @@ func main() {
 			names[i] = t.Redacted()
 		}
 		log.Info("notifications", "targets", names)
+	}
+
+	if *backupDir != "" {
+		if *backupEvery < time.Minute {
+			log.Error("backup-every must be at least 1m")
+			os.Exit(2)
+		}
+		srv.Backups = &backup.Scheduler{Dir: *backupDir, Every: *backupEvery, Keep: *backupKeep, DB: an.DB,
+			Config: func() backup.Config { return backup.Export(st, creds, true) },
+			Logf:   func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }}
+		go srv.Backups.Run(ctx)
+		snap := "config only (database snapshots need SQLite; use pg_dump)"
+		if sn, ok := an.DB.(tsdb.Snapshotter); ok && sn.CanSnapshot() {
+			snap = "database + config"
+		} else if an.DB == nil {
+			snap = "config only (no database)"
+		}
+		log.Info("backups", "dir", *backupDir, "every", *backupEvery, "keep", *backupKeep, "contents", snap)
 	}
 
 	if len(reportSpecs) > 0 {

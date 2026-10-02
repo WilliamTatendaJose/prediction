@@ -612,3 +612,19 @@ func (s *sqlDB) Audit(ctx context.Context, from int64, limit int) ([]anomaly.Aud
 	}
 	return out, rows.Err()
 }
+
+// ErrNoSnapshot: PostgreSQL is backed up with its own tools (pg_dump).
+var ErrNoSnapshot = errors.New("online snapshots are for SQLite; back up PostgreSQL with pg_dump")
+
+func (s *sqlDB) CanSnapshot() bool { return !s.pg }
+
+// Snapshot writes a consistent copy of a SQLite database to path (which
+// must not exist) while writes continue: VACUUM INTO reads one transaction,
+// and the copy is compacted.
+func (s *sqlDB) Snapshot(ctx context.Context, path string) error {
+	if s.pg {
+		return ErrNoSnapshot
+	}
+	_, err := s.db.ExecContext(ctx, "VACUUM INTO ?", path)
+	return err
+}

@@ -58,6 +58,12 @@ type EventQuery struct {
 	ActiveOnly bool
 }
 
+// Snapshotter is implemented by databases that can copy themselves online.
+type Snapshotter interface {
+	CanSnapshot() bool
+	Snapshot(ctx context.Context, path string) error
+}
+
 type DB interface {
 	WritePoints(ctx context.Context, pts []Point) error
 	SaveEvent(ctx context.Context, e anomaly.Event) error

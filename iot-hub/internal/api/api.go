@@ -34,6 +34,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/backup"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
@@ -67,10 +68,11 @@ type Server struct {
 	Connectors    func() []connect.Status // optional
 	Notifier      *notify.Notifier        // optional
 	Alarms        *alarm.Manager
-	Shifts        []string         // shift start times "06:00", for from=shift
-	Location      *time.Location   // plant time zone (default local)
-	Reporter      *notify.Notifier // optional: shift report targets
-	PublicURL     string           // linked from reports
+	Shifts        []string          // shift start times "06:00", for from=shift
+	Location      *time.Location    // plant time zone (default local)
+	Reporter      *notify.Notifier  // optional: shift report targets
+	PublicURL     string            // linked from reports
+	Backups       *backup.Scheduler // optional
 	started       time.Time
 }
 
@@ -113,6 +115,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/labels.csv", read(s.labels))
 	mux.HandleFunc("GET /api/sensors/{id}/oee", read(s.oeeHandler))
 	mux.HandleFunc("GET /api/oee", read(s.oeeOverview))
+	mux.HandleFunc("GET /api/config", s.require(auth.Manage, s.exportConfig))
+	mux.HandleFunc("POST /api/config", s.require(auth.Manage, s.importConfig))
+	mux.HandleFunc("GET /api/backups", s.require(auth.Manage, s.backups))
+	mux.HandleFunc("POST /api/backups", s.require(auth.Manage, s.backupNow))
+	mux.HandleFunc("GET /api/backups/{name}", s.require(auth.Manage, s.backupFile))
 	mux.HandleFunc("GET /api/reports", read(s.reports))
 	mux.HandleFunc("POST /api/reports/send", s.require(auth.Manage, s.sendReport))
 	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))

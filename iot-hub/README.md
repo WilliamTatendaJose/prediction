@@ -60,6 +60,9 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-notify-cooldown` | `IOTHUB_NOTIFY_COOLDOWN` | `10m` | hold repeats for the same sensor/field/kind |
 | `-notify-per-minute` | `IOTHUB_NOTIFY_PER_MINUTE` | `20` | global cap |
 | `-report-to` (repeatable) | `IOTHUB_REPORT_TO` (space-separated) | | shift report targets, same kinds as `-notify`; sent at every shift change |
+| `-backup-dir` | `IOTHUB_BACKUP_DIR` | — (off) | scheduled backups: SQLite snapshot + config. Put it on another disk |
+| `-backup-every` | `IOTHUB_BACKUP_EVERY` | `24h` | time between backups |
+| `-backup-keep` | `IOTHUB_BACKUP_KEEP` | `7` | backups of each kind to keep |
 | `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
 | `-shifts` | `IOTHUB_SHIFTS` | `06:00,14:00,22:00` | shift start times for OEE `from=shift` (empty disables) |
 | `-tz` | `IOTHUB_TZ` | system | plant time zone, e.g. `Africa/Harare` |
@@ -212,6 +215,8 @@ Units and labels from the file are added to the sensor definition, without overw
 | GET | `/api/stream[?sensors=a,b]` | SSE: readings as `data: {"s","t","v"}`; anomalies as `event: anomaly` |
 | GET | `/api/reports?shift=previous\|current&format=json\|html\|text` | shift report (also `from`/`to`); see [Shift reports](#shift-reports) |
 | POST | `/api/reports/send` | send the previous shift's report to the `-report-to` targets now (admin) |
+| GET / POST | `/api/config` | export / import the configuration; see [Backup and restore](#backup-and-restore) (admin) |
+| GET / POST | `/api/backups`, GET `/api/backups/{name}` | list / take / download backups (admin) |
 | GET | `/api/connectors` | PLC connector status |
 | GET | `/api/health` | heap, stream and DB writer counters, active anomalies |
 
@@ -522,6 +527,56 @@ curl -X POST https://hub:8443/api/reports/send -H "Authorization: Bearer $ADMIN"
 - **Unit tests:** shift windows including the night shift either side of midnight; HTML escaping of a `<script>` sensor name, an `<img onerror>` alarm message and a `javascript:` link; chat clipping that never splits a multi-byte character; the multipart email against a fake SMTP server, with no line over the SMTP limit of 998 bytes.
 - **End to end:** the built binary with a shift change set a minute ahead delivered the report to a local webhook 5 s after the change, covering exactly the shift that ended.
 - **Not tested:** rendering in real mail clients (Outlook, Gmail), and delivery to the real chat services.
+
+## Backup and restore
+
+Two parts, because they change at different rates and restore differently:
+
+| | Contents | How |
+|---|---|---|
+| **Configuration** | sensor definitions (fields, limits, detection rules, calculated fields, OEE), the dashboard layout, and optionally device credentials | `GET /api/config` → JSON; `POST /api/config` to restore |
+| **Data** | readings, roll-ups, anomaly history, acknowledgements, notes, shelves, audit log | SQLite: online snapshots. PostgreSQL: `pg_dump` |
+
+```bash
+# Configuration, e.g. before an upgrade or to copy a set-up to another site
+curl -H "Authorization: Bearer $ADMIN" 'https://hub:8443/api/config?devices=1' -o hub-config.json
+curl -H "Authorization: Bearer $ADMIN" -X POST 'https://hub:8443/api/config?dryRun=1' --data-binary @hub-config.json  # what would change
+curl -H "Authorization: Bearer $ADMIN" -X POST 'https://hub:8443/api/config' --data-binary @hub-config.json          # merge (default)
+curl -H "Authorization: Bearer $ADMIN" -X POST 'https://hub:8443/api/config?mode=replace' --data-binary @hub-config.json
+
+# Scheduled backups (SQLite snapshot + config), daily, keeping 7
+iothub -db sqlite:/var/lib/iothub/readings.db -backup-dir /mnt/backup/iothub
+curl -H "Authorization: Bearer $ADMIN" https://hub:8443/api/backups                      # files, last run, last error
+curl -H "Authorization: Bearer $ADMIN" -X POST https://hub:8443/api/backups              # take one now
+curl -H "Authorization: Bearer $ADMIN" -O https://hub:8443/api/backups/iothub-20261002-060000.db
+```
+
+**Import rules:**
+- **All or nothing.** The whole file is checked before anything changes: every sensor definition and formula, the sensor limit, the dashboard JSON and the credentials. A bad file leaves the hub as it was.
+- **Merge** adds and updates. **Replace** also deletes sensors (and devices, if the file has any) that are not in the file.
+- **Unknown fields are rejected**, so a typo in a hand-edited file fails instead of being silently dropped.
+- **Dry run.** `dryRun=1` returns the plan: created, updated and deleted sensors, and which devices would lose their sessions.
+- **Device credentials** are exported only with `devices=1`. They are SHA-256 hashes of random 256-bit tokens, so they can't be turned back into tokens, but they do let whoever holds the file restore working access: keep the file private. Existing tokens keep working after a restore. A device whose token changes, or that a replace removes, is disconnected at once.
+
+**Scheduled backups:**
+- **Online.** The SQLite snapshot (`VACUUM INTO`) is consistent and compacted, and ingestion keeps running while it is taken.
+- **Never half-written.** Files are written under a temporary name and renamed, so an interrupted backup never looks like a good one.
+- **Private.** The directory is created `0700` and files `0600`, because the config file contains credential hashes.
+- **Rotation.** The newest `-backup-keep` of each kind are kept.
+- **Restarts don't postpone backups.** The schedule continues from the newest existing backup; an overdue one runs a minute after start. A failed backup is retried after at most 15 minutes and shows in `GET /api/backups`.
+- **PostgreSQL:** the schedule saves the configuration only; use `pg_dump` (or your provider's backups) for the data.
+- **Another disk.** A backup on the same disk as the database doesn't survive that disk failing. Point `-backup-dir` at another disk or a network share, or copy the files off.
+
+**Restoring:**
+1. Stop the hub.
+2. Copy a `.db` snapshot over the database file. Remove any `-wal` and `-shm` files next to it.
+3. Start the hub. Then `POST` the matching `.json` file to `/api/config?mode=replace`.
+
+**Tested:**
+- **Snapshot under load:** a snapshot of a 20 000-reading database while another goroutine kept writing. Writes continued during the snapshot; the copy passed `PRAGMA integrity_check` and had every reading.
+- **Import:** all-or-nothing for seven kinds of bad file (store unchanged after each). Replace frees slots before adding, and a dry run changes nothing. Tokens survive a round trip; changed or removed devices are reported as revoked; two identities sharing a token are refused; a hub without `-auth-file` refuses credentials rather than losing them at restart.
+- **Rotation and downloads:** files are rotated, with `0600`/`0700` modes. Path traversal (`../`, wrong names, `.partial` files) is refused. Viewers get 403.
+- **Restore drill:** the built binary, 3000 readings → backup → data directory deleted → snapshot copied back and config imported. Same statistics (n 3000, mean 49.5) and the same sensor definition.
 
 ## Dashboard tiles
 
