@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
@@ -77,7 +78,12 @@ type Server struct {
 	SelfService func() bool
 	// MaxDevices is the tenant's identity quota; nil or <= 0 = unlimited.
 	MaxDevices func() int
-	started    time.Time
+	// Settings: alert targets, escalation, reports, shifts (optional).
+	Settings    SettingsStore
+	Escalations func() any
+
+	liveMu  sync.RWMutex // guards Notifier, Reporter, Shifts, Location after start
+	started time.Time
 }
 
 func (s *Server) Handler() http.Handler {
@@ -126,6 +132,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/backups/{name}", s.require(auth.Manage, s.backupFile))
 	mux.HandleFunc("GET /api/reports", read(s.reports))
 	mux.HandleFunc("POST /api/reports/send", s.require(auth.Manage, s.sendReport))
+	mux.HandleFunc("GET /api/settings", s.require(auth.Manage, s.getSettings))
+	mux.HandleFunc("PUT /api/settings", s.require(auth.Manage, s.putSettings))
+	mux.HandleFunc("PUT /api/settings/targets/{target}", s.require(auth.Manage, s.putTarget))
+	mux.HandleFunc("DELETE /api/settings/targets/{target}", s.require(auth.Manage, s.deleteTarget))
+	mux.HandleFunc("POST /api/settings/targets/{target}/test", s.require(auth.Manage, s.testTarget))
 	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))
 	mux.HandleFunc("POST /api/notifications/test", s.require(auth.Manage, s.testNotification))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
@@ -164,12 +175,12 @@ type notifyStatus struct {
 
 func (s *Server) notifications(w http.ResponseWriter, _ *http.Request) {
 	out := map[string]any{"targets": []notifyStatus{}}
-	if s.Notifier != nil {
+	if n := s.notifier(); n != nil {
 		ts := []notifyStatus{}
-		for _, t := range s.Notifier.Targets() {
+		for _, t := range n.Targets() {
 			ts = append(ts, notifyStatus{Target: t.Redacted(), Sent: t.Sent.Load(), Failed: t.Failed.Load(), LastError: t.LastError()})
 		}
-		out = map[string]any{"targets": ts, "suppressed": s.Notifier.Suppressed.Load(), "dropped": s.Notifier.Dropped.Load()}
+		out = map[string]any{"targets": ts, "suppressed": n.Suppressed.Load(), "dropped": n.Dropped.Load()}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -177,13 +188,14 @@ func (s *Server) notifications(w http.ResponseWriter, _ *http.Request) {
 // testNotification sends a test message to every target and reports each
 // result, so setup mistakes show up immediately rather than at 3 a.m.
 func (s *Server) testNotification(w http.ResponseWriter, r *http.Request) {
-	if s.Notifier == nil {
+	n := s.notifier()
+	if n == nil {
 		writeErr(w, http.StatusConflict, errors.New("no notification targets configured (-notify)"))
 		return
 	}
 	res := map[string]string{}
-	for _, t := range s.Notifier.Targets() {
-		if err := s.Notifier.Test(r.Context(), t); err != nil {
+	for _, t := range n.Targets() {
+		if err := n.Test(r.Context(), t); err != nil {
 			res[t.Redacted()] = err.Error()
 		} else {
 			res[t.Redacted()] = "ok"
@@ -365,6 +377,10 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 			filter[id] = true
 		}
 	}
+	// Subscribe before answering: once the client sees the response, every
+	// later reading must reach it.
+	ch := s.Hub.Subscribe()
+	defer s.Hub.Unsubscribe(ch)
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -372,9 +388,6 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "retry: 3000\n\n")
 	flusher.Flush()
-
-	ch := s.Hub.Subscribe()
-	defer s.Hub.Unsubscribe(ch)
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
 	write := func(m *stream.Msg) {

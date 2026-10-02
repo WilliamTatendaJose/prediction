@@ -72,8 +72,14 @@ func ParseTarget(spec string) (*Target, error) {
 			return nil, fmt.Errorf("notify %s: URL must be http(s)", kind)
 		}
 	}
+	if err := checkHost(u.Hostname()); err != nil {
+		return nil, fmt.Errorf("notify %s: %w", kind, err)
+	}
 	return &Target{Kind: kind, URL: u, raw: raw}, nil
 }
+
+// Spec is the full "kind=URL" (with its secrets), for storing settings.
+func (t *Target) Spec() string { return t.Kind + "=" + t.raw }
 
 // Redacted hides credentials and tokens for display. Chat webhooks carry
 // their secret in the path (Slack, Discord, Telegram bot token), so only
@@ -156,11 +162,16 @@ type Message struct {
 // plain-text alternative; chat targets get the text, clipped to their limits;
 // webhooks get the structured report.
 func (n *Notifier) SendReport(ctx context.Context, title, text, html string, data any) map[string]string {
-	m := Message{Status: "report", Title: title, Text: text, HTML: html, Report: data, Severity: "info"}
+	return n.SendTo(ctx, n.cfg.Targets, Message{Status: "report", Title: title, Text: text, HTML: html, Report: data, Severity: "info"})
+}
+
+// SendTo delivers one message to the given targets now (one retry on a
+// transient failure) and returns the outcome per target.
+func (n *Notifier) SendTo(ctx context.Context, targets []*Target, m Message) map[string]string {
 	out := map[string]string{}
-	for _, t := range n.cfg.Targets {
+	for _, t := range targets {
 		err := n.deliver(ctx, t, m)
-		if err != nil && !errors.Is(err, errPermanent) {
+		if err != nil && !errors.Is(err, errPermanent) && !errors.Is(err, ErrBlocked) {
 			select {
 			case <-ctx.Done():
 			case <-time.After(2 * time.Second):
@@ -177,6 +188,15 @@ func (n *Notifier) SendReport(ctx context.Context, title, text, html string, dat
 		out[t.Redacted()] = "ok"
 	}
 	return out
+}
+
+// Escalation renders a reminder for an episode nobody has acknowledged.
+func (n *Notifier) Escalation(e anomaly.Event, level int, open time.Duration) Message {
+	m := n.render(e, "escalation", 0)
+	m.Title = fmt.Sprintf("Escalation %d — not acknowledged: %s", level, strings.TrimPrefix(m.Title, "Anomaly: "))
+	m.Text = fmt.Sprintf("%s\nOpen for %s and not acknowledged.", m.Text, open.Round(time.Minute))
+	m.Severity = "critical"
+	return m
 }
 
 // clip shortens chat text to a service's message limit.
@@ -203,7 +223,7 @@ func New(cfg Config) *Notifier {
 		cfg.PerMinute = 20
 	}
 	return &Notifier{
-		cfg: cfg, queue: make(chan job, 256), client: &http.Client{Timeout: 10 * time.Second},
+		cfg: cfg, queue: make(chan job, 256), client: httpClient(),
 		lastSent: map[string]time.Time{}, held: map[string]int{}, opened: map[string]bool{},
 		tokens: float64(cfg.PerMinute), refillAt: time.Now(), done: make(chan struct{}),
 	}
@@ -530,12 +550,12 @@ func writeQP(b *strings.Builder, s string) {
 // smtpSend is net/smtp.SendMail with a deadline (a hung server must not
 // block the notifier) and implicit TLS support.
 func smtpSend(implicitTLS bool, addr, host string, auth smtp.Auth, from string, to []string, msg []byte) error {
-	d := net.Dialer{Timeout: 15 * time.Second}
+	d := dialer()
 	var conn net.Conn
 	var err error
 	tlsCfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
 	if implicitTLS {
-		conn, err = tls.DialWithDialer(&d, "tcp", addr, tlsCfg)
+		conn, err = tls.DialWithDialer(d, "tcp", addr, tlsCfg)
 	} else {
 		conn, err = d.Dial("tcp", addr)
 	}

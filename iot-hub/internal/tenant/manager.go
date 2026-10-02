@@ -111,6 +111,8 @@ func (p *Platform) start(in Info) error {
 	q, raw, rollup := p.effective(in)
 	o := p.Base
 	o.ConfigPath = filepath.Join(p.dir(in.ID), "config.json")
+	o.SettingsPath = filepath.Join(p.dir(in.ID), "settings.json")
+	o.Seed = Settings{Shifts: p.Base.Seed.Shifts, TimeZone: p.Base.Seed.TimeZone} // never the operator's targets
 	o.DBURL, o.PGSchema = p.dbURL(in.ID)
 	o.MaxSensors = q.MaxSensors
 	o.RawRetention, o.RollupRetention = raw, rollup

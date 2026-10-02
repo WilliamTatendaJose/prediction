@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/oee"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 )
@@ -28,8 +29,8 @@ func (s *Server) window(r *http.Request) (int64, int64, string, error) {
 	now := time.Now().In(s.loc())
 	switch q.Get("from") {
 	case "shift", "":
-		if len(s.Shifts) > 0 {
-			st, err := oee.ShiftStart(now, s.Shifts, s.loc())
+		if shifts := s.shifts(); len(shifts) > 0 {
+			st, err := oee.ShiftStart(now, shifts, s.loc())
 			return st.UnixMilli(), now.UnixMilli(), "current shift (since " + st.Format("15:04") + ")", err
 		}
 		if q.Get("from") == "shift" {
@@ -45,10 +46,37 @@ func (s *Server) window(r *http.Request) (int64, int64, string, error) {
 }
 
 func (s *Server) loc() *time.Location {
+	s.liveMu.RLock()
+	defer s.liveMu.RUnlock()
 	if s.Location != nil {
 		return s.Location
 	}
 	return time.Local
+}
+
+func (s *Server) shifts() []string {
+	s.liveMu.RLock()
+	defer s.liveMu.RUnlock()
+	return s.Shifts
+}
+
+func (s *Server) notifier() *notify.Notifier {
+	s.liveMu.RLock()
+	defer s.liveMu.RUnlock()
+	return s.Notifier
+}
+
+func (s *Server) reporter() *notify.Notifier {
+	s.liveMu.RLock()
+	defer s.liveMu.RUnlock()
+	return s.Reporter
+}
+
+// SetLive swaps notification and shift settings while serving.
+func (s *Server) SetLive(n, rep *notify.Notifier, shifts []string, loc *time.Location) {
+	s.liveMu.Lock()
+	s.Notifier, s.Reporter, s.Shifts, s.Location = n, rep, shifts, loc
+	s.liveMu.Unlock()
 }
 
 // oeeHandler: GET /api/sensors/{id}/oee?from=shift|today|-24h&to=&bucket=1h

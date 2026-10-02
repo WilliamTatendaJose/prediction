@@ -65,6 +65,7 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-backup-keep` | `IOTHUB_BACKUP_KEEP` | `7` | backups of each kind to keep |
 | `-tenancy` | `IOTHUB_TENANCY` | `single` | `multi` = SaaS mode, see [Multi-tenant](#multi-tenant-saas-mode) |
 | `-master-key` | `IOTHUB_MASTER_KEY` | — | encrypts device keys at rest |
+| `-allow-private-targets` | `IOTHUB_ALLOW_PRIVATE_TARGETS` | false | multi: let tenants notify internal addresses (SSRF guard off) |
 | `-tenant-rate` / `-tenant-daily` / `-tenant-devices` | `IOTHUB_TENANT_RATE` / `_DAILY` / `_DEVICES` | 100 / unlimited / 1000 | default tenant quotas (multi) |
 | `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
 | `-shifts` | `IOTHUB_SHIFTS` | `06:00,14:00,22:00` | shift start times for OEE `from=shift` (empty disables) |
@@ -599,6 +600,58 @@ curl https://hub:8443/api/notifications -H "Authorization: Bearer $ADMIN"       
 - **End to end:** a real hub sending range anomalies to a local receiver. Signatures verified; cooldown hold; no orphan "resolved"; the test endpoint.
 - **Unit tests:** retry vs no-retry, the rate cap, every chat payload shape, and SMTP including AUTH against a fake server.
 - **Not tested:** delivery to the real Slack, Teams, Discord and Telegram services, which aren't reachable from here.
+
+### Settings per tenant, and escalation
+
+Notification targets, escalation, shift reports, shifts and the time zone are configured through the API by the tenant's admin. In single-tenant mode the `-notify`, `-report-to`, `-shifts` and `-tz` flags seed these settings. Once an admin saves settings, `settings.json` is the source of truth.
+
+```bash
+A="Authorization: Bearer $ADMIN"
+# Name each target once; its URL (which holds a secret) is never shown back.
+curl -X PUT https://hub:8443/api/settings/targets/ops-teams -H "$A" -d '{"spec":"teams=https://prod-00.westeurope.logic.azure.com/workflows/…"}'
+curl -X PUT https://hub:8443/api/settings/targets/manager   -H "$A" -d '{"spec":"email=smtp://alerts:PASS@smtp.office365.com:587?from=alerts@plant.co&to=manager@plant.co"}'
+curl -X POST https://hub:8443/api/settings/targets/ops-teams/test -H "$A"
+curl -X PUT https://hub:8443/api/settings -H "$A" -d '{
+  "notify":     {"targets":["ops-teams"], "resolved":true, "cooldownMin":10},
+  "escalation": {"levels":[{"afterMin":15,"targets":["ops-teams"]},{"afterMin":60,"targets":["manager"]}], "repeatMin":60},
+  "reports":    {"targets":["manager"]},
+  "shifts": ["06:00","14:00","22:00"], "timeZone": "Africa/Harare", "webhookSecret": "…" }'
+curl https://hub:8443/api/settings -H "$A"     # targets redacted, with sent/failed/last error; recent escalations
+```
+
+**Settings rules:**
+- **Validated whole and applied live.** Notifier, escalation policy, report schedule, shifts and time zone switch over without a restart. Alerts already queued on the old notifier still go out.
+- **Referential checks.** A target that something still uses can't be removed. Unknown fields are rejected.
+- **Private file.** `settings.json` is mode 0600, because target URLs hold secrets.
+- **Write-only secret.** `webhookSecret` is never returned.
+
+**Escalation** re-notifies about alarms that are still **open, unacknowledged and not shelved**:
+- **Levels.** Each level notifies its own targets after its delay: here the shift team after 15 min, the manager after 60.
+- **Repeats.** With `repeatMin`, the last level is repeated until someone acknowledges.
+- **Stopping.** Acknowledging, shelving or the alarm clearing stops it at once.
+- **After a restart** (or a policy change), an alarm that is already old gets **one** message, for the highest level that is due, not a burst of every level.
+- **Not persisted.** Escalation state is kept in memory, so a restart can repeat the current level once. A missed escalation would be worse than a duplicate.
+
+**Blocking private addresses (multi-tenant).** Tenants choose where notifications go. Without a guard, a tenant could aim a "webhook" at the platform's own network (cloud metadata at `169.254.169.254`, databases, admin panels): server-side request forgery. In multi-tenant mode:
+- **What is refused:** every notification connection (webhook, chat, SMTP) to loopback, private, link-local, CGNAT, unspecified or multicast addresses.
+- **When the check runs:** when the address is dialled, after DNS resolution, so a name that resolves to an internal address (DNS rebinding) is caught too. Obvious cases are also refused when the target is saved, with a clear error.
+- **No proxy:** connections go direct while the guard is on. `HTTP(S)_PROXY` is not used for notifications, since a proxy would hide the real destination.
+- **Opting out:** `-allow-private-targets` turns the guard off, for on-premises platforms where tenants are trusted.
+
+**Tested:**
+- **Escalation:** levels at 15 and 60 min, a repeat after 30 min, stopping on acknowledge, one message after a restart, and shelved alarms never escalating.
+- **Settings through the gateway:**
+  - URLs and secrets are not echoed back;
+  - six kinds of bad settings are refused, and an in-use target can't be removed;
+  - a range alarm is delivered live to the tenant's webhook;
+  - shifts and time zone apply at once (the current shift starts at 07:00/19:00 Harare time);
+  - the file is 0600 and reloads after a suspend/resume.
+- **Guard:**
+  - an address table (`::ffff:127.0.0.1`, NAT64 and others) is classified correctly;
+  - five private targets are refused through the API;
+  - a target that passed configuration but points at a local server is stopped at dial time, for both HTTP and SMTP;
+  - with the guard off, local delivery works.
+- **Single-tenant binary:** `-notify` still delivers, and shows up as target `notify-1` in `/api/settings`.
 
 ## Shift reports
 

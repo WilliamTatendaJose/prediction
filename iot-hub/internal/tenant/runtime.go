@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
@@ -26,6 +27,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/backup"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/escalate"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/report"
@@ -55,11 +57,10 @@ type Options struct {
 	Anomaly   bool
 	AnomalyCf anomaly.Config
 
-	Notify        notify.Config // Targets empty = no notifications
-	ReportTargets []*notify.Target
-	Shifts        []string
-	Location      *time.Location
-	PublicURL     string
+	// Seed is used until the tenant saves its own settings (SettingsPath).
+	Seed         Settings
+	SettingsPath string
+	PublicURL    string
 
 	BackupDir   string
 	BackupEvery time.Duration
@@ -89,16 +90,22 @@ type Runtime struct {
 	Analytics *analytics.Service
 	DB        tsdb.DB
 	Writer    *tsdb.Writer
-	Notifier  *notify.Notifier
 	API       *api.Server
+	Escalate  *escalate.Engine
 	Limiter   *Limiter
 	Handler   http.Handler
 
-	log      *slog.Logger
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	stopBg   context.CancelFunc // writer + notifier outlive cancel until Close
-	closeOne sync.Once
+	log        *slog.Logger
+	ctx        context.Context
+	settings   *settingsMgr
+	notifier   atomic.Pointer[running]
+	liveMu     sync.Mutex
+	reportStop context.CancelFunc
+	publicURL  string
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	stopBg     context.CancelFunc // writer + notifier outlive cancel until Close
+	closeOne   sync.Once
 }
 
 // Open builds and starts a tenant's runtime.
@@ -108,10 +115,6 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		log = slog.Default()
 	}
 	log = log.With("tenant", id)
-	loc := o.Location
-	if loc == nil {
-		loc = time.Local
-	}
 	st := store.New(store.Options{Path: o.ConfigPath, Capacity: o.Capacity, MaxSensors: o.MaxSensors,
 		MaxFields: o.MaxFields, AutoRegister: o.AutoRegister})
 	if err := st.Load(); err != nil {
@@ -119,7 +122,8 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	bg, stopBg := context.WithCancel(context.Background())
-	r := &Runtime{ID: id, Store: st, Hub: stream.NewHub(64), log: log, cancel: cancel, stopBg: stopBg, Limiter: o.Limiter}
+	r := &Runtime{ID: id, Store: st, Hub: stream.NewHub(64), log: log, cancel: cancel, stopBg: stopBg, Limiter: o.Limiter,
+		ctx: ctx, publicURL: o.PublicURL}
 	fail := func(err error) (*Runtime, error) {
 		r.Close()
 		return nil, err
@@ -129,8 +133,7 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		r.Pipe.Admit = o.Limiter.Admit
 	}
 	r.Analytics = &analytics.Service{Store: st}
-	r.API = &api.Server{Store: st, Hub: r.Hub, Pipeline: r.Pipe, Analytics: r.Analytics, Shifts: o.Shifts,
-		Location: loc, Auth: o.Creds, PublicRead: o.PublicRead, SecureCookies: o.SecureCookies, TLS: o.TLS,
+	r.API = &api.Server{Store: st, Hub: r.Hub, Pipeline: r.Pipe, Analytics: r.Analytics, Auth: o.Creds, PublicRead: o.PublicRead, SecureCookies: o.SecureCookies, TLS: o.TLS,
 		PublicURL: o.PublicURL, SelfService: o.SelfService, MaxDevices: o.MaxDevices, Web: o.Web}
 
 	if o.DBURL != "" {
@@ -173,24 +176,6 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		log.Debug("calculated field", "sensor", sensor, "field", field, "err", err)
 	}
 
-	if len(o.Notify.Targets) > 0 {
-		cfg := o.Notify
-		cfg.Names = func(id string) string {
-			if sv, err := st.Get(id); err == nil && sv.Name != "" {
-				return sv.Name
-			}
-			return id
-		}
-		if cfg.Logf == nil {
-			cfg.Logf = func(f string, a ...any) { log.Warn(fmt.Sprintf(f, a...)) }
-		}
-		r.Notifier = notify.New(cfg)
-		go r.Notifier.Run(bg)
-		r.API.Notifier = r.Notifier
-	}
-	if len(o.ReportTargets) > 0 {
-		r.API.Reporter = notify.New(notify.Config{Targets: o.ReportTargets, Secret: o.Notify.Secret, BaseURL: o.PublicURL})
-	}
 	if o.Anomaly {
 		r.Detector = anomaly.New(o.AnomalyCf)
 		r.Pipe.Detector, r.Analytics.Detector, r.API.Detector = r.Detector, r.Detector, r.Detector
@@ -201,8 +186,8 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		if h.PublishEvent != nil {
 			h.PublishEvent(id, e)
 		}
-		if r.Notifier != nil {
-			r.Notifier.Notify(e)
+		if n := r.notifier.Load(); n != nil {
+			n.n.Notify(e)
 		}
 	}
 	if h.Publish != nil {
@@ -230,22 +215,31 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 			}
 		})
 	}
-	if r.API.Reporter != nil && len(o.Shifts) > 0 {
-		r.goRun(func() {
-			report.Schedule(ctx, o.Shifts, loc, func(from, to time.Time) {
-				rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-				defer cancel()
-				rep, err := report.Build(rctx, st, r.Analytics, from.UnixMilli(), to.UnixMilli(), "", loc)
-				if err != nil {
-					log.Error("shift report", "err", err)
-					return
-				}
-				rep.Link = o.PublicURL
-				res := r.API.Reporter.SendReport(rctx, rep.Title+" — "+rep.Period, rep.Text(loc), rep.HTML(loc), rep)
-				log.Info("shift report sent", "period", rep.Period, "results", res)
-			}, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) })
-		})
+	// Settings: alert targets, escalation, reports, shifts, time zone.
+	r.Escalate = escalate.New(func() []anomaly.Event {
+		if r.Detector == nil {
+			return nil
+		}
+		return r.Alarms.Decorate(r.Detector.Active())
+	})
+	r.settings = &settingsMgr{path: o.SettingsPath, apply: r.applySettings}
+	r.API.Settings = r.settings
+	r.API.Escalations = func() any { return r.Escalate.Recent() }
+	seed, err := r.settings.load(o.Seed)
+	if err != nil {
+		return fail(err)
 	}
+	r.settings.mu.Lock()
+	if err := r.settings.set(seed); err != nil {
+		// A stored target that is no longer allowed (e.g. a private
+		// address after switching to multi-tenant) must not keep the
+		// tenant down: run without notifications and say why.
+		log.Error("settings: running without notification targets until fixed", "err", err)
+		_ = r.settings.set(Settings{Shifts: seed.Shifts, TimeZone: seed.TimeZone})
+		r.settings.cur = seed // keep the file's content for the admin to fix
+	}
+	r.settings.mu.Unlock()
+	r.goRun(func() { r.Escalate.Run(ctx, 30*time.Second) })
 	if o.BackupDir != "" {
 		r.API.Backups = &backup.Scheduler{Dir: o.BackupDir, Every: o.BackupEvery, Keep: o.BackupKeep, DB: r.DB,
 			Config: func() backup.Config { return backup.Export(st, o.Creds, true) },
@@ -270,8 +264,13 @@ func (r *Runtime) Close() {
 		r.cancel()
 		r.wg.Wait() // includes the final config save
 		r.stopBg()
-		if r.Notifier != nil {
-			<-r.Notifier.Done()
+		r.liveMu.Lock()
+		if r.reportStop != nil {
+			r.reportStop()
+		}
+		r.liveMu.Unlock()
+		if n := r.notifier.Swap(nil); n != nil {
+			n.stop()
 		}
 		if r.Writer != nil {
 			<-r.Writer.Done()
@@ -280,6 +279,82 @@ func (r *Runtime) Close() {
 			r.DB.Close()
 		}
 	})
+}
+
+// running is a notifier with its delivery loop.
+type running struct {
+	n      *notify.Notifier
+	cancel context.CancelFunc
+}
+
+// stop lets the queue drain, then waits for the loop to end.
+func (x *running) stop() {
+	x.cancel()
+	<-x.n.Done()
+}
+
+// applySettings swaps in notifiers, escalation and shift settings built
+// from s. Called with the settings lock held.
+func (r *Runtime) applySettings(s Settings, ts map[string]*notify.Target, loc *time.Location) {
+	names := func(id string) string {
+		if sv, err := r.Store.Get(id); err == nil && sv.Name != "" {
+			return sv.Name
+		}
+		return id
+	}
+	logf := func(f string, a ...any) { r.log.Warn(fmt.Sprintf(f, a...)) }
+	var next *running
+	if len(s.Notify.Targets) > 0 {
+		kinds := map[string]bool{}
+		for _, k := range s.Notify.Kinds {
+			kinds[k] = true
+		}
+		n := notify.New(notify.Config{Targets: pick(ts, s.Notify.Targets), Secret: s.WebhookSecret, Kinds: kinds,
+			Resolved: s.Notify.Resolved, Cooldown: time.Duration(s.Notify.CooldownMin) * time.Minute,
+			PerMinute: s.Notify.PerMinute, BaseURL: r.publicURL, Names: names, Logf: logf})
+		ctx, cancel := context.WithCancel(context.Background())
+		go n.Run(ctx)
+		next = &running{n, cancel}
+	}
+	if old := r.notifier.Swap(next); old != nil {
+		go old.stop() // queued alerts still go out
+	}
+	var rep *notify.Notifier
+	if len(s.Reports.Targets) > 0 {
+		rep = notify.New(notify.Config{Targets: pick(ts, s.Reports.Targets), Secret: s.WebhookSecret, BaseURL: r.publicURL})
+	}
+	var nn *notify.Notifier
+	if next != nil {
+		nn = next.n
+	}
+	r.API.SetLive(nn, rep, s.Shifts, loc)
+	r.Escalate.SetPolicy(escalationPolicy(s, ts, notify.New(notify.Config{Secret: s.WebhookSecret, BaseURL: r.publicURL, Names: names})))
+
+	r.liveMu.Lock()
+	defer r.liveMu.Unlock()
+	if r.reportStop != nil {
+		r.reportStop()
+		r.reportStop = nil
+	}
+	if rep != nil && len(s.Shifts) > 0 {
+		ctx, cancel := context.WithCancel(r.ctx)
+		r.reportStop = cancel
+		shifts := append([]string(nil), s.Shifts...)
+		r.goRun(func() {
+			report.Schedule(ctx, shifts, loc, func(from, to time.Time) {
+				rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				rp, err := report.Build(rctx, r.Store, r.Analytics, from.UnixMilli(), to.UnixMilli(), "", loc)
+				if err != nil {
+					r.log.Error("shift report", "err", err)
+					return
+				}
+				rp.Link = r.publicURL
+				res := rep.SendReport(rctx, rp.Title+" — "+rp.Period, rp.Text(loc), rp.HTML(loc), rp)
+				r.log.Info("shift report sent", "period", rp.Period, "results", res)
+			}, func(f string, a ...any) { r.log.Error(fmt.Sprintf(f, a...)) })
+		})
+	}
 }
 
 // SetRetention applies a quota change.

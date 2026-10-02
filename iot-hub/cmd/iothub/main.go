@@ -117,6 +117,7 @@ func main() {
 	masterKey := flag.String("master-key", env("IOTHUB_MASTER_KEY", ""), "encrypts device keys at rest (long random secret; keep it outside the data directory)")
 	tenantRate := flag.Float64("tenant-rate", envFloat("IOTHUB_TENANT_RATE", 100), "multi: default messages per second per tenant (0 = unlimited)")
 	tenantDaily := flag.Int64("tenant-daily", int64(envInt("IOTHUB_TENANT_DAILY", 0)), "multi: default messages per day per tenant (0 = unlimited)")
+	allowPrivate := flag.Bool("allow-private-targets", env("IOTHUB_ALLOW_PRIVATE_TARGETS", "") == "true", "multi: let tenants send notifications to private/internal addresses (off: blocked against SSRF)")
 	tenantDevices := flag.Int("tenant-devices", envInt("IOTHUB_TENANT_DEVICES", 1000), "multi: default maximum identities per tenant (0 = unlimited)")
 	flag.Parse()
 
@@ -205,7 +206,8 @@ func main() {
 		RawRetention: *rawKeep, RollupRetention: *rollupKeep,
 		Anomaly:   *anomalyOn,
 		AnomalyCf: anomaly.Config{Z: *anomalyZ, Window: *anomalyWindow, Warmup: *anomalyWarmup, Persist: *anomalyPersist, StaleMin: *staleMin},
-		Shifts:    shiftStarts, Location: time.Local, PublicURL: *publicURL,
+		Seed:      tenant.Settings{Shifts: shiftStarts, TimeZone: *tz},
+		PublicURL: *publicURL,
 		BackupDir: *backupDir, BackupEvery: *backupEvery, BackupKeep: *backupKeep,
 		SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil,
 		Hooks: hooks, Logger: log,
@@ -223,6 +225,7 @@ func main() {
 		if *publicRead || *connectorsFile != "" || len(notifySpecs) > 0 || len(reportSpecs) > 0 {
 			fatal(log, "tenancy", errors.New("-public-read, -connectors, -notify and -report-to are single-tenant options: tenants configure notifications themselves, and PLC connectors run on an edge hub that forwards to its tenant"))
 		}
+		notify.BlockPrivateNetworks(!*allowPrivate)
 		plat := &tenant.Platform{
 			Dir: filepath.Join(filepath.Dir(*dataPath), "tenants"), DBURL: *dbURL, Base: base, Creds: creds,
 			Default: tenant.Quota{MessagesPerSecond: *tenantRate, MessagesPerDay: *tenantDaily, MaxDevices: *tenantDevices},
@@ -248,34 +251,29 @@ func main() {
 		o := base
 		o.ConfigPath, o.DBURL, o.Creds, o.PublicRead = *dataPath, *dbURL, creds, *publicRead
 		o.Web = web.FS
-		if len(notifySpecs) > 0 {
-			var targets []*notify.Target
-			for _, spec := range notifySpecs {
-				t, err := notify.ParseTarget(spec)
-				if err != nil {
-					fatal(log, "notify", err)
-				}
-				targets = append(targets, t)
+		// Flags seed the settings; once an admin saves settings through
+		// the API, settings.json is the source and these flags are ignored.
+		o.SettingsPath = filepath.Join(filepath.Dir(*dataPath), "settings.json")
+		seed := &o.Seed
+		seed.WebhookSecret = *notifySecret
+		seed.Notify = tenant.NotifyCfg{Resolved: *notifyResolved, CooldownMin: int(notifyCooldown.Minutes()), PerMinute: *notifyRate}
+		for _, k := range strings.Split(*notifyKinds, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				seed.Notify.Kinds = append(seed.Notify.Kinds, k)
 			}
-			kinds := map[string]bool{}
-			for _, k := range strings.Split(*notifyKinds, ",") {
-				if k = strings.TrimSpace(k); k != "" {
-					kinds[k] = true
-				}
-			}
-			o.Notify = notify.Config{Targets: targets, Secret: *notifySecret, Kinds: kinds, Resolved: *notifyResolved,
-				Cooldown: *notifyCooldown, PerMinute: *notifyRate, BaseURL: *publicURL}
-			log.Info("notifications", "targets", redactAll(targets))
 		}
-		for _, spec := range reportSpecs {
-			t, err := notify.ParseTarget(spec)
-			if err != nil {
-				fatal(log, "report-to", err)
-			}
-			o.ReportTargets = append(o.ReportTargets, t)
+		for i, spec := range notifySpecs {
+			id := fmt.Sprintf("notify-%d", i+1)
+			seed.Targets = append(seed.Targets, tenant.TargetSpec{ID: id, Spec: spec})
+			seed.Notify.Targets = append(seed.Notify.Targets, id)
 		}
-		if len(o.ReportTargets) > 0 {
-			log.Info("shift reports", "targets", redactAll(o.ReportTargets), "shifts", shiftStarts)
+		for i, spec := range reportSpecs {
+			id := fmt.Sprintf("report-%d", i+1)
+			seed.Targets = append(seed.Targets, tenant.TargetSpec{ID: id, Spec: spec})
+			seed.Reports.Targets = append(seed.Reports.Targets, id)
+		}
+		if _, err := os.Stat(o.SettingsPath); err == nil && (len(notifySpecs) > 0 || len(reportSpecs) > 0) {
+			log.Warn("settings.json exists: -notify and -report-to are ignored (manage targets with /api/settings)", "file", o.SettingsPath)
 		}
 		rt, err := tenant.Open(ctx, auth.DefaultTenant, o)
 		if err != nil {

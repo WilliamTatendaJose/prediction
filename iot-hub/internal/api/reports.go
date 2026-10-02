@@ -23,16 +23,17 @@ func (s *Server) reportWindow(r *http.Request) (int64, int64, string, error) {
 	if shift != "" && shift != "previous" && shift != "current" {
 		return 0, 0, "", fmt.Errorf("%w: shift must be previous or current", store.ErrInvalid)
 	}
-	if len(s.Shifts) == 0 {
+	shifts := s.shifts()
+	if len(shifts) == 0 {
 		now := time.Now()
 		return now.Add(-24 * time.Hour).UnixMilli(), now.UnixMilli(), "last 24 hours", nil
 	}
 	now := time.Now()
 	if shift == "current" {
-		start, err := oee.ShiftStart(now, s.Shifts, s.loc())
+		start, err := oee.ShiftStart(now, shifts, s.loc())
 		return start.UnixMilli(), now.UnixMilli(), "", err
 	}
-	a, b, err := report.PreviousShift(now, s.Shifts, s.loc())
+	a, b, err := report.PreviousShift(now, shifts, s.loc())
 	return a.UnixMilli(), b.UnixMilli(), "", err
 }
 
@@ -72,7 +73,8 @@ func (s *Server) reports(w http.ResponseWriter, r *http.Request) {
 // sendReport: POST /api/reports/send (admin) sends the previous shift's
 // report to the report targets now; used to check setup.
 func (s *Server) sendReport(w http.ResponseWriter, r *http.Request) {
-	if s.Reporter == nil {
+	rp := s.reporter()
+	if rp == nil {
 		writeErr(w, http.StatusConflict, errors.New("no report targets configured (-report-to)"))
 		return
 	}
@@ -86,7 +88,7 @@ func (s *Server) sendReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	res := s.Reporter.SendReport(r.Context(), rep.Title+" — "+rep.Period, rep.Text(s.loc()), rep.HTML(s.loc()), rep)
+	res := rp.SendReport(r.Context(), rep.Title+" — "+rep.Period, rep.Text(s.loc()), rep.HTML(s.loc()), rep)
 	s.audit(r, "report.send", rep.Period, "")
 	writeJSON(w, http.StatusOK, res)
 }
