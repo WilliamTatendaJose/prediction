@@ -21,11 +21,19 @@ type Hub struct {
 	subs    map[chan *Msg]struct{}
 	buf     int
 	Dropped atomic.Uint64
+	done    chan struct{}
+	once    sync.Once
 }
 
 func NewHub(buffer int) *Hub {
-	return &Hub{subs: map[chan *Msg]struct{}{}, buf: buffer}
+	return &Hub{subs: map[chan *Msg]struct{}{}, buf: buffer, done: make(chan struct{})}
 }
+
+// Close ends every stream (the tenant stopped).
+func (h *Hub) Close() { h.once.Do(func() { close(h.done) }) }
+
+// Done is closed by Close.
+func (h *Hub) Done() <-chan struct{} { return h.done }
 
 func (h *Hub) Subscribe() chan *Msg {
 	ch := make(chan *Msg, h.buf)

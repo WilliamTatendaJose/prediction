@@ -63,6 +63,9 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-backup-dir` | `IOTHUB_BACKUP_DIR` | — (off) | scheduled backups: SQLite snapshot + config. Put it on another disk |
 | `-backup-every` | `IOTHUB_BACKUP_EVERY` | `24h` | time between backups |
 | `-backup-keep` | `IOTHUB_BACKUP_KEEP` | `7` | backups of each kind to keep |
+| `-tenancy` | `IOTHUB_TENANCY` | `single` | `multi` = SaaS mode, see [Multi-tenant](#multi-tenant-saas-mode) |
+| `-master-key` | `IOTHUB_MASTER_KEY` | — | encrypts device keys at rest |
+| `-tenant-rate` / `-tenant-daily` / `-tenant-devices` | `IOTHUB_TENANT_RATE` / `_DAILY` / `_DEVICES` | 100 / unlimited / 1000 | default tenant quotas (multi) |
 | `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
 | `-shifts` | `IOTHUB_SHIFTS` | `06:00,14:00,22:00` | shift start times for OEE `from=shift` (empty disables) |
 | `-tz` | `IOTHUB_TZ` | system | plant time zone, e.g. `Africa/Harare` |
@@ -75,10 +78,11 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 
 ## Security
 
-With no `-token` and no credentials file, the hub is **open**, and it logs a warning saying so. Setting `-token` turns authentication on for HTTP and MQTT. That token is the **admin** bootstrap; everything else gets its own token:
+With no `-token` and no credentials file, the hub is **open**, and it logs a warning saying so. Setting `-token` turns authentication on for HTTP and MQTT. That token is the **superadmin** (the platform operator; in single-tenant mode simply the admin). Everything else gets its own credential:
 
 | Role | HTTP | MQTT | Typical holder |
 |---|---|---|---|
+| `superadmin` | everything in every tenant, plus tenant management (multi-tenant) | anything | the platform operator (`-token`) |
 | `admin` | everything, including devices and dashboard layout | publish/subscribe anything | you |
 | `operator` | read; acknowledge and shelve alarms, write notes | subscribe only | shift staff, supervisors |
 | `service` | read; ingest and define **its** sensors | subscribe all; publish its sensors | the ML.NET bridge (`*-ml`) |
@@ -105,6 +109,37 @@ curl -X DELETE https://hub:8443/api/devices/env-node-1 -H "Authorization: Bearer
 - **Headers.** Every response carries a strict Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, and HSTS under TLS.
 - **`/api/health` stays public** for load balancers. It reveals counts, not data.
 
+### Device keys and SAS tokens (as in Azure IoT Hub)
+
+An identity can have a **token**, a **primary/secondary key pair**, or both (`"auth": "token" | "keys" | "both"`). With keys, the device (or your backend) signs short-lived **SAS tokens**. A leaked SAS token expires on its own, and the keys never leave the device.
+
+```bash
+curl -X POST https://hub:8443/api/devices -H "Authorization: Bearer $ADMIN" \
+     -d '{"id":"pump-1","role":"device","sensors":["pump-1"],"auth":"keys"}'
+# → primaryKey, secondaryKey, connectionString:
+#   HostName=hub:8443;TenantId=default;DeviceId=pump-1;SharedAccessKey=…
+```
+
+| | |
+|---|---|
+| SAS format | `SharedAccessSignature sr={tenant}%2Fdevices%2F{id}&sig={sig}&se={unix expiry}` |
+| Signature | `base64(HMAC-SHA256(base64decode(key), urlencode(resource) + "\n" + expiry))`, the same construction as Azure IoT Hub, so its client libraries and samples can generate tokens |
+| HTTP | `Authorization: SharedAccessSignature sr=…` (or `Bearer <token>`) |
+| MQTT | password = the SAS token (or the token) |
+| Lifetime | at most 366 days |
+
+| Endpoint (admin) | |
+|---|---|
+| `POST /api/devices/{id}/sas {"ttl":"24h"}` | issue a SAS token from the primary key, for devices that can't sign |
+| `POST /api/devices/{id}/rotate {"which":"primary"}` | new primary key (or `secondary`, `token`); the other key keeps working, so devices move over without downtime |
+| `GET /api/devices/{id}/keys` | show the keys and connection strings (audited) |
+| `PATCH /api/devices/{id} {"disabled":true}` | disable without deleting; also `sensors`, `note`, `expires` |
+| `POST /api/devices` with `"expires": <unix ms>` | a token that stops working at that time |
+
+Disabling, rotating, narrowing the sensors or changing the expiry drops the device's live MQTT sessions at once.
+
+**Keys at rest.** Keys must be stored to verify signatures. Set `-master-key` (`IOTHUB_MASTER_KEY`, a long random secret kept outside the data directory) and they are encrypted with AES-256-GCM. Existing plain keys are encrypted on the next start. Without it, keys are stored as is in the credentials file (mode 0600).
+
 **TLS.** Use a real certificate if the hub has a DNS name. Otherwise make a small private CA once:
 
 ```bash
@@ -124,6 +159,81 @@ Install `ca.crt` in each client's trust store: Windows *Trusted Root*, Linux `/u
 - a username/id mismatch being rejected
 - an untrusted certificate failing
 - the CSRF header requirement
+
+## Multi-tenant (SaaS) mode
+
+`-tenancy multi` turns one hub into a platform hosting many customers. Each **tenant** is an isolated hub, like one Azure IoT Hub instance per customer:
+- its own sensors, dashboard and live buffers
+- its own anomaly detector and alarm state (acks, shelves, notes, audit)
+- its own live stream and backups
+- its own database: a SQLite file, or a PostgreSQL schema
+
+The superadmin (`-token`) creates tenants, sets their quotas and decides who issues device credentials.
+
+```bash
+iothub -tenancy multi -token "$SUPER" -master-key "$MASTER" -db sqlite:readings.db \
+       -tls-cert hub.crt -tls-key hub.key -mqtt "" -http :8443
+S="Authorization: Bearer $SUPER"
+
+curl -X POST https://hub:8443/api/admin/tenants -H "$S" -d '{"id":"acme","name":"Acme Mining",
+      "quota":{"messagesPerSecond":200,"messagesPerDay":5000000,"maxSensors":500,"maxDevices":200,"rawRetentionDays":30}}'
+# Device credentials for the tenant (only the superadmin, unless deviceSelfService is on):
+curl -X POST https://hub:8443/api/devices -H "$S" -H "X-Tenant: acme" \
+     -d '{"id":"pump-1","role":"device","sensors":["pump-*"],"auth":"keys"}'
+curl -X POST https://hub:8443/api/devices -H "$S" -H "X-Tenant: acme" -d '{"id":"ops","role":"admin"}'   # the customer's admin
+curl https://hub:8443/api/admin/tenants -H "$S"                       # usage: sensors, devices, messages today, rejected
+curl -X PATCH https://hub:8443/api/admin/tenants/acme -H "$S" -d '{"status":"suspended"}'
+curl -X DELETE 'https://hub:8443/api/admin/tenants/acme?confirm=acme' -H "$S"   # erases data, credentials, backups
+```
+
+**How a request finds its tenant:**
+
+| | |
+|---|---|
+| HTTP, tenant user | from the credential. Naming another tenant (`X-Tenant`, `?tenant=`) is refused with 403 |
+| HTTP, superadmin | `X-Tenant: acme` header, or `?tenant=acme` (for EventSource) |
+| MQTT | username `{tenant}/{id}`; topics `{tenant}/iot/{sensor}[/{field}]` and `{tenant}/iot-events/…` |
+| MQTT subscriptions | must start with the caller's own tenant: `acme/#` is allowed; `#`, `+/iot/#` and `$SYS/#` are refused |
+| Dashboard | the same page; signing in with a tenant credential shows that tenant |
+
+**Isolation, in layers:**
+- **The gateway** authenticates once and hands the request only to the caller's tenant.
+- **Each tenant's API server** checks the tenant again, so a gateway bug alone can't leak.
+- **Separate runtimes.** Tenants share no stores, streams or caches.
+- **Separate databases.** SQLite tenants have separate files under `data/tenants/{id}/`. PostgreSQL tenants have separate schemas (`t_{id}`), selected with `search_path`, so every query is confined to one schema.
+- **No adopted leftovers.** A new tenant is refused if a data directory or schema with its name already exists, so it can never adopt an old tenant's data.
+
+**Quotas** (Azure tiers, roughly). Each field is 0 for the platform default and −1 for unlimited:
+
+| Quota | Enforced | Default |
+|---|---|---|
+| `messagesPerSecond` | token bucket with a 2 s burst; excess gets HTTP 429 (MQTT: dropped) | `-tenant-rate` 100 |
+| `messagesPerDay` | count per UTC day | `-tenant-daily` unlimited |
+| `maxSensors` | new sensors refused (507) | `-max-sensors` |
+| `maxDevices` | new identities refused (507) | `-tenant-devices` 1000 |
+| `rawRetentionDays`, `rollupRetentionDays` | pruning | `-raw-retention`, `-rollup-retention` |
+
+Quota changes apply at once, without a restart. One tenant flooding messages is rejected before any work is done, so it can't slow the others.
+
+**Suspension** keeps the data but drops the tenant's MQTT sessions and live streams and refuses its API and sign-in. Resuming restores everything.
+
+**Single-tenant options** (`-public-read`, `-connectors`, `-notify`, `-report-to`) are refused in multi-tenant mode:
+- **PLC connectors** belong on an edge hub at the plant, which forwards to its tenant. A cloud server can't reach plant networks.
+- **Notifications and reports** are configured per tenant through the API.
+
+**Tested** (`internal/gateway`, SQLite and PostgreSQL):
+- **Two tenants, the same names.** `acme` and `globex` use the same sensor names and device ids. Each sees only its own values, stats and history.
+- **Naming another tenant** is refused on every route tried (reads and writes, `X-Tenant` and `?tenant=`).
+- **No leaks** through device listings, config exports, live streams or MQTT:
+  - a username naming another tenant is refused;
+  - a publish into another tenant is dropped;
+  - `#`, `+/iot/#`, the other tenant's topics and `$SYS` are refused.
+- **Suspension** drops MQTT sessions and the data survives a resume. **Deletion** erases the data directory and tokens, and the id can be reused cleanly.
+- **Quotas:** rate (10 of 30 accepted at 5/s, the rest 429), sensors and devices; raising a quota applies at once.
+- **Self-service** off and on.
+- **Mutation check:** with the gateway's tenant check removed, the server's own check still blocks every request. With both removed, or with the broker's topic check removed, the test fails. So the test can detect a leak, and the layers are independent.
+- **PostgreSQL:** separate `t_acme` / `t_globex` schemas; an existing schema is refused instead of adopted. That check was added after the test found a new tenant inheriting a leftover schema's readings.
+- **The built binary:** tenant creation, a keys device, SAS ingest, encrypted keys in the file, and a restart with tenant, data and SAS intact.
 
 ## Sending data
 

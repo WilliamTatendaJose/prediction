@@ -75,7 +75,9 @@ type Server struct {
 	Backups       *backup.Scheduler // optional
 	// SelfService: may tenant admins issue device credentials? nil = yes.
 	SelfService func() bool
-	started     time.Time
+	// MaxDevices is the tenant's identity quota; nil or <= 0 = unlimited.
+	MaxDevices func() int
+	started    time.Time
 }
 
 func (s *Server) Handler() http.Handler {
@@ -206,6 +208,8 @@ func storeErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, err)
 	case errors.Is(err, store.ErrInvalid):
 		writeErr(w, http.StatusBadRequest, err)
+	case errors.Is(err, ingest.ErrQuota):
+		writeErr(w, http.StatusTooManyRequests, err)
 	case errors.Is(err, store.ErrLimit):
 		writeErr(w, http.StatusInsufficientStorage, err)
 	default:
@@ -387,6 +391,8 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-s.Hub.Done():
 			return
 		case <-ping.C:
 			_, _ = io.WriteString(w, ": ping\n\n")

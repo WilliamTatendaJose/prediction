@@ -162,7 +162,22 @@ func (s *Store) List() []SensorView {
 }
 
 // MaxSensors is the configured sensor limit.
-func (s *Store) MaxSensors() int { return s.opts.MaxSensors }
+func (s *Store) MaxSensors() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.opts.MaxSensors
+}
+
+// SetMaxSensors changes the limit (tenant quota). Existing sensors over a
+// lowered limit stay; new ones are refused.
+func (s *Store) SetMaxSensors(n int) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.opts.MaxSensors = n
+	s.mu.Unlock()
+}
 
 // Definitions returns every sensor definition, sorted by ID.
 func (s *Store) Definitions() []Sensor {

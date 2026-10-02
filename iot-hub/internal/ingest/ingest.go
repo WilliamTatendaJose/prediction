@@ -5,6 +5,7 @@ package ingest
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -29,7 +30,13 @@ type Pipeline struct {
 	Alarms *alarm.Manager
 	// Calc computes calculated fields (formulas, integrals) per reading.
 	Calc *calc.Engine
+	// Admit enforces the tenant's message quota; nil = unlimited. It is
+	// called once per message, before any work.
+	Admit func() error
 }
+
+// ErrQuota: the tenant's message rate or daily quota is used up.
+var ErrQuota = errors.New("message quota exceeded")
 
 // Handle accepts either a JSON object of fields ({"temp":21.5,"door":"open"})
 // or, when field is set, a bare value (21.5, true, "open"). A bare value with
@@ -47,6 +54,11 @@ func (p *Pipeline) Handle(sensor, field string, payload []byte) (store.Reading, 
 // HandleValues ingests already-decoded values (used by PLC connectors).
 // ts <= 0 means now.
 func (p *Pipeline) HandleValues(sensor string, ts int64, values map[string]any) (store.Reading, error) {
+	if p.Admit != nil {
+		if err := p.Admit(); err != nil {
+			return store.Reading{}, err
+		}
+	}
 	if ts <= 0 {
 		ts = time.Now().UnixMilli()
 	}

@@ -16,27 +16,21 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
-	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
-	"github.com/williamtatendajose/prediction/iot-hub/internal/backup"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
-	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/gateway"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
-	"github.com/williamtatendajose/prediction/iot-hub/internal/report"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
-	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
-	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/tenant"
 	"github.com/williamtatendajose/prediction/iot-hub/web"
 )
 
@@ -119,6 +113,11 @@ func main() {
 	tz := flag.String("tz", env("IOTHUB_TZ", ""), "plant time zone for shifts and daily reports, e.g. Africa/Harare (default: system)")
 	connectorsFile := flag.String("connectors", env("IOTHUB_CONNECTORS", ""), "Modbus/OPC UA connectors config (JSON); empty disables")
 	debug := flag.Bool("debug", env("IOTHUB_DEBUG", "") == "true", "debug logging")
+	tenancy := flag.String("tenancy", env("IOTHUB_TENANCY", "single"), "single (one hub) or multi (SaaS: isolated tenants, -token is the superadmin)")
+	masterKey := flag.String("master-key", env("IOTHUB_MASTER_KEY", ""), "encrypts device keys at rest (long random secret; keep it outside the data directory)")
+	tenantRate := flag.Float64("tenant-rate", envFloat("IOTHUB_TENANT_RATE", 100), "multi: default messages per second per tenant (0 = unlimited)")
+	tenantDaily := flag.Int64("tenant-daily", int64(envInt("IOTHUB_TENANT_DAILY", 0)), "multi: default messages per day per tenant (0 = unlimited)")
+	tenantDevices := flag.Int("tenant-devices", envInt("IOTHUB_TENANT_DEVICES", 1000), "multi: default maximum identities per tenant (0 = unlimited)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -127,27 +126,25 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	st := store.New(store.Options{
-		Path: *dataPath, Capacity: *capacity, MaxSensors: *maxSensors,
-		MaxFields: *maxFields, AutoRegister: *autoReg,
-	})
-	if err := st.Load(); err != nil {
-		log.Error("load config", "err", err)
-		os.Exit(1)
-	}
-	log.Info("memory bound for readings",
+	log.Info("memory bound for readings per tenant",
 		"maxMB", float64(*maxSensors**maxFields**capacity*12)/(1<<20))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	hub := stream.NewHub(64)
-	pipe := &ingest.Pipeline{Store: st, Hub: hub}
-	an := &analytics.Service{Store: st}
+	multi := *tenancy == "multi"
+	if !multi && *tenancy != "single" {
+		fatal(log, "tenancy", errors.New("must be single or multi"))
+	}
 	creds := auth.New(*authFile, *token)
+	if err := creds.SetMasterKey(*masterKey); err != nil {
+		fatal(log, "master key", err)
+	}
 	if err := creds.Load(); err != nil {
-		log.Error("load credentials", "err", err)
-		os.Exit(1)
+		fatal(log, "load credentials", err)
+	}
+	if *masterKey == "" && multi {
+		log.Warn("no -master-key: device keys (SAS) are stored unencrypted in the credentials file (mode 0600)")
 	}
 	if !creds.Enabled() {
 		log.Warn("AUTHENTICATION IS OFF: anyone who can reach this hub can read and write. Set -token to enable it.")
@@ -156,8 +153,7 @@ func main() {
 	if *tlsCert != "" {
 		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 		if err != nil {
-			log.Error("tls", "err", err)
-			os.Exit(1)
+			fatal(log, "tls", err)
 		}
 		tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 		if *mqttAddr != "" {
@@ -167,8 +163,7 @@ func main() {
 	if *tz != "" {
 		loc, err := time.LoadLocation(*tz)
 		if err != nil {
-			log.Error("tz", "err", err)
-			os.Exit(1)
+			fatal(log, "tz", err)
 		}
 		time.Local = loc
 	}
@@ -176,169 +171,126 @@ func main() {
 	for _, s := range strings.Split(*shifts, ",") {
 		if s = strings.TrimSpace(s); s != "" {
 			if _, err := time.Parse("15:04", s); err != nil {
-				log.Error("shifts", "err", fmt.Errorf("bad shift start %q (want HH:MM)", s))
-				os.Exit(1)
+				fatal(log, "shifts", fmt.Errorf("bad shift start %q (want HH:MM)", s))
 			}
 			shiftStarts = append(shiftStarts, s)
 		}
 	}
-	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Web: web.FS, Analytics: an, Shifts: shiftStarts,
-		Auth: creds, PublicRead: *publicRead, SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil, PublicURL: *publicURL}
-
-	var writer *tsdb.Writer
-	stopWriter := func() {}
-	stopNotifier := func() {}
-	if *dbURL != "" {
-		if p, ok := strings.CutPrefix(*dbURL, "sqlite:"); ok || !strings.Contains(*dbURL, "://") {
-			if p == "" {
-				p = *dbURL
-			}
-			_ = os.MkdirAll(filepath.Dir(p), 0o755)
-		}
-		db, err := tsdb.Open(ctx, *dbURL)
-		if err != nil {
-			log.Error("database", "err", err)
-			os.Exit(1)
-		}
-		defer db.Close()
-		_ = db.CloseOpenEvents(ctx, time.Now().UnixMilli()) // episodes cut short by the last shutdown
-		writer = tsdb.NewWriter(db, 16384)
-		writer.RawRetention, writer.RollupRetention = *rawKeep, *rollupKeep
-		writer.Logf = func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) }
-		// The writer outlives ctx: it is stopped only after the HTTP server and
-		// broker have closed, so in-flight readings still reach the database.
-		wctx, wstop := context.WithCancel(context.Background())
-		stopWriter = wstop
-		go writer.Run(wctx)
-		pipe.Writer, an.DB, srv.Writer = writer, db, writer
-		log.Info("database", "url", redact(*dbURL), "rawRetention", *rawKeep, "rollupRetention", *rollupKeep)
+	if *backupDir != "" && *backupEvery < time.Minute {
+		fatal(log, "backup", errors.New("-backup-every must be at least 1m"))
 	}
 
-	// Alarm handling: acks, notes, shelves, audit log (persisted with a DB).
-	var alarmStore tsdb.AlarmStore
-	if an.DB != nil {
-		alarmStore = an.DB
+	// The broker is created after the tenants (it needs their pipelines);
+	// tenants reach it through these hooks.
+	var mq *broker.Broker
+	hooks := tenant.Hooks{
+		Publish: func(t string, r store.Reading) {
+			if mq != nil {
+				mq.RepublishTo(t, r)
+			}
+		},
+		PublishEvent: func(t string, e anomaly.Event) {
+			if mq != nil {
+				mq.PublishEventTo(t, e)
+			}
+		},
+		Kick: func(t, id string) {
+			if mq != nil {
+				mq.KickTenant(t, id)
+			}
+		},
 	}
-	alarms := alarm.New(alarmStore)
-	if err := alarms.Load(ctx); err != nil {
-		log.Error("load alarm state", "err", err)
-		os.Exit(1)
-	}
-	alarms.OnChange = func(kind string) {
-		hub.Publish(&stream.Msg{Event: "alarms", Data: []byte(`{"kind":"` + kind + `"}`)})
-	}
-	pipe.Alarms, an.Alarms, srv.Alarms = alarms, alarms, alarms
-	pipe.Calc = calc.NewEngine()
-	pipe.Calc.Errors = func(sensor, field string, err error) {
-		log.Debug("calculated field", "sensor", sensor, "field", field, "err", err)
+	base := tenant.Options{
+		Capacity: *capacity, MaxSensors: *maxSensors, MaxFields: *maxFields, AutoRegister: *autoReg,
+		RawRetention: *rawKeep, RollupRetention: *rollupKeep,
+		Anomaly:   *anomalyOn,
+		AnomalyCf: anomaly.Config{Z: *anomalyZ, Window: *anomalyWindow, Warmup: *anomalyWarmup, Persist: *anomalyPersist, StaleMin: *staleMin},
+		Shifts:    shiftStarts, Location: time.Local, PublicURL: *publicURL,
+		BackupDir: *backupDir, BackupEvery: *backupEvery, BackupKeep: *backupKeep,
+		SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil,
+		Hooks: hooks, Logger: log,
 	}
 
-	var notifier *notify.Notifier
-	if len(notifySpecs) > 0 {
-		var targets []*notify.Target
-		for _, spec := range notifySpecs {
-			t, err := notify.ParseTarget(spec)
-			if err != nil {
-				log.Error("notify", "err", err)
-				os.Exit(1)
-			}
-			targets = append(targets, t)
+	var handler http.Handler
+	var resolver broker.Resolver
+	var pipe *ingest.Pipeline
+	var closeTenants func()
+	brokerAuth := creds
+	if multi {
+		if *token == "" {
+			fatal(log, "tenancy", errors.New("multi-tenant mode needs -token (the superadmin token)"))
 		}
-		kinds := map[string]bool{}
-		for _, k := range strings.Split(*notifyKinds, ",") {
-			if k = strings.TrimSpace(k); k != "" {
-				kinds[k] = true
-			}
+		if *publicRead || *connectorsFile != "" || len(notifySpecs) > 0 || len(reportSpecs) > 0 {
+			fatal(log, "tenancy", errors.New("-public-read, -connectors, -notify and -report-to are single-tenant options: tenants configure notifications themselves, and PLC connectors run on an edge hub that forwards to its tenant"))
 		}
-		notifier = notify.New(notify.Config{
-			Targets: targets, Secret: *notifySecret, Kinds: kinds, Resolved: *notifyResolved,
-			Cooldown: *notifyCooldown, PerMinute: *notifyRate, BaseURL: *publicURL,
-			Names: func(id string) string {
-				if sv, err := st.Get(id); err == nil && sv.Name != "" {
-					return sv.Name
+		plat := &tenant.Platform{
+			Dir: filepath.Join(filepath.Dir(*dataPath), "tenants"), DBURL: *dbURL, Base: base, Creds: creds,
+			Default: tenant.Quota{MessagesPerSecond: *tenantRate, MessagesPerDay: *tenantDaily, MaxDevices: *tenantDevices},
+			OnStop: func(id string) {
+				if mq != nil {
+					mq.KickTenant(id, "")
 				}
-				return id
 			},
-			Logf: func(f string, a ...any) { log.Warn(fmt.Sprintf(f, a...)) },
-		})
-		// Like the DB writer, it outlives ctx so alerts raised during
-		// shutdown still go out.
-		nctx, nstop := context.WithCancel(context.Background())
-		stopNotifier = nstop
-		go notifier.Run(nctx)
-		srv.Notifier = notifier
-		pipe.OnEvent = notifier.Notify
-		names := make([]string, len(targets))
-		for i, t := range targets {
-			names[i] = t.Redacted()
 		}
-		log.Info("notifications", "targets", names)
-	}
-
-	if *backupDir != "" {
-		if *backupEvery < time.Minute {
-			log.Error("backup-every must be at least 1m")
-			os.Exit(2)
+		if err := plat.Load(ctx); err != nil {
+			fatal(log, "tenants", err)
 		}
-		srv.Backups = &backup.Scheduler{Dir: *backupDir, Every: *backupEvery, Keep: *backupKeep, DB: an.DB,
-			Config: func() backup.Config { return backup.Export(st, creds, true) },
-			Logf:   func(f string, a ...any) { log.Info(fmt.Sprintf(f, a...)) }}
-		go srv.Backups.Run(ctx)
-		snap := "config only (database snapshots need SQLite; use pg_dump)"
-		if sn, ok := an.DB.(tsdb.Snapshotter); ok && sn.CanSnapshot() {
-			snap = "database + config"
-		} else if an.DB == nil {
-			snap = "config only (no database)"
+		static, err := api.StaticHandler(web.FS)
+		if err != nil {
+			fatal(log, "dashboard", err)
 		}
-		log.Info("backups", "dir", *backupDir, "every", *backupEvery, "keep", *backupKeep, "contents", snap)
-	}
-
-	if len(reportSpecs) > 0 {
-		var targets []*notify.Target
-		names := make([]string, 0, len(reportSpecs))
+		gw := &gateway.Gateway{Platform: plat, Creds: creds.Platform(), Static: static,
+			SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil, Logger: log}
+		handler, resolver, closeTenants = gw.Handler(), platformResolver{plat}, plat.Close
+		brokerAuth = creds.Platform()
+		log.Info("multi-tenant", "tenants", len(plat.List()), "dir", plat.Dir)
+	} else {
+		o := base
+		o.ConfigPath, o.DBURL, o.Creds, o.PublicRead = *dataPath, *dbURL, creds, *publicRead
+		o.Web = web.FS
+		if len(notifySpecs) > 0 {
+			var targets []*notify.Target
+			for _, spec := range notifySpecs {
+				t, err := notify.ParseTarget(spec)
+				if err != nil {
+					fatal(log, "notify", err)
+				}
+				targets = append(targets, t)
+			}
+			kinds := map[string]bool{}
+			for _, k := range strings.Split(*notifyKinds, ",") {
+				if k = strings.TrimSpace(k); k != "" {
+					kinds[k] = true
+				}
+			}
+			o.Notify = notify.Config{Targets: targets, Secret: *notifySecret, Kinds: kinds, Resolved: *notifyResolved,
+				Cooldown: *notifyCooldown, PerMinute: *notifyRate, BaseURL: *publicURL}
+			log.Info("notifications", "targets", redactAll(targets))
+		}
 		for _, spec := range reportSpecs {
 			t, err := notify.ParseTarget(spec)
 			if err != nil {
-				log.Error("report-to", "err", err)
-				os.Exit(2)
+				fatal(log, "report-to", err)
 			}
-			targets = append(targets, t)
-			names = append(names, t.Redacted())
+			o.ReportTargets = append(o.ReportTargets, t)
 		}
-		srv.Reporter = notify.New(notify.Config{Targets: targets, Secret: *notifySecret, BaseURL: *publicURL})
-		if len(shiftStarts) > 0 {
-			go report.Schedule(ctx, shiftStarts, time.Local, func(from, to time.Time) {
-				rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-				defer cancel()
-				rep, err := report.Build(rctx, st, an, from.UnixMilli(), to.UnixMilli(), "", time.Local)
-				if err != nil {
-					log.Error("shift report", "err", err)
-					return
-				}
-				rep.Link = *publicURL
-				res := srv.Reporter.SendReport(rctx, rep.Title+" — "+rep.Period, rep.Text(time.Local), rep.HTML(time.Local), rep)
-				log.Info("shift report sent", "period", rep.Period, "results", res)
-			}, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) })
+		if len(o.ReportTargets) > 0 {
+			log.Info("shift reports", "targets", redactAll(o.ReportTargets), "shifts", shiftStarts)
 		}
-		log.Info("shift reports", "targets", names, "shifts", shiftStarts)
-	}
-
-	if *anomalyOn {
-		det := anomaly.New(anomaly.Config{Z: *anomalyZ, Window: *anomalyWindow, Warmup: *anomalyWarmup, Persist: *anomalyPersist, StaleMin: *staleMin})
-		pipe.Detector, an.Detector, srv.Detector = det, det, det
-	}
-	persistDone := make(chan struct{})
-	go func() {
-		st.RunPersist(ctx, time.Second, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) })
-		close(persistDone)
-	}()
-
-	var mq *broker.Broker
-	// Restore live state from the database before any transport starts, so
-	// tiles show the last known values (and recent history) immediately
-	// after a restart instead of staying blank until each sensor reports.
-	if an.DB != nil {
-		restoreLive(ctx, an.DB, st, pipe.Detector, *capacity, log)
+		rt, err := tenant.Open(ctx, auth.DefaultTenant, o)
+		if err != nil {
+			fatal(log, "start", err)
+		}
+		if *dbURL != "" {
+			log.Info("database", "url", redact(*dbURL), "rawRetention", *rawKeep, "rollupRetention", *rollupKeep)
+		}
+		if *backupDir != "" {
+			log.Info("backups", "dir", *backupDir, "every", *backupEvery, "keep", *backupKeep)
+		}
+		handler, pipe, closeTenants = rt.Handler, rt.Pipe, rt.Close
+		if *connectorsFile != "" {
+			startConnectors(ctx, *connectorsFile, filepath.Dir(*authFile), rt, log)
+		}
 	}
 
 	mqttsAddr := ""
@@ -348,82 +300,25 @@ func main() {
 	if *mqttAddr != "" || *mqttWS != "" || mqttsAddr != "" {
 		var err error
 		mq, err = broker.New(broker.Config{
-			TCPAddr: *mqttAddr, WSAddr: *mqttWS, TLSAddr: mqttsAddr, TLS: tlsCfg, Prefix: *prefix, Auth: creds,
-			Logger: log.With("component", "mqtt"),
+			TCPAddr: *mqttAddr, WSAddr: *mqttWS, TLSAddr: mqttsAddr, TLS: tlsCfg, Prefix: *prefix, Auth: brokerAuth,
+			Tenants: resolver, Logger: log.With("component", "mqtt"),
 		}, pipe)
 		if err != nil {
-			log.Error("mqtt", "err", err)
-			os.Exit(1)
-		}
-		srv.OnIngest = mq.Republish
-		srv.OnRevoke = func(id string) { mq.Kick(id) }
-		if notifier != nil {
-			pipe.OnEvent = func(e anomaly.Event) { mq.PublishEvent(e); notifier.Notify(e) }
-		} else {
-			pipe.OnEvent = mq.PublishEvent
+			fatal(log, "mqtt", err)
 		}
 		if err := mq.Serve(); err != nil {
-			log.Error("mqtt serve", "err", err)
-			os.Exit(1)
+			fatal(log, "mqtt serve", err)
 		}
-		log.Info("mqtt listening", "tcp", *mqttAddr, "tls", mqttsAddr, "ws", *mqttWS, "topics", *prefix+"/{sensor}[/{field}]")
-	}
-
-	if *connectorsFile != "" {
-		cc, err := connect.Load(*connectorsFile)
-		if err != nil {
-			log.Error("connectors", "err", err)
-			os.Exit(1)
+		topics := *prefix + "/{sensor}[/{field}]"
+		if multi {
+			topics = "{tenant}/" + topics + " (username {tenant}/{id})"
 		}
-		for i := range cc.OPCUA {
-			cc.OPCUA[i].CertDir = filepath.Dir(*authFile)
-		}
-		clog := log.With("component", "connect")
-		conns := connect.Start(ctx, cc, connect.Target{
-			Ingest: func(sensor string, ts int64, values map[string]any) {
-				r, err := pipe.HandleValues(sensor, ts, values)
-				if err != nil {
-					clog.Debug("ingest rejected", "sensor", sensor, "err", err)
-					return
-				}
-				if srv.OnIngest != nil {
-					srv.OnIngest(r) // PLC data appears on MQTT like any other reading
-				}
-			},
-			Define: func(sensor string, fields map[string]connect.FieldInfo) {
-				defineFields(st, sensor, fields, clog)
-			},
-			Logf: func(f string, a ...any) { clog.Warn(fmt.Sprintf(f, a...)) },
-		})
-		srv.Connectors = func() []connect.Status {
-			out := make([]connect.Status, len(conns))
-			for i, c := range conns {
-				out[i] = c.Status()
-			}
-			return out
-		}
-		log.Info("connectors started", "modbus", len(cc.Modbus), "opcua", len(cc.OPCUA))
-	}
-
-	// Started only after the pipeline is fully wired (OnEvent above).
-	if det := pipe.Detector; det != nil {
-		go func() {
-			t := time.NewTicker(10 * time.Second)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case now := <-t.C:
-					pipe.Emit(det.CheckStale(now.UnixMilli()))
-				}
-			}
-		}()
+		log.Info("mqtt listening", "tcp", *mqttAddr, "tls", mqttsAddr, "ws", *mqttWS, "topics", topics)
 	}
 
 	httpSrv := &http.Server{
 		Addr:              *httpAddr,
-		Handler:           srv.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
@@ -453,56 +348,69 @@ func main() {
 	if mq != nil {
 		_ = mq.Close()
 	}
-	<-persistDone
-	stopNotifier()
-	if srv.Notifier != nil {
-		<-srv.Notifier.Done()
-	}
-	stopWriter()
-	if writer != nil {
-		<-writer.Done() // final flush before the deferred db.Close
-	}
+	closeTenants() // final config saves, notifier drain, database flush
 }
 
-func restoreLive(ctx context.Context, db tsdb.DB, st *store.Store, det *anomaly.Detector, limit int, log *slog.Logger) {
-	t0 := time.Now()
-	series, points := 0, 0
-	gaps := map[string]float64{} // sensor -> typical reporting interval (ms)
-	err := db.Latest(ctx, limit, func(sensor, field string, ts []int64, vals []float64, text string, textTS int64) {
-		if !st.Restore(sensor, field, ts, vals, text, textTS) {
-			return
-		}
-		series++
-		points += len(ts)
-		if det == nil || len(vals) == 0 {
-			return
-		}
-		sv, _ := st.Get(sensor)
-		if sv.Fields[field].Type != "bool" { // booleans are not spike-checked
-			det.Warm(sensor, field, vals, st.Rule(sensor, field))
-		}
-		if len(ts) >= 4 {
-			d := make([]float64, 0, len(ts)-1)
-			for i := 1; i < len(ts); i++ {
-				d = append(d, float64(ts[i]-ts[i-1]))
-			}
-			sort.Float64s(d)
-			if m := d[len(d)/2]; m > 0 && (gaps[sensor] == 0 || m < gaps[sensor]) {
-				gaps[sensor] = m // median gap: robust to outages in the history
-			}
-		}
-	})
+func fatal(log *slog.Logger, what string, err error) {
+	log.Error(what, "err", err)
+	os.Exit(1)
+}
+
+func redactAll(ts []*notify.Target) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = t.Redacted()
+	}
+	return out
+}
+
+// platformResolver gives the broker each active tenant's pipeline.
+type platformResolver struct{ p *tenant.Platform }
+
+func (r platformResolver) Pipeline(t string) (*ingest.Pipeline, error) {
+	rt, err := r.p.Runtime(t)
 	if err != nil {
-		log.Error("restore live state", "err", err)
-		return
+		return nil, err
 	}
-	if det != nil {
-		now := time.Now().UnixMilli()
-		for _, sv := range st.List() {
-			det.Resume(sv.ID, gaps[sv.ID], now)
+	if rt == nil {
+		return nil, tenant.ErrNotFound
+	}
+	return rt.Pipe, nil
+}
+
+func startConnectors(ctx context.Context, file, certDir string, rt *tenant.Runtime, log *slog.Logger) {
+	cc, err := connect.Load(file)
+	if err != nil {
+		fatal(log, "connectors", err)
+	}
+	for i := range cc.OPCUA {
+		cc.OPCUA[i].CertDir = certDir
+	}
+	clog := log.With("component", "connect")
+	conns := connect.Start(ctx, cc, connect.Target{
+		Ingest: func(sensor string, ts int64, values map[string]any) {
+			r, err := rt.Pipe.HandleValues(sensor, ts, values)
+			if err != nil {
+				clog.Debug("ingest rejected", "sensor", sensor, "err", err)
+				return
+			}
+			if rt.API.OnIngest != nil {
+				rt.API.OnIngest(r) // PLC data appears on MQTT like any other reading
+			}
+		},
+		Define: func(sensor string, fields map[string]connect.FieldInfo) {
+			defineFields(rt.Store, sensor, fields, clog)
+		},
+		Logf: func(f string, a ...any) { clog.Warn(fmt.Sprintf(f, a...)) },
+	})
+	rt.API.Connectors = func() []connect.Status {
+		out := make([]connect.Status, len(conns))
+		for i, c := range conns {
+			out[i] = c.Status()
 		}
+		return out
 	}
-	log.Info("restored live state", "series", series, "points", points, "took", time.Since(t0).Round(time.Millisecond))
+	log.Info("connectors started", "modbus", len(cc.Modbus), "opcua", len(cc.OPCUA))
 }
 
 // defineFields adds units/labels declared by a connector to the sensor

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -627,4 +628,64 @@ func (s *sqlDB) Snapshot(ctx context.Context, path string) error {
 	}
 	_, err := s.db.ExecContext(ctx, "VACUUM INTO ?", path)
 	return err
+}
+
+var schemaRe = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+
+func isPostgres(url string) bool {
+	return strings.HasPrefix(url, "postgres://") || strings.HasPrefix(url, "postgresql://")
+}
+
+// OpenSchema opens a database for one tenant. For PostgreSQL the tenant's
+// tables live in their own schema (created if missing) selected with
+// search_path, so every query in this package stays unqualified and can
+// only see that tenant's tables. Other URLs open as usual (SQLite tenants
+// get their own file).
+func OpenSchema(ctx context.Context, url, schema string) (DB, error) {
+	if schema == "" || !isPostgres(url) {
+		return Open(ctx, url)
+	}
+	if !schemaRe.MatchString(schema) {
+		return nil, fmt.Errorf("bad schema name %q", schema)
+	}
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		return nil, err
+	}
+	_, err = db.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS "`+schema+`"`)
+	db.Close()
+	if err != nil {
+		return nil, fmt.Errorf("create schema %s: %w", schema, err)
+	}
+	sep := "?"
+	if strings.Contains(url, "?") {
+		sep = "&"
+	}
+	return openSQL(ctx, "pgx", url+sep+"search_path="+schema, true)
+}
+
+// DropSchema deletes a tenant's PostgreSQL schema and all its data.
+func DropSchema(ctx context.Context, url, schema string) error {
+	if !isPostgres(url) || !schemaRe.MatchString(schema) {
+		return fmt.Errorf("bad schema %q", schema)
+	}
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`)
+	return err
+}
+
+// SchemaExists reports whether a PostgreSQL schema exists.
+func SchemaExists(ctx context.Context, url, schema string) (bool, error) {
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	var n int
+	err = db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1`, schema).Scan(&n)
+	return n > 0, err
 }

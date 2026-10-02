@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 )
 
 const cookieName = "iothub_token"
@@ -20,14 +21,34 @@ type identityKey struct{}
 // actor is who made the request, for the audit log.
 func actor(r *http.Request) string {
 	if id, ok := r.Context().Value(identityKey{}).(*auth.Identity); ok && id != nil {
-		return id.ID
+		return id.ID // "admin" is reserved: it can only be the platform superadmin
 	}
 	return "unknown"
 }
 
+type gatewayKey struct{}
+
+type gatewayAuth struct {
+	id        *auth.Identity
+	viaCookie bool
+}
+
+// WithIdentity marks a request as authenticated by the platform gateway,
+// which resolved the tenant and hands the request only to that tenant's
+// Server. Never derived from anything the client sends.
+func WithIdentity(r *http.Request, id *auth.Identity, viaCookie bool) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), gatewayKey{}, gatewayAuth{id, viaCookie}))
+}
+
+// CookieName is the login cookie (shared with the gateway).
+const CookieName = cookieName
+
 // identity resolves the caller from "Authorization: Bearer <token>" or the
 // login cookie. viaCookie reports which, for the CSRF check.
 func (s *Server) identity(r *http.Request) (id *auth.Identity, viaCookie, ok bool) {
+	if g, found := r.Context().Value(gatewayKey{}).(gatewayAuth); found {
+		return g.id, g.viaCookie, g.id != nil
+	}
 	if h := r.Header.Get("Authorization"); h != "" {
 		if strings.HasPrefix(h, auth.SASPrefix) { // Azure IoT Hub style
 			id, ok = s.Auth.Authenticate(h)
@@ -72,6 +93,12 @@ func (s *Server) require(a auth.Action, next http.HandlerFunc) http.HandlerFunc 
 			writeErr(w, http.StatusForbidden, errors.New("missing X-Requested-With header"))
 			return
 		}
+		// Defence in depth: the gateway routes by tenant, and the server
+		// also refuses any identity from another tenant.
+		if !id.InTenant(s.tenantID()) {
+			writeErr(w, http.StatusForbidden, errors.New("wrong tenant"))
+			return
+		}
 		if !id.Can(a, r.PathValue("id")) {
 			writeErr(w, http.StatusForbidden, errors.New(id.ID+" ("+string(id.Role)+") is not allowed to do this"))
 			return
@@ -79,6 +106,9 @@ func (s *Server) require(a auth.Action, next http.HandlerFunc) http.HandlerFunc 
 		next(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
 	}
 }
+
+// SecureHeaders adds browser hardening to every response.
+func SecureHeaders(next http.Handler, tls bool) http.Handler { return secureHeaders(next, tls) }
 
 // secureHeaders adds browser hardening to every response.
 func secureHeaders(next http.Handler, tls bool) http.Handler {
@@ -196,6 +226,12 @@ func (s *Server) addDevice(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if s.MaxDevices != nil {
+		if n := s.MaxDevices(); n > 0 && s.Auth.Count() >= n {
+			writeErr(w, http.StatusInsufficientStorage, fmt.Errorf("%w: max %d devices for this tenant", store.ErrLimit, n))
+			return
+		}
 	}
 	sec, err := s.Auth.Create(req)
 	if err != nil {

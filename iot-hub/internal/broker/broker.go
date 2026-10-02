@@ -39,12 +39,29 @@ type Config struct {
 	// token). Nil or no credentials configured = open broker.
 	Auth   *auth.Store
 	Logger *slog.Logger
+	// Tenants switches to multi-tenant topics: {tenant}/{prefix}/{sensor}.
+	// Usernames are {tenant}/{id}; Auth must then be the platform view.
+	Tenants Resolver
+}
+
+// Resolver finds an active tenant's pipeline.
+type Resolver interface {
+	Pipeline(tenant string) (*ingest.Pipeline, error)
 }
 
 type Broker struct {
 	srv    *mqtt.Server
 	prefix string
 	acl    *aclHook
+	multi  bool
+}
+
+// root is a tenant's topic namespace.
+func (b *Broker) root(tenant string) string {
+	if b.multi {
+		return tenant + "/"
+	}
+	return ""
 }
 
 func New(cfg Config, p *ingest.Pipeline) (*Broker, error) {
@@ -66,11 +83,11 @@ func New(cfg Config, p *ingest.Pipeline) (*Broker, error) {
 	if cfg.Auth == nil {
 		cfg.Auth = auth.New("", "")
 	}
-	acl := &aclHook{store: cfg.Auth, prefix: cfg.Prefix, ids: map[*mqtt.Client]*auth.Identity{}}
+	acl := &aclHook{store: cfg.Auth, prefix: cfg.Prefix, ids: map[*mqtt.Client]*auth.Identity{}, tenants: cfg.Tenants}
 	if err := srv.AddHook(acl, nil); err != nil {
 		return nil, err
 	}
-	if err := srv.AddHook(&ingestHook{p: p, prefix: cfg.Prefix + "/", log: srv.Log}, nil); err != nil {
+	if err := srv.AddHook(&ingestHook{p: p, prefix: cfg.Prefix + "/", log: srv.Log, tenants: cfg.Tenants}, nil); err != nil {
 		return nil, err
 	}
 	if cfg.TCPAddr != "" {
@@ -91,7 +108,7 @@ func New(cfg Config, p *ingest.Pipeline) (*Broker, error) {
 			return nil, err
 		}
 	}
-	return &Broker{srv: srv, prefix: cfg.Prefix, acl: acl}, nil
+	return &Broker{srv: srv, prefix: cfg.Prefix, acl: acl, multi: cfg.Tenants != nil}, nil
 }
 
 func (b *Broker) Serve() error { return b.srv.Serve() }
@@ -100,7 +117,10 @@ func (b *Broker) Close() error { return b.srv.Close() }
 // Republish forwards a reading that arrived over REST onto MQTT so
 // subscribers see every reading regardless of transport. Inline publishes are
 // skipped by ingestHook, so this cannot loop.
-func (b *Broker) Republish(r store.Reading) {
+func (b *Broker) Republish(r store.Reading) { b.RepublishTo(auth.DefaultTenant, r) }
+
+// RepublishTo publishes a reading in a tenant's namespace.
+func (b *Broker) RepublishTo(tenant string, r store.Reading) {
 	m := make(map[string]any, len(r.Values)+1)
 	for k, v := range r.Values {
 		m[k] = v
@@ -110,14 +130,15 @@ func (b *Broker) Republish(r store.Reading) {
 	if err != nil {
 		return
 	}
-	_ = b.srv.Publish(b.prefix+"/"+r.Sensor, payload, false, 0)
+	_ = b.srv.Publish(b.root(tenant)+b.prefix+"/"+r.Sensor, payload, false, 0)
 }
 
 type ingestHook struct {
 	mqtt.HookBase
-	p      *ingest.Pipeline
-	prefix string
-	log    *slog.Logger
+	p       *ingest.Pipeline
+	prefix  string
+	log     *slog.Logger
+	tenants Resolver
 }
 
 func (h *ingestHook) ID() string { return "iot-ingest" }
@@ -125,10 +146,25 @@ func (h *ingestHook) ID() string { return "iot-ingest" }
 func (h *ingestHook) Provides(b byte) bool { return b == mqtt.OnPublished }
 
 func (h *ingestHook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
-	if cl.Net.Inline || !strings.HasPrefix(pk.TopicName, h.prefix) {
+	if cl.Net.Inline {
 		return
 	}
-	parts := strings.Split(pk.TopicName[len(h.prefix):], "/")
+	topic, p := pk.TopicName, h.p
+	if h.tenants != nil { // {tenant}/{prefix}/...; the ACL already checked the tenant
+		tenant, rest, ok := strings.Cut(topic, "/")
+		if !ok {
+			return
+		}
+		pp, err := h.tenants.Pipeline(tenant)
+		if err != nil {
+			return
+		}
+		topic, p = rest, pp
+	}
+	if !strings.HasPrefix(topic, h.prefix) {
+		return
+	}
+	parts := strings.Split(topic[len(h.prefix):], "/")
 	var sensor, field string
 	switch len(parts) {
 	case 1:
@@ -138,25 +174,28 @@ func (h *ingestHook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
 	default:
 		return
 	}
-	if _, err := h.p.Handle(sensor, field, bytes.Clone(pk.Payload)); err != nil {
+	if _, err := p.Handle(sensor, field, bytes.Clone(pk.Payload)); err != nil {
 		h.log.Debug("mqtt ingest rejected", "topic", pk.TopicName, "err", err)
 	}
 }
 
 // Kick disconnects every session authenticated as id (after revocation).
-func (b *Broker) Kick(id string) int {
-	return b.acl.kick(id)
-}
+func (b *Broker) Kick(id string) int { return b.acl.kick(auth.DefaultTenant, id) }
+
+// KickTenant disconnects a tenant's sessions of id ("" = all of them, when
+// the tenant is suspended or deleted).
+func (b *Broker) KickTenant(tenant, id string) int { return b.acl.kick(tenant, id) }
 
 var errRevoked = errors.New("credentials revoked")
 
 // aclHook authenticates CONNECT and authorises every publish/subscribe.
 type aclHook struct {
 	mqtt.HookBase
-	store  *auth.Store
-	prefix string
-	mu     sync.Mutex
-	ids    map[*mqtt.Client]*auth.Identity
+	store   *auth.Store
+	prefix  string
+	tenants Resolver
+	mu      sync.Mutex
+	ids     map[*mqtt.Client]*auth.Identity
 }
 
 func (h *aclHook) ID() string { return "iot-acl" }
@@ -170,9 +209,21 @@ func (h *aclHook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool
 	if !ok {
 		return false
 	}
-	// Bind the session to the identity: a device's username must be its id,
-	// so logs and client lists show who is connected.
-	if id.ID != "admin" && id != auth.Anonymous && string(pk.Connect.Username) != id.ID {
+	user := string(pk.Connect.Username)
+	if h.tenants != nil {
+		// Multi-tenant: the username is {tenant}/{id}, as in Azure IoT Hub,
+		// and the tenant must be active.
+		if id.Role != auth.Superadmin {
+			if user != id.Tenant+"/"+id.ID {
+				return false
+			}
+			if _, err := h.tenants.Pipeline(id.Tenant); err != nil {
+				return false
+			}
+		}
+	} else if id.ID != "admin" && id != auth.Anonymous && user != id.ID {
+		// Bind the session to the identity: a device's username must be its
+		// id, so logs and client lists show who is connected.
 		return false
 	}
 	h.mu.Lock()
@@ -194,6 +245,20 @@ func (h *aclHook) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 	if id == nil {
 		return false
 	}
+	if h.tenants != nil {
+		// Every topic lives under a literal tenant segment. A subscription
+		// filter must start with the caller's own tenant, so no wildcard
+		// can reach another tenant's topics.
+		if id.Role != auth.Superadmin {
+			rest, ok := strings.CutPrefix(topic, id.Tenant+"/")
+			if !ok {
+				return false
+			}
+			topic = rest
+		} else if _, rest, ok := strings.Cut(topic, "/"); ok && write {
+			topic = rest
+		}
+	}
 	if !write {
 		return id.Can(auth.Subscribe, "")
 	}
@@ -213,11 +278,11 @@ func (h *aclHook) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 	return id.Can(auth.Ingest, parts[0])
 }
 
-func (h *aclHook) kick(id string) int {
+func (h *aclHook) kick(tenant, id string) int {
 	h.mu.Lock()
 	var victims []*mqtt.Client
 	for cl, ident := range h.ids {
-		if ident.ID == id {
+		if ident.Tenant == tenant && (id == "" || ident.ID == id) {
 			victims = append(victims, cl)
 		}
 	}
@@ -230,10 +295,12 @@ func (h *aclHook) kick(id string) int {
 
 // PublishEvent sends an anomaly episode to {prefix}-events/anomaly/{sensor}.
 // It sits outside the ingest prefix so subscribers to iot/# see only data.
-func (b *Broker) PublishEvent(e anomaly.Event) {
+func (b *Broker) PublishEvent(e anomaly.Event) { b.PublishEventTo(auth.DefaultTenant, e) }
+
+func (b *Broker) PublishEventTo(tenant string, e anomaly.Event) {
 	payload, err := json.Marshal(e)
 	if err != nil {
 		return
 	}
-	_ = b.srv.Publish(b.prefix+"-events/anomaly/"+e.Sensor, payload, false, 0)
+	_ = b.srv.Publish(b.root(tenant)+b.prefix+"-events/anomaly/"+e.Sensor, payload, false, 0)
 }

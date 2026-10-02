@@ -10,6 +10,7 @@ package tsdb
 import (
 	"context"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -96,6 +97,7 @@ type Writer struct {
 	RawRetention, RollupRetention time.Duration
 	Logf                          func(string, ...any)
 
+	retMu   sync.Mutex // guards the retention fields after Run starts
 	pts     chan Point
 	evs     chan anomaly.Event
 	done    chan struct{}
@@ -216,8 +218,18 @@ func (w *Writer) Run(ctx context.Context) {
 
 func (w *Writer) Done() <-chan struct{} { return w.done }
 
+// SetRetention changes retention while the writer runs (tenant quotas).
+func (w *Writer) SetRetention(raw, rollup time.Duration) {
+	w.retMu.Lock()
+	w.RawRetention, w.RollupRetention = raw, rollup
+	w.retMu.Unlock()
+}
+
 func (w *Writer) prune() {
-	if w.RawRetention <= 0 && w.RollupRetention <= 0 {
+	w.retMu.Lock()
+	raw, rollup := w.RawRetention, w.RollupRetention
+	w.retMu.Unlock()
+	if raw <= 0 && rollup <= 0 {
 		return
 	}
 	now := time.Now()
@@ -227,13 +239,13 @@ func (w *Writer) prune() {
 		}
 		return now.Add(-d).UnixMilli()
 	}
-	evBefore := before(max(w.RawRetention, w.RollupRetention))
-	if w.RawRetention <= 0 || w.RollupRetention <= 0 {
+	evBefore := before(max(raw, rollup))
+	if raw <= 0 || rollup <= 0 {
 		evBefore = 0 // something is kept forever; keep its events too
 	}
 	c, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	if err := w.DB.Prune(c, before(w.RawRetention), before(w.RollupRetention), evBefore); err != nil {
+	if err := w.DB.Prune(c, before(raw), before(rollup), evBefore); err != nil {
 		w.fail("prune", err)
 	}
 }

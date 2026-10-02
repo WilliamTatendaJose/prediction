@@ -122,3 +122,12 @@ func etagMatch(header, etag string) bool {
 	}
 	return false
 }
+
+// StaticHandler serves dashboard files (shared by every tenant).
+func StaticHandler(fsys fs.FS) (http.Handler, error) {
+	a, err := loadAssets(fsys)
+	if err != nil {
+		return nil, err
+	}
+	return staticHandler(a), nil
+}
