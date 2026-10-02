@@ -53,6 +53,13 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-anomaly-persist` | `IOTHUB_ANOMALY_PERSIST` | `2` | consecutive outliers before a spike opens |
 | `-anomaly-warmup` | `IOTHUB_ANOMALY_WARMUP` | `30` | samples before spike detection starts |
 | `-stale-min` | `IOTHUB_STALE_MIN` | `1m` | minimum silence before "stale" (0 disables) |
+| `-notify` (repeatable) | `IOTHUB_NOTIFY` (space-separated) | — | alert targets, `kind=URL` (see Notifications) |
+| `-notify-secret` | `IOTHUB_NOTIFY_SECRET` | — | HMAC key for generic webhook signatures |
+| `-notify-kinds` | `IOTHUB_NOTIFY_KINDS` | all | e.g. `range,stale` |
+| `-notify-resolved` | `IOTHUB_NOTIFY_RESOLVED` | `true` | also send "resolved" messages |
+| `-notify-cooldown` | `IOTHUB_NOTIFY_COOLDOWN` | `10m` | hold repeats for the same sensor/field/kind |
+| `-notify-per-minute` | `IOTHUB_NOTIFY_PER_MINUTE` | `20` | global cap |
+| `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
 | `-connectors` | `IOTHUB_CONNECTORS` | — | Modbus / OPC UA connectors file (see PLCs and meters) |
 | `-token` | `IOTHUB_TOKEN` | — | admin token; setting it turns authentication on (see Security) |
 | `-auth-file` | `IOTHUB_AUTH_FILE` | `data/devices.json` | per-device credentials (hashes only, mode 0600) |
@@ -312,6 +319,42 @@ The bridge reconnects with backoff (up to 60 s) and logs only the first failure,
 
 Suggested tiles: a `state` tile on `access-1-ml.prediction` (normal value `Normal`), a `line` tile on `risk` (Y 0–1), and an `anomalies` tile on `access-1-ml`.
 
+## Notifications
+
+Anomaly episodes are sent to people when they open and, by default, when they resolve. Targets are `kind=URL`:
+
+| Kind | URL | Message |
+|---|---|---|
+| `webhook` | any https endpoint | full JSON (event, status, title, text). `X-IoTHub-Signature: sha256=<HMAC of body>` when `-notify-secret` is set |
+| `slack` | Slack incoming webhook | text |
+| `teams` | Teams **Workflows** webhook ("Post to a channel when a webhook request is received") | Adaptive Card with a dashboard button |
+| `discord` | Discord channel webhook | text |
+| `telegram` | `https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>` | text |
+| `email` | `smtp://user:pass@host:587?from=hub@x.com&to=a@x.com,b@x.com` (STARTTLS), or `smtps://…:465` | plain text |
+
+```bash
+IOTHUB_NOTIFY="teams=https://prod-00.westeurope.logic.azure.com/workflows/… email=smtp://alerts:PASS@smtp.office365.com:587?from=alerts@plant.co&to=maintenance@plant.co" \
+IOTHUB_PUBLIC_URL=https://iothub.plant.local:8443 iothub …
+curl -X POST https://hub:8443/api/notifications/test -H "Authorization: Bearer $ADMIN"   # try every target now
+curl https://hub:8443/api/notifications -H "Authorization: Bearer $ADMIN"              # sent / failed / last error
+```
+
+**Alarm-storm protection**, because an alert channel that floods gets muted:
+- **Cooldown.** A new episode for the same sensor, field and kind within the cooldown is held, not sent. The next message that does go out says how many were held.
+- **Global cap.** A token bucket allows `-notify-per-minute` messages in total.
+- **Resolved messages** are sent only for episodes whose opening was sent.
+
+**Delivery:**
+- **Never blocks ingestion.** Messages go through a bounded queue.
+- **Retries.** 5xx and 429 responses are retried at 1 s and 4 s; a 4xx is a configuration error and is not retried.
+- **Email.** It has a 30 s deadline, and credentials only travel over TLS.
+- **Secrets stay hidden.** URLs (which contain secrets) are shown redacted everywhere. Prefer the environment variable to the flag, so they don't appear in process lists.
+
+**Tested:**
+- **End to end:** a real hub sending range anomalies to a local receiver. Signatures verified; cooldown hold; no orphan "resolved"; the test endpoint.
+- **Unit tests:** retry vs no-retry, the rate cap, every chat payload shape, and SMTP including AUTH against a fake server.
+- **Not tested:** delivery to the real Slack, Teams, Discord and Telegram services, which aren't reachable from here.
+
 ## Dashboard tiles
 
 | Tile | Shows |
@@ -381,7 +424,6 @@ Without the database (`-db ""`): 20 MB RSS and 2.2% CPU at the same 1,000 msgs/s
 - **No per-IP rate limiting or lockout.** Tokens are 256-bit, so guessing is not feasible, but noisy scanners are not throttled. Put the hub behind a firewall or reverse proxy if it faces the internet.
 - **Device credentials are tokens, not client certificates.** Mutual TLS would bind identity to hardware keys; the listener supports it, but it isn't wired up.
 - **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits, and models (see ML.NET integration) for multi-field judgements.
-- **No notifications yet.** Anomalies go to the dashboard, the database and MQTT. Email/Slack/webhook delivery would be a small subscriber on `iot-events/anomaly/#` or an `OnEvent` hook.
 - **Statistics are mean/std/min/max.** No percentiles: they don't merge across rollups, so they would need raw scans or sketches.
 - **The embedded broker is a single node.** To use an existing broker (Mosquitto, EMQX), run with `-mqtt ""` and add a small subscriber that calls `Pipeline.Handle`.
 - **Deleting a sensor keeps its database history.** Re-creating the same id continues the series.

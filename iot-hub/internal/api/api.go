@@ -34,6 +34,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
@@ -62,6 +63,7 @@ type Server struct {
 	TLS           bool        // adds HSTS
 	OnRevoke      func(id string)
 	Connectors    func() []connect.Status // optional
+	Notifier      *notify.Notifier        // optional
 	started       time.Time
 }
 
@@ -90,6 +92,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/dashboard", s.require(auth.Manage, s.putDashboard))
 	mux.HandleFunc("GET /api/stream", read(s.stream))
 	mux.HandleFunc("GET /api/connectors", read(s.connectors))
+	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))
+	mux.HandleFunc("POST /api/notifications/test", s.require(auth.Manage, s.testNotification))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
 	mux.HandleFunc("POST /api/devices", s.require(auth.Manage, s.addDevice))
 	mux.HandleFunc("DELETE /api/devices/{id}", s.require(auth.Manage, s.deleteDevice))
@@ -107,6 +111,43 @@ func (s *Server) connectors(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Connectors())
+}
+
+type notifyStatus struct {
+	Target    string `json:"target"`
+	Sent      uint64 `json:"sent"`
+	Failed    uint64 `json:"failed"`
+	LastError string `json:"lastError,omitempty"`
+}
+
+func (s *Server) notifications(w http.ResponseWriter, _ *http.Request) {
+	out := map[string]any{"targets": []notifyStatus{}}
+	if s.Notifier != nil {
+		ts := []notifyStatus{}
+		for _, t := range s.Notifier.Targets() {
+			ts = append(ts, notifyStatus{Target: t.Redacted(), Sent: t.Sent.Load(), Failed: t.Failed.Load(), LastError: t.LastError()})
+		}
+		out = map[string]any{"targets": ts, "suppressed": s.Notifier.Suppressed.Load(), "dropped": s.Notifier.Dropped.Load()}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// testNotification sends a test message to every target and reports each
+// result, so setup mistakes show up immediately rather than at 3 a.m.
+func (s *Server) testNotification(w http.ResponseWriter, r *http.Request) {
+	if s.Notifier == nil {
+		writeErr(w, http.StatusConflict, errors.New("no notification targets configured (-notify)"))
+		return
+	}
+	res := map[string]string{}
+	for _, t := range s.Notifier.Targets() {
+		if err := s.Notifier.Test(r.Context(), t); err != nil {
+			res[t.Redacted()] = err.Error()
+		} else {
+			res[t.Redacted()] = "ok"
+		}
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

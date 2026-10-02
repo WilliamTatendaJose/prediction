@@ -28,6 +28,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
@@ -87,6 +88,20 @@ func main() {
 	anomalyPersist := flag.Int("anomaly-persist", envInt("IOTHUB_ANOMALY_PERSIST", 2), "consecutive outliers before a spike opens")
 	anomalyWarmup := flag.Int("anomaly-warmup", envInt("IOTHUB_ANOMALY_WARMUP", 30), "samples before spike detection starts")
 	staleMin := flag.Duration("stale-min", envDur("IOTHUB_STALE_MIN", time.Minute), "minimum silence before a sensor is stale (0 disables)")
+	var notifySpecs []string
+	for _, f := range strings.Fields(os.Getenv("IOTHUB_NOTIFY")) {
+		notifySpecs = append(notifySpecs, f)
+	}
+	flag.Func("notify", "notification target kind=URL (repeatable; or IOTHUB_NOTIFY, space-separated). kinds: webhook slack teams discord telegram email", func(v string) error {
+		notifySpecs = append(notifySpecs, v)
+		return nil
+	})
+	notifySecret := flag.String("notify-secret", env("IOTHUB_NOTIFY_SECRET", ""), "HMAC secret for generic webhook signatures")
+	notifyKinds := flag.String("notify-kinds", env("IOTHUB_NOTIFY_KINDS", ""), "anomaly kinds to notify, comma-separated (empty = all)")
+	notifyResolved := flag.Bool("notify-resolved", env("IOTHUB_NOTIFY_RESOLVED", "true") == "true", "also notify when an episode resolves")
+	notifyCooldown := flag.Duration("notify-cooldown", envDur("IOTHUB_NOTIFY_COOLDOWN", 10*time.Minute), "hold repeat alerts for the same sensor/field/kind")
+	notifyRate := flag.Int("notify-per-minute", envInt("IOTHUB_NOTIFY_PER_MINUTE", 20), "maximum notifications per minute")
+	publicURL := flag.String("public-url", env("IOTHUB_PUBLIC_URL", ""), "dashboard URL used in notification links")
 	connectorsFile := flag.String("connectors", env("IOTHUB_CONNECTORS", ""), "Modbus/OPC UA connectors config (JSON); empty disables")
 	debug := flag.Bool("debug", env("IOTHUB_DEBUG", "") == "true", "debug logging")
 	flag.Parse()
@@ -139,6 +154,7 @@ func main() {
 
 	var writer *tsdb.Writer
 	stopWriter := func() {}
+	stopNotifier := func() {}
 	if *dbURL != "" {
 		if p, ok := strings.CutPrefix(*dbURL, "sqlite:"); ok || !strings.Contains(*dbURL, "://") {
 			if p == "" {
@@ -163,6 +179,48 @@ func main() {
 		go writer.Run(wctx)
 		pipe.Writer, an.DB, srv.Writer = writer, db, writer
 		log.Info("database", "url", redact(*dbURL), "rawRetention", *rawKeep, "rollupRetention", *rollupKeep)
+	}
+
+	var notifier *notify.Notifier
+	if len(notifySpecs) > 0 {
+		var targets []*notify.Target
+		for _, spec := range notifySpecs {
+			t, err := notify.ParseTarget(spec)
+			if err != nil {
+				log.Error("notify", "err", err)
+				os.Exit(1)
+			}
+			targets = append(targets, t)
+		}
+		kinds := map[string]bool{}
+		for _, k := range strings.Split(*notifyKinds, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				kinds[k] = true
+			}
+		}
+		notifier = notify.New(notify.Config{
+			Targets: targets, Secret: *notifySecret, Kinds: kinds, Resolved: *notifyResolved,
+			Cooldown: *notifyCooldown, PerMinute: *notifyRate, BaseURL: *publicURL,
+			Names: func(id string) string {
+				if sv, err := st.Get(id); err == nil && sv.Name != "" {
+					return sv.Name
+				}
+				return id
+			},
+			Logf: func(f string, a ...any) { log.Warn(fmt.Sprintf(f, a...)) },
+		})
+		// Like the DB writer, it outlives ctx so alerts raised during
+		// shutdown still go out.
+		nctx, nstop := context.WithCancel(context.Background())
+		stopNotifier = nstop
+		go notifier.Run(nctx)
+		srv.Notifier = notifier
+		pipe.OnEvent = notifier.Notify
+		names := make([]string, len(targets))
+		for i, t := range targets {
+			names[i] = t.Redacted()
+		}
+		log.Info("notifications", "targets", names)
 	}
 
 	if *anomalyOn {
@@ -192,7 +250,11 @@ func main() {
 		}
 		srv.OnIngest = mq.Republish
 		srv.OnRevoke = func(id string) { mq.Kick(id) }
-		pipe.OnEvent = mq.PublishEvent
+		if notifier != nil {
+			pipe.OnEvent = func(e anomaly.Event) { mq.PublishEvent(e); notifier.Notify(e) }
+		} else {
+			pipe.OnEvent = mq.PublishEvent
+		}
 		if err := mq.Serve(); err != nil {
 			log.Error("mqtt serve", "err", err)
 			os.Exit(1)
@@ -285,6 +347,10 @@ func main() {
 		_ = mq.Close()
 	}
 	<-persistDone
+	stopNotifier()
+	if srv.Notifier != nil {
+		<-srv.Notifier.Done()
+	}
 	stopWriter()
 	if writer != nil {
 		<-writer.Done() // final flush before the deferred db.Close
