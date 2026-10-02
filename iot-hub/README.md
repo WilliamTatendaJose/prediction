@@ -202,6 +202,7 @@ Units and labels from the file are added to the sensor definition, without overw
 | GET | `/api/sensors/{id}/history?field=&limit=&since=` | live ring buffer, columnar `{t, v}` |
 | GET | `/api/sensors/{id}/series?field=&from=&to=&bucket=` | bucketed `{t, n, min, max, avg}`; `bucket` = `auto` (≤600 points), or a duration like `5m` |
 | GET | `/api/sensors/{id}/stats?field=&from=&to=` | `{n, min, max, mean, std}` |
+| GET | `/api/sensors/{id}/forecast?field=&horizon=6h&history=&threshold=&side=` | projection with an 80 % band, skill vs naive, and when it crosses the field's alert limits |
 | GET | `/api/anomalies?sensor=&from=&to=&limit=&active=1` | anomaly episodes, newest first |
 | GET / PUT | `/api/dashboard` | layout JSON (opaque to the server) |
 | GET | `/api/stream[?sensors=a,b]` | SSE: readings as `data: {"s","t","v"}`; anomalies as `event: anomaly` |
@@ -273,6 +274,35 @@ curl -X PUT localhost:8080/api/sensors/tank-1 -d '{
 | **5** | **300** | **2 (default)** | **0** | **0** |
 
 Real sensor noise is usually heavier-tailed than Gaussian. With `persist=1`, a 5 Hz sensor would raise about 30 false alerts an hour. The cost of `persist=2` is that a single-sample glitch goes unreported; set `persist: 1` on fields where those matter. Detector state is in memory, so after a restart each field re-learns for `warmup` samples, and episodes left open by the previous run are closed in the database.
+
+## Forecasting
+
+`/api/sensors/{id}/forecast` projects a field forward, and answers *when* it will reach a limit, e.g. "the diesel tank reaches 15 % in about 8 h (7 h 37 m – 8 h 17 m)". It runs in the hub, so there's no separate service. The method is exponential smoothing: Holt (level + damped trend), or additive Holt–Winters with a daily season once there are 3+ days of history.
+
+**Model selection, and why to trust it:**
+- **Parameters** are fitted by one-step error over the whole history.
+- **The model family** (flat / trend / seasonal) is chosen by multi-step error on the most recent 20 %. A richer family must beat a simpler one by **10 %**.
+  - Without that margin, holdout noise invents trends. In testing, a flat noisy series drifted 17 % (50 → 41) over the horizon, which would mean false "limit reached in N hours" warnings.
+- **Skill.** Every response reports `skill = 1 − MAE / MAE(no-change forecast)`. The ETA tile labels the result *reliable* (skill > 0.2) or *low confidence*.
+- **History handling:**
+  - The bucket size adapts until at least 80 % of buckets hold real data; short gaps are interpolated.
+  - Forecasts are clamped to the field's `min`/`max` (a tank never goes below 0 %).
+  - The 80 % band assumes errors grow with the square root of the horizon. It's a guide, not a guarantee.
+
+**Measured** (100 random seeds per case, in `internal/forecast`):
+
+| Case | Result |
+|---|---|
+| Linear drain + noise, time to limit | median error **0.9 %**, p90 2.7 %, worst 6.2 % |
+| Flat noise, false crossing of ±10 | **0 / 100** |
+| Daily cycle + noise | Holt–Winters chosen 100/100, beats no-change 100/100 |
+| End to end via the API (12 h of 1-min tank data) | ETA 7.98 h vs true 8.0 h |
+
+**Dashboard:**
+- **`eta` tile:** time to limit, with range and confidence. The limit defaults to the field's alert `low`/`high`.
+- **`forecast` option on `line` tiles:** dashed projection, band, a "now" divider, the limit line, and the crossing point. Hover shows the forecast value and its likely range.
+
+**Limits.** This extrapolates recent behaviour: a refill, a shift change, or a process change it has not seen will make it wrong until the data shows it. It's for operational ETAs (tanks, filters, temperature drift), not process modelling. Process-specific models belong in the ML.NET service once real data exists.
 
 ## ML.NET integration
 
@@ -365,6 +395,7 @@ curl https://hub:8443/api/notifications -H "Authorization: Bearer $ADMIN"       
 | `stats` | mean, min, max, std and sample count over 1 h – 30 d |
 | `anomalies` | anomaly log for one sensor or all, open episodes first, live |
 | `state` | text or on/off with a "normal" value |
+| `eta` | time until a forecast reaches a limit, with range and a reliability label |
 
 The header shows a live count of active anomalies. For `stat`/`meter` thresholds, set `warn` and `crit`; if `crit < warn`, low values are treated as bad. Fields in one `line` tile share a y-axis, so only group fields on the same scale.
 

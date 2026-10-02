@@ -87,6 +87,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sensors/{id}/history", read(s.history))
 	mux.HandleFunc("GET /api/sensors/{id}/series", read(s.series))
 	mux.HandleFunc("GET /api/sensors/{id}/stats", read(s.stats))
+	mux.HandleFunc("GET /api/sensors/{id}/forecast", read(s.forecastSeries))
 	mux.HandleFunc("GET /api/anomalies", read(s.anomalies))
 	mux.HandleFunc("GET /api/dashboard", read(s.getDashboard))
 	mux.HandleFunc("PUT /api/dashboard", s.require(auth.Manage, s.putDashboard))

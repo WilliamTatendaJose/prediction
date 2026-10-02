@@ -237,3 +237,73 @@ func TestRangeRuleFromSensorDefinition(t *testing.T) {
 		t.Fatalf("active %+v", active)
 	}
 }
+
+func TestForecastETA(t *testing.T) {
+	e := full(t, true)
+	putReq, _ := http.NewRequest("PUT", e.url+"/api/sensors/tank", strings.NewReader(`{"fields":{"level":{"unit":"%","detect":{"low":15,"z":-1}}}}`))
+	if res, err := http.DefaultClient.Do(putReq); err != nil || res.StatusCode != 200 {
+		t.Fatalf("put: %v", err)
+	}
+	// 12 h of history every minute: 95 % falling 4 %/h.
+	now := time.Now()
+	start := now.Add(-12 * time.Hour)
+	var lines []string
+	for i := 0; i <= 720; i++ {
+		ts := start.Add(time.Duration(i) * time.Minute)
+		lines = append(lines, fmt.Sprintf(`{"level":%.3f,"ts":%d}`, 95-4*float64(i)/60, ts.UnixMilli()))
+	}
+	for _, l := range lines {
+		post(t, e.url+"/api/sensors/tank/data", l)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for e.writer.Written.Load() < 721 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	var f struct {
+		Method    string
+		Skill     float64
+		Crossings []struct {
+			Side          string
+			ETA, ETAEarly int64
+			ETALate       int64
+		}
+		Yhat []float64
+	}
+	code := getJSON(t, e.url+"/api/sensors/tank/forecast?field=level&horizon=6h&history=12h", &f)
+	if code != 200 || len(f.Crossings) != 1 || f.Crossings[0].Side != "below" {
+		t.Fatalf("forecast %d %+v", code, f)
+	}
+	// Now at 47 %; 15 % is (47-15)/4 = 8 h away: beyond a 6 h horizon.
+	if f.Crossings[0].ETA != 0 {
+		t.Fatalf("crossing should be beyond 6 h, got eta in %v", time.Until(time.UnixMilli(f.Crossings[0].ETA)))
+	}
+	getJSON(t, e.url+"/api/sensors/tank/forecast?field=level&horizon=12h&history=12h", &f)
+	eta := time.Until(time.UnixMilli(f.Crossings[0].ETA))
+	if eta < 7*time.Hour+30*time.Minute || eta > 8*time.Hour+30*time.Minute {
+		t.Fatalf("ETA %v, want ~8h (%s skill %.2f)", eta, f.Method, f.Skill)
+	}
+	if code := getJSON(t, e.url+"/api/sensors/nope/forecast?field=x", nil); code != 400 && code != 404 {
+		t.Fatalf("unknown sensor: %d", code)
+	}
+}
+
+func TestForecastClampedToFieldRange(t *testing.T) {
+	e := full(t, false)
+	putReq, _ := http.NewRequest("PUT", e.url+"/api/sensors/tank", strings.NewReader(`{"fields":{"level":{"min":0,"max":100}}}`))
+	if res, err := http.DefaultClient.Do(putReq); err != nil || res.StatusCode != 200 {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(-2 * time.Hour)
+	for i := 0; i <= 120; i++ { // 20 % falling 10 %/h: hits 0 in 2 h
+		post(t, e.url+"/api/sensors/tank/data", fmt.Sprintf(`{"level":%.2f,"ts":%d}`, 40-10*float64(i)/60, start.Add(time.Duration(i)*time.Minute).UnixMilli()))
+	}
+	var f struct{ Yhat, Lo []float64 }
+	if code := getJSON(t, e.url+"/api/sensors/tank/forecast?field=level&horizon=6h&history=2h", &f); code != 200 {
+		t.Fatalf("code %d", code)
+	}
+	for i := range f.Yhat {
+		if f.Yhat[i] < 0 || f.Lo[i] < 0 {
+			t.Fatalf("forecast below the field minimum at %d: %v / %v", i, f.Yhat[i], f.Lo[i])
+		}
+	}
+}

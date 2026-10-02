@@ -216,6 +216,7 @@ registerTile('line', {
   defaultSize: { w: 2, h: 2 },
   options: [
     { key: 'range', label: 'Time range', type: 'select', choices: [['', 'Live'], ['1h', 'Last hour'], ['6h', 'Last 6 hours'], ['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days']] },
+    { key: 'forecast', label: 'Forecast (first field)', type: 'select', choices: [['', 'None'], ['1h', 'Next hour'], ['6h', 'Next 6 hours'], ['24h', 'Next 24 hours']] },
     { key: 'points', label: 'Points kept (live)', type: 'number' },
     { key: 'min', label: 'Y min', type: 'number' }, { key: 'max', label: 'Y max', type: 'number' },
   ],
@@ -240,6 +241,14 @@ registerTile('line', {
     let bands = fields.map(() => null); // historical: { min: Float32Array, max: Float32Array }
     let marks = [];                      // anomaly episodes { start, end, field, kind, message }
     let timer = null, alive = true;
+    let fc = null, fcTimer = null; // forecast for fields[0]
+    async function loadForecast() {
+      fc = await ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/forecast?field=${encodeURIComponent(fields[0])}&horizon=${o.forecast}`).catch(() => null);
+      if (!alive) return;
+      ctx.invalidate();
+      fcTimer = setTimeout(loadForecast, Math.max(60e3, fc?.bucket || 0));
+    }
+    if (o.forecast) loadForecast();
 
     const loadMarks = (from) => ctx.api(`/api/anomalies?sensor=${encodeURIComponent(cfg.sensor)}&from=${from}&limit=200`)
       .then((evs) => { marks = evs.filter((e) => !e.field || fields.includes(e.field)); ctx.invalidate(); })
@@ -287,6 +296,10 @@ registerTile('line', {
           e.t1 = Date.now(); e.t0 = e.t1 - span;
           bands.forEach((b) => { if (!b) return; for (let i = 0; i < b.min.length; i++) { if (num(o.min) == null) e.lo = Math.min(e.lo, b.min[i]); if (num(o.max) == null) e.hi = Math.max(e.hi, b.max[i]); } });
         }
+        if (fc?.t?.length) { // make room for the forecast; the band may clip, the central line may not
+          e.t1 = Math.max(e.t1, fc.t[fc.t.length - 1]);
+          for (const v of fc.yhat) { if (num(o.min) == null) e.lo = Math.min(e.lo, v); if (num(o.max) == null) e.hi = Math.max(e.hi, v); }
+        }
         const X = (t) => pad.l + ((t - e.t0) / (e.t1 - e.t0)) * w;
         const Y = (v) => pad.t + h - ((v - e.lo) / (e.hi - e.lo)) * h;
         const tf = e.t1 - e.t0 >= 12 * 3600e3 ? dateTimeFmt : timeFmt; // dates once the ends can share a clock time
@@ -313,6 +326,30 @@ registerTile('line', {
         });
         drawLines(g, series, colors, pad.l, pad.t, w, h, e, 2);
 
+        if (fc?.t?.length) {
+          g.save();
+          g.beginPath(); g.rect(pad.l, pad.t, w, h); g.clip();
+          g.beginPath(); // 80 % band
+          fc.t.forEach((t, i) => (i ? g.lineTo(X(t), Y(fc.hi[i])) : g.moveTo(X(t), Y(fc.hi[i]))));
+          for (let i = fc.t.length - 1; i >= 0; i--) g.lineTo(X(fc.t[i]), Y(fc.lo[i]));
+          g.closePath(); g.globalAlpha = 0.12; g.fillStyle = colors[0]; g.fill(); g.globalAlpha = 1;
+          g.setLineDash([5, 4]); g.strokeStyle = colors[0]; g.lineWidth = 2; // central forecast
+          g.beginPath(); fc.t.forEach((t, i) => (i ? g.lineTo(X(t), Y(fc.yhat[i])) : g.moveTo(X(t), Y(fc.yhat[i])))); g.stroke();
+          const nowX = Math.round(X(Date.now())) + 0.5; // "now" divider
+          g.setLineDash([2, 3]); g.strokeStyle = css('--axis'); g.lineWidth = 1;
+          g.beginPath(); g.moveTo(nowX, pad.t); g.lineTo(nowX, pad.t + h); g.stroke();
+          for (const c of fc.crossings || []) { // limit line + where the forecast meets it
+            if (c.threshold < e.lo || c.threshold > e.hi) continue;
+            g.strokeStyle = css('--critical'); g.globalAlpha = 0.6;
+            g.beginPath(); g.moveTo(pad.l, Y(c.threshold)); g.lineTo(pad.l + w, Y(c.threshold)); g.stroke();
+            g.globalAlpha = 1;
+            if (c.eta) { g.setLineDash([]); g.fillStyle = css('--critical'); g.beginPath(); g.arc(X(c.eta), Y(c.threshold), 4, 0, 7); g.fill(); }
+          }
+          g.restore();
+          g.font = '10px system-ui, sans-serif'; g.fillStyle = css('--muted'); g.textAlign = 'left'; g.textBaseline = 'top';
+          g.fillText('forecast →', nowX + 4, pad.t + 2);
+        }
+
         // anomaly markers: dashed rule + a small flag at the top
         const crit = css('--critical');
         g.strokeStyle = crit; g.fillStyle = crit; g.lineWidth = 1; g.setLineDash([3, 3]);
@@ -327,8 +364,24 @@ registerTile('line', {
         g.setLineDash([]);
 
         if (hoverX == null || hoverX < pad.l || hoverX > pad.l + w) { tip.style.display = 'none'; return; }
-        // Crosshair snaps to the nearest sample time of the first non-empty series.
         const tx = e.t0 + ((hoverX - pad.l) / w) * (e.t1 - e.t0);
+        if (fc?.t?.length && tx > Date.now()) { // hovering the forecast
+          let i = 0;
+          for (let k = 1; k < fc.t.length; k++) if (Math.abs(fc.t[k] - tx) < Math.abs(fc.t[i] - tx)) i = k;
+          const x = X(fc.t[i]);
+          g.strokeStyle = css('--axis'); g.beginPath(); g.moveTo(Math.round(x) + 0.5, pad.t); g.lineTo(Math.round(x) + 0.5, pad.t + h); g.stroke();
+          tip.replaceChildren();
+          const tt = document.createElement('div'); tt.className = 't'; tt.textContent = 'forecast · ' + tf.format(fc.t[i]); tip.append(tt);
+          const row = document.createElement('div'); row.className = 'row'; row.style.setProperty('--c', `var(${SERIES[0]})`);
+          const b = document.createElement('b'); b.textContent = fmt(fc.yhat[i]) + ' ' + ctx.unit(fields[0]);
+          const n = document.createElement('span'); n.textContent = `likely ${fmt(fc.lo[i])} to ${fmt(fc.hi[i])}`;
+          row.append(b, n); tip.append(row);
+          tip.style.display = 'block';
+          const left = x + 12 + tip.offsetWidth > W ? x - 12 - tip.offsetWidth : x + 12;
+          tip.style.left = Math.max(0, left) + 'px'; tip.style.top = pad.t + 'px';
+          return;
+        }
+        // Crosshair snaps to the nearest sample time of the first non-empty series.
         const ref = series.find((s) => s.n);
         let best = 0, bd = Infinity;
         for (let i = 0; i < ref.n; i++) { const d = Math.abs(ref.t[ref.idx(i)] - tx); if (d < bd) { bd = d; best = i; } }
@@ -361,7 +414,70 @@ registerTile('line', {
         const left = x + 12 + tip.offsetWidth > W ? x - 12 - tip.offsetWidth : x + 12;
         tip.style.left = Math.max(0, left) + 'px'; tip.style.top = pad.t + 'px';
       },
-      destroy() { alive = false; clearTimeout(timer); ro.disconnect(); },
+      destroy() { alive = false; clearTimeout(timer); clearTimeout(fcTimer); ro.disconnect(); },
+    };
+  },
+});
+
+// ---- eta: time until a forecast reaches a limit ---------------------------
+const dur = (ms) => {
+  const m = Math.round(ms / 60e3);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  return h < 48 ? `${h} h ${m % 60} min` : `${Math.round(h / 24)} days`;
+};
+registerTile('eta', {
+  label: 'Time to limit (forecast)',
+  options: [
+    { key: 'horizon', label: 'Look ahead', type: 'select', choices: [['24h', '24 hours'], ['6h', '6 hours'], ['7d', '7 days']] },
+    { key: 'threshold', label: 'Limit (default: field alert limit)', type: 'number' },
+    { key: 'side', label: 'Alert when the value goes', type: 'select', choices: [['below', 'below the limit'], ['above', 'above the limit']] },
+  ],
+  create(el, cfg, ctx) {
+    const o = cfg.options || {};
+    const horizon = o.horizon || '24h';
+    const body = header(el, cfg, ctx, [cfg.field]);
+    el.querySelector('h2').textContent = cfg.title || `${ctx.sensor.name || ctx.sensor.id} · ${cfg.field} · time to limit`;
+    const val = document.createElement('div'); val.className = 'value';
+    const sub = document.createElement('div'); sub.className = 'sub';
+    const st = statusEl();
+    body.append(val, sub, st);
+    let f = null, err = '', timer, alive = true;
+    const load = async () => {
+      const q = num(o.threshold) != null ? `&threshold=${o.threshold}&side=${o.side || 'below'}` : '';
+      try {
+        f = await ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/forecast?field=${encodeURIComponent(cfg.field)}&horizon=${horizon}${q}`);
+        err = '';
+      } catch (e) { f = null; err = e.message; }
+      if (!alive) return;
+      ctx.invalidate();
+      timer = setTimeout(load, 60e3);
+    };
+    load();
+    return {
+      update() {},
+      render() {
+        const c = f?.crossings?.[0];
+        if (!f || !c) {
+          val.textContent = '—';
+          sub.textContent = err || 'Set a limit here or a low/high alert limit on the field.';
+          setStatus(st, null);
+          return;
+        }
+        const unit = ctx.unit(cfg.field);
+        if (c.eta) {
+          val.textContent = dur(c.eta - Date.now());
+          const lo = c.etaEarly ? dur(c.etaEarly - Date.now()) : null, hi = c.etaLate ? dur(c.etaLate - Date.now()) : `>${horizon}`;
+          sub.textContent = `until ${c.side} ${fmt(c.threshold)} ${unit}${lo ? ` · likely ${lo} – ${hi}` : ''}`;
+        } else {
+          val.textContent = `> ${horizon}`;
+          sub.textContent = `no ${c.side === 'below' ? 'drop below' : 'rise above'} ${fmt(c.threshold)} ${unit} forecast` + (c.etaEarly ? ` (possible in ${dur(c.etaEarly - Date.now())})` : '');
+        }
+        // Say plainly when the forecast is not better than assuming no change.
+        setStatus(st, f.skill > 0.2 ? ['good', `Forecast reliable (${Math.round(f.skill * 100)}% better than no-change)`]
+          : ['warning', 'Low confidence: recent data is too irregular to forecast']);
+      },
+      destroy() { alive = false; clearTimeout(timer); },
     };
   },
 });
