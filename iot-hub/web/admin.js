@@ -57,7 +57,7 @@ const enc = encodeURIComponent;
 const when = (ms) => (ms ? new Date(ms).toLocaleString() : '—');
 
 // ---- tabs -------------------------------------------------------------------
-const tabs = { sensors: sensorsTab, devices: devicesTab, alerts: alertsTab, jobs: jobsTab, tenants: tenantsTab };
+const tabs = { sensors: sensorsTab, devices: devicesTab, alerts: alertsTab, jobs: jobsTab, grafana: grafanaTab, tenants: tenantsTab };
 function show(name) {
   if (!tabs[name]) name = 'sensors';
   for (const b of document.querySelectorAll('.tabs button')) b.setAttribute('aria-selected', b.dataset.tab === name);
@@ -210,7 +210,7 @@ function showSecrets(title, r) {
   const body = $('secret-body');
   body.replaceChildren(h('p', { class: 'sub', text: title }));
   for (const [k, label] of [['token', 'Token'], ['connectionString', 'Connection string'], ['primaryKey', 'Primary key'],
-    ['secondaryKey', 'Secondary key'], ['sas', 'SAS token']]) {
+    ['secondaryKey', 'Secondary key'], ['sas', 'SAS token'], ['login', 'Grafana login'], ['password', 'Password'], ['url', 'Grafana']]) {
     if (!r[k]) continue;
     const input = h('input', { value: r[k], readonly: true, 'aria-label': label });
     body.append(h('div', { class: 'secret-row' }, h('label', { text: label }), h('div', { class: 'copy' }, input,
@@ -524,6 +524,54 @@ async function jobsTab(edit) {
       result));
 }
 
+// ---- Grafana (per tenant) ----------------------------------------------------
+async function grafanaTab() {
+  const g = await api('/api/grafana');
+  if (!g.grafana || g.grafana.error) {
+    view.replaceChildren(h('section', { class: 'card' }, h('h2', { text: 'Grafana' }),
+      h('p', { class: 'sub', text: g.grafana?.error ? 'Setting up Grafana for this tenant failed: ' + g.grafana.error + ' The platform operator can retry it.' : 'Grafana has not been set up for this tenant yet; the platform operator provisions it.' })));
+    return;
+  }
+  const tbody = h('tbody');
+  for (const u of g.users || []) {
+    tbody.append(h('tr', {}, h('td', {}, h('b', { text: tenantPrefix() + u.login })), h('td', { text: u.role }),
+      h('td', {}, h('div', { class: 'row' },
+        h('button', { class: 'small', onclick: async () => {
+          try { await put('/api/grafana/users/' + enc(u.login), { role: u.role === 'Viewer' ? 'Editor' : 'Viewer' }); grafanaTab(); } catch (e) { fail(e); }
+        } }, u.role === 'Viewer' ? 'Make editor' : 'Make viewer'),
+        h('button', { class: 'small danger', onclick: async () => {
+          if (!confirm('Remove Grafana user ' + u.login + '?')) return;
+          try { await del('/api/grafana/users/' + enc(u.login)); grafanaTab(); } catch (e) { fail(e); }
+        } }, 'Remove')))));
+  }
+  const login = h('input', { placeholder: 'ana', 'aria-label': 'Grafana login' });
+  const email = h('input', { placeholder: 'ana@plant.co (optional)', 'aria-label': 'Email' });
+  const role = h('select', { 'aria-label': 'Grafana role' }, opt('Viewer'), opt('Editor'));
+  const err = h('p', { class: 'err', role: 'alert' });
+  view.replaceChildren(
+    h('section', { class: 'card' },
+      h('h2', { text: 'Grafana' }),
+      h('p', { class: 'sub' }, 'This tenant has its own Grafana organization with the IoT Hub dashboards: ',
+        h('a', { href: g.grafana.url, target: '_blank', rel: 'noopener', text: g.grafana.url }),
+        '. Its data source can only read this tenant\'s data, so editors may write their own SQL.'),
+      h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' },
+        h('thead', {}, h('tr', {}, ...['Login', 'Role', ''].map((t) => h('th', { text: t })))), tbody))),
+    h('section', { class: 'card' },
+      h('h2', { text: 'Add a Grafana user' }),
+      h('div', { class: 'row' }, field('Login', login), field('Email', email), field('Role', role),
+        h('button', { class: 'primary', onclick: async () => {
+          err.textContent = '';
+          try {
+            const r = await put('/api/grafana/users/' + enc(login.value.trim()), { role: role.value, email: email.value.trim() || undefined });
+            if (r.password) showSecrets('Grafana sign-in for ' + r.login, r); else toast('Role updated');
+            grafanaTab();
+          } catch (e) { err.textContent = e.message; }
+        } }, 'Add')),
+      h('p', { class: 'hint', text: 'Editors can build dashboards and write queries; viewers only look. Organization admin stays with the platform.' }),
+      err));
+}
+const tenantPrefix = () => (tenant || me.tenant?.id || '') + '.';
+
 // ---- tenants (superadmin) ---------------------------------------------------
 async function tenantsTab() {
   const list = await api('/api/admin/tenants');
@@ -536,7 +584,12 @@ async function tenantsTab() {
       h('td', { class: 'n', text: `${t.sensors} / ${q.maxSensors}` }), h('td', { class: 'n', text: `${t.devices} / ${q.maxDevices || '∞'}` }),
       h('td', { class: 'n', text: `${t.messagesToday} / ${q.messagesPerDay || '∞'}` }), h('td', { class: 'n', text: t.messagesRejected }),
       h('td', { text: t.deviceSelfService ? 'tenant' : 'platform' }),
+      h('td', {}, t.grafana?.orgId && !t.grafana.error ? h('a', { href: t.grafana.url, target: '_blank', rel: 'noopener', text: 'org ' + t.grafana.orgId })
+        : t.grafana?.error ? h('span', { class: 'err', title: t.grafana.error, text: 'failed' }) : '—'),
       h('td', {}, h('div', { class: 'row' },
+        me.grafana && h('button', { class: 'small', onclick: async () => {
+          try { await post('/api/admin/tenants/' + enc(t.id) + '/grafana'); toast('Grafana provisioned for ' + t.id); tenantsTab(); } catch (e) { fail(e); }
+        } }, t.grafana?.orgId && !t.grafana.error ? 'Repair Grafana' : 'Provision Grafana'),
         t.status === 'active' && h('button', { class: 'small', onclick: () => { safeSet('iothub.tenant', t.id); location.href = './'; } }, 'Open'),
         h('button', { class: 'small', onclick: () => tenantForm(t) }, 'Edit'),
         h('button', { class: 'small', onclick: async () => {
@@ -553,7 +606,7 @@ async function tenantsTab() {
       h('h2', { text: 'Tenants' }),
       h('p', { class: 'sub', text: 'Each tenant is an isolated hub with its own data, devices and settings.' }),
       h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' },
-        h('thead', {}, h('tr', {}, ...['Tenant', 'Status', 'Sensors', 'Devices', 'Messages today', 'Rejected', 'Credentials by', ''].map((x) => h('th', { text: x })))), tbody))),
+        h('thead', {}, h('tr', {}, ...['Tenant', 'Status', 'Sensors', 'Devices', 'Messages today', 'Rejected', 'Credentials by', 'Grafana', ''].map((x) => h('th', { text: x })))), tbody))),
     tenantForm());
 }
 
@@ -600,6 +653,7 @@ if (!me.identity) {
   view.replaceChildren(h('p', { class: 'err', text: 'Settings are for administrators.' }));
 } else {
   $('who').textContent = me.authEnabled ? `${me.identity.id} (${me.identity.role}${me.tenant ? ', ' + me.tenant.id : ''})` : 'authentication off';
+  document.querySelector('[data-tab="grafana"]').hidden = !me.grafana;
   if (me.multiTenant && isSuper()) {
     document.querySelector('[data-tab="tenants"]').hidden = false;
     const ids = (me.tenants || []).filter((t) => t.status === 'active').map((t) => t.id);

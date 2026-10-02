@@ -15,7 +15,11 @@ type inbox struct {
 	got []paho.Message
 }
 
-func (b *inbox) handler(_ paho.Client, m paho.Message) { b.mu.Lock(); b.got = append(b.got, m); b.mu.Unlock() }
+func (b *inbox) handler(_ paho.Client, m paho.Message) {
+	b.mu.Lock()
+	b.got = append(b.got, m)
+	b.mu.Unlock()
+}
 
 func (b *inbox) wait(t *testing.T, topicPrefix string) paho.Message {
 	t.Helper()

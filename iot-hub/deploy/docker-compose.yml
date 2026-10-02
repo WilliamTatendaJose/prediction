@@ -27,6 +27,12 @@ services:
       IOTHUB_TOKEN: ${IOTHUB_TOKEN:?set in .env}
       IOTHUB_DATA: /data/iothub.json
       IOTHUB_AUTH_FILE: /data/devices.json
+      # SaaS: one isolated hub per tenant, each with its own Grafana org.
+      # IOTHUB_TENANCY: multi
+      # IOTHUB_MASTER_KEY: ${IOTHUB_MASTER_KEY}
+      # IOTHUB_GRAFANA_URL: http://grafana:3000
+      # IOTHUB_GRAFANA_PUBLIC_URL: https://grafana.example.com
+      # IOTHUB_GRAFANA_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
     volumes:
       - hubdata:/data
     ports: ["8080:8080", "1883:1883"]
@@ -38,6 +44,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_AUTO_ASSIGN_ORG: "false"   # tenant users join only their tenant's org
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

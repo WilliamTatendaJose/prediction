@@ -46,7 +46,12 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /api/admin/tenants/{tenant}", g.super(g.getTenant))
 	mux.HandleFunc("PATCH /api/admin/tenants/{tenant}", g.super(g.patchTenant))
 	mux.HandleFunc("DELETE /api/admin/tenants/{tenant}", g.super(g.deleteTenant))
+	mux.HandleFunc("POST /api/admin/tenants/{tenant}/grafana", g.super(g.provisionGrafana))
+	mux.HandleFunc("DELETE /api/admin/tenants/{tenant}/grafana", g.super(g.deprovisionGrafana))
 	mux.Handle("/api/admin/", http.NotFoundHandler())
+	mux.HandleFunc("GET /api/grafana", g.tenantAdmin(g.grafanaInfo))
+	mux.HandleFunc("PUT /api/grafana/users/{login}", g.tenantAdmin(g.grafanaSetUser))
+	mux.HandleFunc("DELETE /api/grafana/users/{login}", g.tenantAdmin(g.grafanaDeleteUser))
 	mux.HandleFunc("/api/", g.dispatch)
 	if g.Static != nil {
 		// "/" without a method: "GET /" would conflict with "/api/admin/".
@@ -104,14 +109,17 @@ func csrf(w http.ResponseWriter, r *http.Request, viaCookie bool) bool {
 	return true
 }
 
-func (g *Gateway) dispatch(w http.ResponseWriter, r *http.Request) {
+// resolve authenticates a request and picks its tenant: the caller's own,
+// or (superadmin) the one named by X-Tenant / ?tenant=. It answers the
+// request itself when it can't.
+func (g *Gateway) resolve(w http.ResponseWriter, r *http.Request) (*auth.Identity, bool, *tenant.Runtime, bool) {
 	id, viaCookie, ok := g.authenticate(r)
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, errors.New("missing or invalid token"))
-		return
+		return nil, false, nil, false
 	}
 	if !csrf(w, r, viaCookie) {
-		return
+		return nil, false, nil, false
 	}
 	t := r.Header.Get("X-Tenant")
 	if t == "" {
@@ -121,11 +129,11 @@ func (g *Gateway) dispatch(w http.ResponseWriter, r *http.Request) {
 	case id.Role == auth.Superadmin:
 		if t == "" {
 			writeErr(w, http.StatusBadRequest, errors.New("superadmin: choose a tenant with the X-Tenant header or ?tenant="))
-			return
+			return nil, false, nil, false
 		}
 	case t != "" && t != id.Tenant:
 		writeErr(w, http.StatusForbidden, errors.New("this credential belongs to another tenant"))
-		return
+		return nil, false, nil, false
 	default:
 		t = id.Tenant
 	}
@@ -133,12 +141,20 @@ func (g *Gateway) dispatch(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, tenant.ErrNotFound):
 		writeErr(w, http.StatusNotFound, err)
-		return
+		return nil, false, nil, false
 	case errors.Is(err, tenant.ErrSuspended):
 		writeErr(w, http.StatusForbidden, err)
-		return
+		return nil, false, nil, false
 	case err != nil || rt == nil:
 		writeErr(w, http.StatusServiceUnavailable, errors.New("tenant is not running"))
+		return nil, false, nil, false
+	}
+	return id, viaCookie, rt, true
+}
+
+func (g *Gateway) dispatch(w http.ResponseWriter, r *http.Request) {
+	id, viaCookie, rt, ok := g.resolve(w, r)
+	if !ok {
 		return
 	}
 	rt.Handler.ServeHTTP(w, api.WithIdentity(r, id, viaCookie))
@@ -206,6 +222,7 @@ func (g *Gateway) me(w http.ResponseWriter, r *http.Request) {
 		out["tenant"] = tenantRef{in.ID, in.Name, in.Status}
 		out["deviceSelfService"] = in.DeviceSelfService
 	}
+	out["grafana"] = g.Platform.Grafana != nil
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -266,6 +283,13 @@ func (g *Gateway) createTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.Logger.Info("tenant created", "tenant", in.ID)
+	if g.Platform.Grafana != nil { // best effort: recorded, and retried with POST …/grafana
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		if _, err := g.Platform.ProvisionGrafana(ctx, in.ID); err != nil && !errors.Is(err, tenant.ErrNoGrafana) {
+			g.Logger.Warn("grafana provisioning failed", "tenant", in.ID, "err", err)
+		}
+		cancel()
+	}
 	u, _ := g.Platform.Get(in.ID)
 	writeJSON(w, http.StatusCreated, u)
 }

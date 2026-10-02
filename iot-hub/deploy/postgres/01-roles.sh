@@ -4,11 +4,15 @@
 #   iothub      owns the iothub database and schema (the hub connects as it;
 #               not a superuser)
 #   grafana_ro  read-only: a reporting tool must not be able to change data
+# In multi-tenant mode with per-tenant Grafana (-grafana-url), iothub also
+# creates one read-only role per tenant (grafana_t_{tenant}); CREATEROLE
+# allows exactly that on PostgreSQL 16+ (it can't create superusers, and
+# manages only the roles it created).
 # The hub creates its tables later as iothub; default privileges give
 # grafana_ro SELECT on them automatically.
 set -e
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<SQL
-CREATE ROLE iothub LOGIN PASSWORD '${IOTHUB_DB_PASSWORD}';
+CREATE ROLE iothub LOGIN CREATEROLE PASSWORD '${IOTHUB_DB_PASSWORD}';
 CREATE ROLE grafana_ro LOGIN PASSWORD '${GRAFANA_DB_PASSWORD}';
 ALTER DATABASE "$POSTGRES_DB" OWNER TO iothub;
 ALTER SCHEMA public OWNER TO iothub;

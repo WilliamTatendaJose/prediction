@@ -28,6 +28,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/forward"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/gateway"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/grafana"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
@@ -125,6 +126,13 @@ func main() {
 	fwdMax := flag.Int("forward-max-mb", envInt("IOTHUB_FORWARD_MAX_MB", 1024), "edge: queue cap on disk; beyond it the oldest unsent readings are dropped")
 	fwdSensors := flag.String("forward-sensors", env("IOTHUB_FORWARD_SENSORS", "*"), "edge: which sensors to forward (glob)")
 	fwdPrefix := flag.String("forward-prefix", env("IOTHUB_FORWARD_PREFIX", ""), "edge: prefix for sensor ids in the cloud, e.g. plant1. (keeps sites apart)")
+	grafURL := flag.String("grafana-url", env("IOTHUB_GRAFANA_URL", ""), "multi: Grafana to provision an organization per tenant in (needs -db postgres://…)")
+	grafUser := flag.String("grafana-user", env("IOTHUB_GRAFANA_USER", "admin"), "multi: Grafana server admin user")
+	grafPass := flag.String("grafana-password", env("IOTHUB_GRAFANA_PASSWORD", ""), "multi: Grafana server admin password (prefer the environment variable)")
+	grafPublic := flag.String("grafana-public-url", env("IOTHUB_GRAFANA_PUBLIC_URL", ""), "multi: Grafana URL for people (default -grafana-url)")
+	grafDBHost := flag.String("grafana-db-host", env("IOTHUB_GRAFANA_DB_HOST", ""), "multi: PostgreSQL host:port as Grafana reaches it (default: the -db host)")
+	grafDBAdmin := flag.String("grafana-db-admin", env("IOTHUB_GRAFANA_DB_ADMIN", ""), "multi: PostgreSQL URL of a CREATEROLE role for tenant read-only roles (default: -db)")
+	grafSSL := flag.String("grafana-db-sslmode", env("IOTHUB_GRAFANA_DB_SSLMODE", "disable"), "multi: sslmode Grafana uses to reach PostgreSQL")
 	tenantDevices := flag.Int("tenant-devices", envInt("IOTHUB_TENANT_DEVICES", 1000), "multi: default maximum identities per tenant (0 = unlimited)")
 	flag.Parse()
 
@@ -143,6 +151,9 @@ func main() {
 	multi := *tenancy == "multi"
 	if !multi && *tenancy != "single" {
 		fatal(log, "tenancy", errors.New("must be single or multi"))
+	}
+	if !multi && *grafURL != "" {
+		fatal(log, "grafana", errors.New("-grafana-url provisions per-tenant Grafana in multi-tenant mode; a single hub uses deploy/'s Grafana"))
 	}
 	creds := auth.New(*authFile, *token)
 	if err := creds.SetMasterKey(*masterKey); err != nil {
@@ -250,6 +261,27 @@ func main() {
 					mq.KickTenant(id, "")
 				}
 			},
+		}
+		if *grafURL != "" {
+			if !strings.HasPrefix(*dbURL, "postgres") {
+				fatal(log, "grafana", errors.New("per-tenant Grafana needs -db postgres://… (each tenant's role reads its own schema)"))
+			}
+			admin, host := *grafDBAdmin, *grafDBHost
+			if admin == "" {
+				admin = *dbURL
+			}
+			if host == "" {
+				if u, err := url.Parse(*dbURL); err == nil {
+					host = u.Host
+				}
+			}
+			g, err := grafana.New(grafana.Config{URL: *grafURL, User: *grafUser, Password: *grafPass, PublicURL: *grafPublic,
+				DBAdminURL: admin, DBHost: host, SSLMode: *grafSSL})
+			if err != nil {
+				fatal(log, "grafana", err)
+			}
+			plat.Grafana = g
+			log.Info("per-tenant Grafana", "url", *grafURL, "dbHost", host)
 		}
 		if err := plat.Load(ctx); err != nil {
 			fatal(log, "tenants", err)

@@ -56,7 +56,7 @@ func TestSingleTenantTwins(t *testing.T) {
 	h := httptest.NewServer(rt.Handler)
 	defer h.Close()
 
-	c := paho.NewClient(paho.NewClientOptions().AddBroker("tcp://"+addr).SetClientID("pump-1").SetUsername("pump-1").SetPassword(tok))
+	c := paho.NewClient(paho.NewClientOptions().AddBroker("tcp://" + addr).SetClientID("pump-1").SetUsername("pump-1").SetPassword(tok))
 	if tk := c.Connect(); !tk.WaitTimeout(3*time.Second) || tk.Error() != nil {
 		t.Fatal(tk.Error())
 	}
@@ -80,7 +80,7 @@ func TestSingleTenantTwins(t *testing.T) {
 		t.Fatal("desired not delivered")
 	}
 	c.Publish("devices/pump-1/twin/reported", 0, false, `{"setpoint":42}`).Wait()
-	<-got // the ack
+	<-got      // the ack
 	rt.Close() // saves twins.json
 	rt = open()
 	defer rt.Close()

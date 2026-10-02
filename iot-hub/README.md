@@ -68,6 +68,7 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-tenancy` | `IOTHUB_TENANCY` | `single` | `multi` = SaaS mode, see [Multi-tenant](#multi-tenant-saas-mode) |
 | `-master-key` | `IOTHUB_MASTER_KEY` | — | encrypts device keys at rest |
 | `-allow-private-targets` | `IOTHUB_ALLOW_PRIVATE_TARGETS` | false | multi: let tenants notify internal addresses (SSRF guard off) |
+| `-grafana-url` (+ `-grafana-*`) | `IOTHUB_GRAFANA_URL`, `IOTHUB_GRAFANA_PASSWORD` | — | multi: a Grafana organization per tenant, see [Per-tenant Grafana](#per-tenant-grafana) |
 | `-tenant-rate` / `-tenant-daily` / `-tenant-devices` | `IOTHUB_TENANT_RATE` / `_DAILY` / `_DEVICES` | 100 / unlimited / 1000 | default tenant quotas (multi) |
 | `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
 | `-shifts` | `IOTHUB_SHIFTS` | `06:00,14:00,22:00` | shift start times for OEE `from=shift` (empty disables) |
@@ -219,6 +220,85 @@ curl -X DELETE 'https://hub:8443/api/admin/tenants/acme?confirm=acme' -H "$S"   
 Quota changes apply at once, without a restart. One tenant flooding messages is rejected before any work is done, so it can't slow the others.
 
 **Suspension** keeps the data but drops the tenant's MQTT sessions and live streams and refuses its API and sign-in. Resuming restores everything.
+
+### Per-tenant Grafana
+
+With `-grafana-url`, multi-tenant mode gives each tenant **its own Grafana organization**:
+- a PostgreSQL data source reading only that tenant's data;
+- the IoT Hub overview dashboard;
+- the tenant's own Grafana users.
+
+Creating a tenant provisions it. Deleting the tenant removes it.
+
+```bash
+IOTHUB_GRAFANA_PASSWORD=… iothub -tenancy multi -token "$SUPER" -db postgres://iothub:…@db:5432/iothub \
+     -grafana-url http://grafana:3000 -grafana-public-url https://grafana.example.com
+curl -X POST https://hub:8443/api/admin/tenants/acme/grafana -H "$S"     # repair / retry (rotates the DB password)
+# Tenant admins manage their own Grafana users (password shown once):
+curl -X PUT https://hub:8443/api/grafana/users/ana -H "Authorization: Bearer $TENANT_ADMIN" -d '{"role":"Editor"}'
+#   → {"login":"acme.ana","password":"…","url":"https://grafana.example.com/?orgId=7"}
+curl https://hub:8443/api/grafana -H "Authorization: Bearer $TENANT_ADMIN"   # link and users
+```
+
+| Flag | Default | |
+|---|---|---|
+| `-grafana-url` | — | Grafana as the hub reaches it; turns the feature on (multi-tenant, PostgreSQL) |
+| `-grafana-user`, `IOTHUB_GRAFANA_PASSWORD` | `admin` | a Grafana **server** admin (organizations are server-level) |
+| `-grafana-public-url` | `-grafana-url` | the link people get |
+| `-grafana-db-host` | the `-db` host | PostgreSQL `host:port` as Grafana reaches it |
+| `-grafana-db-admin` | `-db` | a role with `CREATEROLE` that owns the tenant schemas. `deploy/`'s `iothub` role has it |
+
+**Isolation is enforced by PostgreSQL, not by Grafana.** Grafana editors can write any SQL, so each tenant's data source logs in as its own role, `grafana_t_{tenant}`:
+- **Access:** `CONNECT`, plus `USAGE` and `SELECT` on its tenant's schema only. Default privileges cover tables added later. `search_path` is that schema, so the dashboard's unqualified queries work as they are.
+- **Read-only:** transactions are read-only and there are no write grants.
+- **Limits:** a 30 s statement timeout, `work_mem` 16 MB and at most 5 connections, so one tenant's heavy query can't exhaust the database.
+- **Password:** random, and rotated on every (re)provisioning. Only Grafana's encrypted data-source store keeps it; the hub doesn't store it.
+
+**Grafana users:**
+- **Names** are namespaced `{tenant}.{login}`, so a tenant can only ever manage its own users.
+- **Organisations:** users belong to their tenant's organization and nothing else. They are removed from the main organization, which is the platform's. `deploy/` also sets `GF_USERS_AUTO_ASSIGN_ORG=false`.
+- **Roles:** tenants may grant **Viewer** or **Editor**. Organization **Admin** stays with the platform, because an org admin can edit data sources and point them at any host, which is SSRF from the Grafana server.
+
+**Failure handling:**
+- **Grafana down:** if Grafana is unreachable when a tenant is created, the tenant is still created. The error is recorded on the tenant (shown on the Tenants tab), and `POST …/grafana` retries.
+- **Idempotent provisioning:** provisioning only creates what is missing and updates the rest, so it is safe to repeat.
+- **Deprovisioning order:** it revokes what was granted, then drops the role, before the tenant's schema is dropped. A `CREATEROLE` admin can't use `DROP OWNED`.
+
+The settings page shows each tenant's Grafana (link, failure, a Provision/Repair button) on the **Tenants** tab. Tenant admins get a **Grafana** tab to add users (password shown once), switch Viewer/Editor and remove them.
+
+**PostgreSQL only.** SQLite tenants have no database Grafana could reach safely.
+
+**Tested** against **Grafana 11.2** and **PostgreSQL 16**, with the hub as a **non-superuser** `CREATEROLE` role (as in `deploy/`) and password authentication on:
+- **Through Grafana's query API, as a tenant's Grafana editor:**
+  - the tenant's own readings come back;
+  - these were refused, and the data was unchanged afterwards:
+    - reading `t_globex.readings`;
+    - `DELETE`;
+    - `CREATE TABLE`;
+    - `SET ROLE` to the other tenant's role;
+    - `pg_read_file`;
+    - turning read-only off and deleting.
+  - queries in the other tenant's org and in the main org were refused;
+  - the editor couldn't modify the data source;
+  - `Admin` and malformed logins were refused when granted.
+- **Provisioning:** re-provisioning is idempotent, and deprovisioning removes the org, users and role.
+- **Mutation check:** pointing the data source at the hub's own role makes the test fail.
+- **Real problems found and fixed:**
+  - re-provisioning failed because a `CREATEROLE` role may not `ALTER … NOSUPERUSER`;
+  - deprovisioning failed because it may not `DROP OWNED`.
+  
+  Testing as a superuser would have hidden both.
+- **With the built binary:**
+  - creating a tenant provisioned it (org, data source, dashboard);
+  - a viewer was refused, and a tenant admin created an Editor;
+  - Grafana queries returned the tenant's readings and rollups;
+  - the record survived a hub restart;
+  - deleting the tenant removed the org, user, role and schema;
+  - with Grafana stopped, the tenant was still created and the error recorded; after Grafana came back, a retry provisioned it, once.
+- **In the browser:**
+  - the superadmin created a tenant and saw its Grafana org;
+  - the tenant admin added a Grafana user on the Grafana tab;
+  - signed into Grafana as that user, the provisioned dashboard showed the tenant's data (120 samples, mean, min, max, the rollup chart) with no query errors.
 
 **Single-tenant options** (`-public-read`, `-connectors`, `-notify`, `-report-to`) are refused in multi-tenant mode:
 - **PLC connectors** belong on an edge hub at the plant, which forwards to its tenant. A cloud server can't reach plant networks.
@@ -1122,7 +1202,7 @@ Without the database (`-db ""`): 20 MB RSS and 2.2% CPU at the same 1,000 msgs/s
 - **Multi-tenant mode runs on one node.** Every tenant's runtime lives in one process; the limit is memory (each tenant's live buffers) and one machine's CPU. Sharding tenants across nodes (by tenant id at a load balancer) is the next step if it outgrows that.
 - **Twins have no change history or scheduled jobs.** Bulk updates apply at once; there is no Azure-style job scheduler or per-device result tracking for them.
 - **Direct methods need MQTT.** HTTP devices get twins and messages (by polling) but can't take synchronous method calls.
-- **Grafana and multi-tenant PostgreSQL.** Each tenant has its own schema (`t_{id}`); the provisioned Grafana datasource reads the public schema only, so per-tenant dashboards need a datasource per schema.
+- **Per-tenant Grafana users are local Grafana accounts.** Single sign-on from the hub into Grafana (JWT or auth proxy) isn't wired up; users sign in with the password created for them.
 - **Stream jobs are one step.** A job can't read another job's output (no chains), and there are no joins between streams.
 - **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits, and models (see ML.NET integration) for multi-field judgements.
 - **Statistics are mean/std/min/max.** No percentiles: they don't merge across rollups, so they would need raw scans or sketches.

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/grafana"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
 )
 
@@ -32,6 +33,8 @@ type Platform struct {
 	Default Quota           // quota for fields a tenant leaves at 0
 	Creds   *auth.Store     // root credential store
 	OnStop  func(id string) // called when a tenant stops (drop its sessions)
+	// Grafana provisions an organization per PostgreSQL tenant (optional).
+	Grafana *grafana.Provisioner
 
 	mu      sync.RWMutex
 	infos   map[string]Info
@@ -379,6 +382,11 @@ func (p *Platform) Delete(ctx context.Context, id string) error {
 	if _, e := p.Creds.RemoveTenant(id); e != nil && err == nil {
 		err = e
 	}
+	if _, sch := p.dbURL(id); sch != "" && p.Grafana != nil { // before the schema it reads goes
+		if e := p.Grafana.Deprovision(ctx, id, sch); e != nil && err == nil {
+			err = fmt.Errorf("grafana: %w", e)
+		}
+	}
 	if url, sch := p.dbURL(id); sch != "" {
 		if e := tsdb.DropSchema(ctx, url, sch); e != nil && err == nil {
 			err = e
@@ -390,6 +398,51 @@ func (p *Platform) Delete(ctx context.Context, id string) error {
 	if p.Base.BackupDir != "" {
 		_ = os.RemoveAll(filepath.Join(p.Base.BackupDir, id))
 	}
+	return err
+}
+
+// ErrNoGrafana: Grafana is not configured, or the tenant isn't on PostgreSQL.
+var ErrNoGrafana = errors.New("per-tenant Grafana needs -grafana-url and a PostgreSQL database (-db postgres://…)")
+
+// ProvisionGrafana creates or repairs a tenant's Grafana organization and
+// records the outcome (also when it fails, so it can be retried).
+func (p *Platform) ProvisionGrafana(ctx context.Context, id string) (grafana.Result, error) {
+	_, sch := p.dbURL(id)
+	if p.Grafana == nil || sch == "" {
+		return grafana.Result{}, ErrNoGrafana
+	}
+	if _, ok := p.Info(id); !ok {
+		return grafana.Result{}, ErrNotFound
+	}
+	res, err := p.Grafana.Provision(ctx, id, sch)
+	if err != nil {
+		res.Error = err.Error()
+	}
+	p.mu.Lock()
+	if in, ok := p.infos[id]; ok {
+		in.Grafana = &res
+		p.infos[id] = in
+		_ = p.save()
+	}
+	p.mu.Unlock()
+	return res, err
+}
+
+// DeprovisionGrafana removes a tenant's Grafana organization, users and
+// database role (the tenant and its data stay).
+func (p *Platform) DeprovisionGrafana(ctx context.Context, id string) error {
+	_, sch := p.dbURL(id)
+	if p.Grafana == nil || sch == "" {
+		return ErrNoGrafana
+	}
+	err := p.Grafana.Deprovision(ctx, id, sch)
+	p.mu.Lock()
+	if in, ok := p.infos[id]; ok && err == nil {
+		in.Grafana = nil
+		p.infos[id] = in
+		_ = p.save()
+	}
+	p.mu.Unlock()
 	return err
 }
 

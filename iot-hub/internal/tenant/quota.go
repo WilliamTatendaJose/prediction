@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/grafana"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 )
 
@@ -22,6 +23,8 @@ type Info struct {
 	// strings).
 	DeviceSelfService bool   `json:"deviceSelfService"`
 	Note              string `json:"note,omitempty"`
+	// Grafana is the tenant's Grafana organization, when provisioned.
+	Grafana *grafana.Result `json:"grafana,omitempty"`
 }
 
 const (
