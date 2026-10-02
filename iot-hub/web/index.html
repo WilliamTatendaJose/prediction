@@ -17,11 +17,13 @@
 <body>
   <header>
     <h1>IoT Hub</h1>
+    <select id="tenant" hidden aria-label="Tenant" title="Tenant"></select>
     <span class="alerts" id="alerts" role="status" hidden></span>
     <span class="conn" id="conn" data-state="idle">Connecting…</span>
     <button id="install" hidden title="Install the dashboard as an app">Install</button>
     <button id="theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
     <button id="edit">Edit</button>
+    <a id="settings" class="button" href="admin.html" hidden>Settings</a>
     <button id="logout" hidden>Sign out</button>
     <button id="add" class="primary" hidden>Add tile</button>
     <button id="save" class="primary" hidden>Save layout</button>

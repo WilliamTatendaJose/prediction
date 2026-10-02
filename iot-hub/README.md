@@ -818,6 +818,46 @@ curl -H "Authorization: Bearer $ADMIN" -O https://hub:8443/api/backups/iothub-20
 - **Rotation and downloads:** files are rotated, with `0600`/`0700` modes. Path traversal (`../`, wrong names, `.partial` files) is refused. Viewers get 403.
 - **Restore drill:** the built binary, 3000 readings → backup → data directory deleted → snapshot copied back and config imported. Same statistics (n 3000, mean 49.5) and the same sensor definition.
 
+## Settings page
+
+`/admin.html` (the **Settings** link on the dashboard, for admins) does everything the API does, without curl:
+
+| Tab | |
+|---|---|
+| Sensors | name, kind, location; per field: label, unit, display range, alarm limits, detection on/off. **Calculated fields** (formula or integral) have a **Test** button that evaluates the formula against the sensor's latest values. **OEE** set-up picks the running, counter and planned-stop fields. Server validation errors show next to Save |
+| Devices | create identities with keys (SAS) and/or tokens and an optional expiry. Secrets are shown once with copy buttons, including the connection string. Show keys, issue a 24 h SAS, rotate, disable, delete. A tenant admin without self-service sees the list and a note that the platform operator issues credentials |
+| Alerts & reports | named targets (sent/failed/last error; test; remove), which targets get alarms, kinds, cooldown, escalation levels with repeat, report targets, shifts, time zone, webhook secret |
+| Stream jobs | live counters per job; a query editor with **Test on history** (results table), save, delete |
+| Tenants | superadmin only: usage against quota, create, edit quota and self-service, suspend/resume, delete (type the id to confirm), and **Open** to view a tenant's dashboard |
+
+A multi-tenant superadmin gets a tenant switcher on both the dashboard and the settings page.
+
+**Security of the page:**
+- **No HTML from data.** Every value from the server is rendered as text, never as HTML, so device-supplied names can't inject markup.
+- **Same CSP as the dashboard.** The page works under the strict Content-Security-Policy, with no inline styles or scripts. The browser test caught one inline style, which was moved to CSS.
+
+**Tested** in Chromium, end to end against the built binary in multi-tenant mode:
+- **Superadmin journey:** sign in, see the "no tenants" state, create a tenant, open it, then create a keys device and see its connection string.
+- **SAS cross-check:** readings were sent with SAS tokens signed by an independent Node implementation of Azure's algorithm, using the key shown in the UI (60/60 accepted).
+- **Sensor editor:**
+  - a formula test (`rpm / 60` = 23.83) and a broken formula's error;
+  - the server's OEE validation shown inline;
+  - the save keeps learned field types.
+- **Alerts:**
+  - a private webhook refused with the SSRF message;
+  - a Teams target listed redacted (the secret appears nowhere in the page);
+  - notify and escalation settings saved.
+- **Jobs:** a dry run (60 readings → 7 windows) and a saved job shown as running.
+- **Other views:**
+  - a tenant admin with credentials locked to the platform;
+  - dark theme at 390 px with no horizontal page scroll.
+- **Regressions:** the earlier dashboard, PWA and login tests still pass in single-tenant mode.
+- **Bugs found and fixed along the way:**
+  - a crash on a fresh tenant's settings (empty lists omitted by the server);
+  - an inline style blocked by CSP;
+  - a stray "null"/"false" rendered as text;
+  - duplicate field names accepted silently.
+
 ## Install as an app (PWA)
 
 The dashboard can be installed on phones, tablets and PCs: it opens in its own window from the home screen or start menu, like a native app. There is nothing extra to deploy, because the hub serves the manifest, icons and service worker.

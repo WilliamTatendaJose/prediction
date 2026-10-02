@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 )
 
@@ -187,4 +188,42 @@ func (s *Server) testJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// calcTest: POST /api/calc/test {"sensor": "meter", "formula": "voltage * current / 1000"}
+// evaluates a formula against the sensor's latest values, so the editor
+// can show the result before saving.
+func (s *Server) calcTest(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sensor  string `json:"sensor"`
+		Formula string `json:"formula"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	e, err := calc.Parse(req.Formula)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"error": err.Error()})
+		return
+	}
+	sv, err := s.Store.Get(req.Sensor)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	v, err := e.Eval(func(f string) (float64, bool) {
+		switch x := sv.Last[f].(type) {
+		case float64:
+			return x, true
+		case bool:
+			return map[bool]float64{true: 1}[x], true
+		}
+		return 0, false
+	})
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"error": err.Error(), "uses": e.Fields()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"value": v, "uses": e.Fields()})
 }

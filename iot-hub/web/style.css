@@ -52,6 +52,7 @@ button, select, input {
   padding: 6px 10px;
 }
 button { cursor: pointer; }
+a.button { font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; text-decoration: none; }
 button.primary { background: var(--s1); color: #fff; border-color: transparent; }
 button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
 
@@ -154,3 +155,43 @@ dialog select[multiple] { height: 90px; }
 .oee-col div.nodata { background: var(--grid); }
 .oee-col span { font-size: 9px; color: var(--muted); text-align: center; overflow: hidden; white-space: nowrap; }
 .oee-warn { color: var(--ink-2); margin-top: 4px; }
+
+/* ---- settings page ---- */
+body.admin main.panel { display: block; padding: 16px; max-width: 1200px; }
+.tabs { display: flex; gap: 4px; padding: 8px 16px 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; color: var(--ink-2); white-space: nowrap; }
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--s1); font-weight: 600; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin: 0 0 14px; }
+.card h2 { font-size: 15px; margin: 0 0 4px; }
+.card h3 { font-size: 13px; margin: 14px 0 6px; color: var(--ink-2); }
+.card p.sub, .hint { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+.tbl-wrap { overflow-x: auto; }
+table.tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
+.tbl th, .tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+.tbl th { color: var(--ink-2); font-weight: 600; font-size: 12px; white-space: nowrap; }
+.tbl td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.tbl input, .tbl select { width: 100%; min-width: 60px; padding: 4px 6px; }
+.tbl input[type="checkbox"] { width: auto; min-width: 0; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin: 6px 0; }
+.row label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--ink-2); }
+.row label.check { flex-direction: row; align-items: center; gap: 6px; }
+.row input, .row select, .row textarea { min-width: 140px; }
+textarea { font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px; width: 100%; min-height: 110px; }
+.err { color: var(--critical); font-size: 12px; margin: 6px 0; white-space: pre-wrap; }
+.ok { color: var(--good); font-size: 12px; }
+.pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--grid); color: var(--ink-2); margin-right: 4px; }
+.pill.on { background: var(--track); color: var(--ink); }
+.pill.bad { background: var(--critical); color: #fff; }
+button.danger { color: var(--critical); }
+button.small { padding: 2px 8px; font-size: 12px; }
+.secret-row { margin: 8px 0; }
+.secret-row label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 3px; }
+.secret-row .copy { display: flex; gap: 6px; }
+.secret-row input { flex: 1; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+#toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--page); padding: 8px 14px; border-radius: 8px; font-size: 13px; z-index: 10; max-width: calc(100vw - 32px); }
+#toast.bad { background: var(--critical); color: #fff; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 16px; }
+.row input[type="checkbox"] { min-width: 0; }
+dialog .sub { font-size: 12px; color: var(--ink-2); margin: 0 0 8px; }
+.row input.wide { min-width: min(320px, 100%); }
+.tbl td > b { white-space: nowrap; }

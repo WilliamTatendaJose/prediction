@@ -138,6 +138,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings/targets/{target}", s.require(auth.Manage, s.putTarget))
 	mux.HandleFunc("DELETE /api/settings/targets/{target}", s.require(auth.Manage, s.deleteTarget))
 	mux.HandleFunc("POST /api/settings/targets/{target}/test", s.require(auth.Manage, s.testTarget))
+	mux.HandleFunc("POST /api/calc/test", read(s.calcTest))
 	mux.HandleFunc("GET /api/jobs", read(s.listJobs))
 	mux.HandleFunc("POST /api/jobs/test", s.require(auth.Manage, s.testJob))
 	mux.HandleFunc("PUT /api/jobs/{job}", s.require(auth.Manage, s.putJob))

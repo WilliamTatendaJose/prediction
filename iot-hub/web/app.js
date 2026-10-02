@@ -14,8 +14,10 @@ const active = new Map();     // open anomaly episodes by id
 // Auth lives in an HttpOnly cookie set by /api/login: scripts never see the
 // token. X-Requested-With is the server's CSRF guard for cookie writes.
 class Unauthorized extends Error {}
+let tenant = null; // multi-tenant superadmin: the tenant being viewed
 async function api(path, opts = {}) {
   const headers = { 'X-Requested-With': 'iothub', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) };
+  if (tenant) headers['X-Tenant'] = tenant;
   const res = await fetch(path, { ...opts, headers, credentials: 'same-origin' });
   if (res.status === 401) { showLogin(); throw new Unauthorized('login required'); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -131,7 +133,7 @@ let refreshTimer = null;
 function connect() {
   es?.close();
   const conn = $('conn');
-  es = new EventSource('/api/stream');
+  es = new EventSource('/api/stream' + (tenant ? '?tenant=' + encodeURIComponent(tenant) : ''));
   es.onopen = () => { conn.dataset.state = 'live'; conn.textContent = 'Live'; };
   es.onerror = () => { conn.dataset.state = 'down'; conn.textContent = 'Reconnecting…'; };
   es.onmessage = (ev) => {
@@ -311,6 +313,29 @@ dlg.addEventListener('close', () => {
 // ---- boot -------------------------------------------------------------------
 const savedTheme = safeGet('iothub.theme');
 if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+// A multi-tenant superadmin chooses which tenant to view.
+function pickTenant() {
+  if (!me.multiTenant || me.identity?.role !== 'superadmin') return true;
+  const ids = (me.tenants || []).filter((t) => t.status === 'active').map((t) => t.id);
+  const sel = $('tenant');
+  sel.replaceChildren();
+  for (const id of ids) { const o = document.createElement('option'); o.value = o.textContent = id; sel.append(o); }
+  if (!ids.length) {
+    $('settings').hidden = false;
+    $('logout').hidden = false;
+    const p = document.createElement('p'); p.className = 'empty';
+    p.textContent = 'No active tenants yet. Create one under Settings → Tenants.';
+    grid.replaceChildren(p);
+    $('conn').textContent = 'Platform';
+    return false;
+  }
+  tenant = ids.includes(safeGet('iothub.tenant')) ? safeGet('iothub.tenant') : ids[0];
+  sel.value = tenant;
+  sel.hidden = false;
+  sel.onchange = () => { safeSet('iothub.tenant', sel.value); location.reload(); };
+  return true;
+}
+
 // Boot retries until the hub answers: an installed dashboard is often
 // opened before the network (or the hub) is back.
 let bootDelay = 2000, bootTimer = null, booting = false, booted = false;
@@ -323,7 +348,9 @@ async function boot() {
     const r = await fetch('/api/me', { credentials: 'same-origin' });
     me = await r.json();
     if (r.status === 401 && !me.publicRead) showLogin();
+    if (!pickTenant()) { booted = true; return; }
     $('edit').hidden = !canManage();
+    $('settings').hidden = !canManage();
     $('logout').hidden = !me.authEnabled || !me.identity;
     if (me.identity && me.authEnabled) $('logout').title = `Signed in as ${me.identity.id} (${me.identity.role})`;
     const [, dash] = await Promise.all([loadSensors(), api('/api/dashboard')]);

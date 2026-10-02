@@ -3,8 +3,8 @@
 // new hub version is picked up on the next online load. API responses are
 // never cached: no plant data or authenticated content is stored on the
 // device, and an offline dashboard never shows old values as if live.
-const CACHE = 'iothub-shell-v1';
-const SHELL = ['/', '/index.html', '/app.js', '/tiles.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png'];
+const CACHE = 'iothub-shell-v2';
+const SHELL = ['/', '/index.html', '/app.js', '/tiles.js', '/style.css', '/admin.html', '/admin.js', '/manifest.webmanifest', '/icon.svg', '/icon-192.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
