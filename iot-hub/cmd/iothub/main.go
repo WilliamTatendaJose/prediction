@@ -11,17 +11,23 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
 	"github.com/williamtatendajose/prediction/iot-hub/web"
 )
 
@@ -39,6 +45,20 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envDur(key string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil {
+		return d
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if f, err := strconv.ParseFloat(os.Getenv(key), 64); err == nil {
+		return f
+	}
+	return def
+}
+
 func main() {
 	httpAddr := flag.String("http", env("IOTHUB_HTTP", ":8080"), "HTTP listen address")
 	mqttAddr := flag.String("mqtt", env("IOTHUB_MQTT", ":1883"), "MQTT TCP listen address (empty disables)")
@@ -50,6 +70,15 @@ func main() {
 	maxFields := flag.Int("max-fields", envInt("IOTHUB_MAX_FIELDS", 16), "maximum fields per sensor")
 	autoReg := flag.Bool("auto-register", env("IOTHUB_AUTO_REGISTER", "true") == "true", "create sensors/fields on first data")
 	token := flag.String("token", env("IOTHUB_TOKEN", ""), "shared secret for writes (HTTP Bearer / MQTT password)")
+	dbURL := flag.String("db", env("IOTHUB_DB", "data/readings.db"), "database: path.db, sqlite:path, postgres://... (empty = memory only)")
+	rawKeep := flag.Duration("raw-retention", envDur("IOTHUB_RAW_RETENTION", 7*24*time.Hour), "keep raw readings this long (0 = forever)")
+	rollupKeep := flag.Duration("rollup-retention", envDur("IOTHUB_ROLLUP_RETENTION", 365*24*time.Hour), "keep 1-minute rollups this long (0 = forever)")
+	anomalyOn := flag.Bool("anomaly", env("IOTHUB_ANOMALY", "true") == "true", "streaming anomaly detection")
+	anomalyZ := flag.Float64("anomaly-z", envFloat("IOTHUB_ANOMALY_Z", 5), "spike threshold in standard deviations")
+	anomalyWindow := flag.Int("anomaly-window", envInt("IOTHUB_ANOMALY_WINDOW", 300), "EWMA span in samples")
+	anomalyPersist := flag.Int("anomaly-persist", envInt("IOTHUB_ANOMALY_PERSIST", 2), "consecutive outliers before a spike opens")
+	anomalyWarmup := flag.Int("anomaly-warmup", envInt("IOTHUB_ANOMALY_WARMUP", 30), "samples before spike detection starts")
+	staleMin := flag.Duration("stale-min", envDur("IOTHUB_STALE_MIN", time.Minute), "minimum silence before a sensor is stale (0 disables)")
 	debug := flag.Bool("debug", env("IOTHUB_DEBUG", "") == "true", "debug logging")
 	flag.Parse()
 
@@ -70,12 +99,46 @@ func main() {
 	log.Info("memory bound for readings",
 		"maxMB", float64(*maxSensors**maxFields**capacity*12)/(1<<20))
 
-	hub := stream.NewHub(64)
-	pipe := &ingest.Pipeline{Store: st, Hub: hub}
-	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Token: *token, Web: web.FS}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	hub := stream.NewHub(64)
+	pipe := &ingest.Pipeline{Store: st, Hub: hub}
+	an := &analytics.Service{Store: st}
+	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Token: *token, Web: web.FS, Analytics: an}
+
+	var writer *tsdb.Writer
+	stopWriter := func() {}
+	if *dbURL != "" {
+		if p, ok := strings.CutPrefix(*dbURL, "sqlite:"); ok || !strings.Contains(*dbURL, "://") {
+			if p == "" {
+				p = *dbURL
+			}
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		}
+		db, err := tsdb.Open(ctx, *dbURL)
+		if err != nil {
+			log.Error("database", "err", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+		_ = db.CloseOpenEvents(ctx, time.Now().UnixMilli()) // episodes cut short by the last shutdown
+		writer = tsdb.NewWriter(db, 16384)
+		writer.RawRetention, writer.RollupRetention = *rawKeep, *rollupKeep
+		writer.Logf = func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) }
+		// The writer outlives ctx: it is stopped only after the HTTP server and
+		// broker have closed, so in-flight readings still reach the database.
+		wctx, wstop := context.WithCancel(context.Background())
+		stopWriter = wstop
+		go writer.Run(wctx)
+		pipe.Writer, an.DB, srv.Writer = writer, db, writer
+		log.Info("database", "url", redact(*dbURL), "rawRetention", *rawKeep, "rollupRetention", *rollupKeep)
+	}
+
+	if *anomalyOn {
+		det := anomaly.New(anomaly.Config{Z: *anomalyZ, Window: *anomalyWindow, Warmup: *anomalyWarmup, Persist: *anomalyPersist, StaleMin: *staleMin})
+		pipe.Detector, an.Detector, srv.Detector = det, det, det
+	}
 	persistDone := make(chan struct{})
 	go func() {
 		st.RunPersist(ctx, time.Second, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) })
@@ -94,11 +157,28 @@ func main() {
 			os.Exit(1)
 		}
 		srv.OnIngest = mq.Republish
+		pipe.OnEvent = mq.PublishEvent
 		if err := mq.Serve(); err != nil {
 			log.Error("mqtt serve", "err", err)
 			os.Exit(1)
 		}
 		log.Info("mqtt listening", "tcp", *mqttAddr, "ws", *mqttWS, "topics", *prefix+"/{sensor}[/{field}]")
+	}
+
+	// Started only after the pipeline is fully wired (OnEvent above).
+	if det := pipe.Detector; det != nil {
+		go func() {
+			t := time.NewTicker(10 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					pipe.Emit(det.CheckStale(now.UnixMilli()))
+				}
+			}
+		}()
 	}
 
 	httpSrv := &http.Server{
@@ -127,4 +207,19 @@ func main() {
 		_ = mq.Close()
 	}
 	<-persistDone
+	stopWriter()
+	if writer != nil {
+		<-writer.Done() // final flush before the deferred db.Close
+	}
+}
+
+// redact hides a password in a database URL for logging.
+func redact(u string) string {
+	if p, err := url.Parse(u); err == nil && p.User != nil {
+		if _, ok := p.User.Password(); ok {
+			p.User = url.UserPassword(p.User.Username(), "xxx")
+			return p.String()
+		}
+	}
+	return u
 }

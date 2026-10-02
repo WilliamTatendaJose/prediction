@@ -4,12 +4,17 @@
 // registerTile(type, {
 //   label,                 // shown in the "Add tile" dialog
 //   multi,                 // true: tile takes several fields (cfg.fields), else cfg.field
-//   options: [{ key, label, type: 'number'|'text' }],
+//   options: [{ key, label, type: 'number'|'text'|'select', choices?: [[value, label]] }],
 //   create(el, cfg, ctx) -> { update(t, value|values), render(), destroy?() }
 // })
 //
-// ctx = { sensor, unit(field), history(field, limit) -> Promise<{t:[],v:[]}>, invalidate() }
+//   sensorOptional,        // true: may watch all sensors (cfg.sensor empty)
+//   noField,               // true: takes no field
+// ctx = { sensor, unit(field), history(field, limit) -> Promise<{t:[],v:[]}>,
+//         api(path) -> Promise<json>, invalidate() }
 // update() only records data; render() runs at most once per animation frame.
+// Optional anomaly(event) receives anomaly episodes for the tile's sensor
+// (or all sensors when cfg.sensor is empty).
 
 export const TILE_TYPES = {};
 export function registerTile(type, def) { TILE_TYPES[type] = def; }
@@ -198,22 +203,29 @@ registerTile('meter', {
   },
 });
 
-// ---- line: up to 4 fields over time, crosshair tooltip --------------------
+// ---- line: up to 4 fields, live or historical, anomaly markers -----------
 // All fields share one y-axis, so only group fields with the same unit/scale;
-// put different measures in separate tiles.
+// put different measures in separate tiles. Historical ranges come from
+// /series (bucket averages with a min-max band), refreshed periodically.
+const RANGES = { '': 0, '1h': 3600e3, '6h': 6 * 3600e3, '24h': 86400e3, '7d': 7 * 86400e3, '30d': 30 * 86400e3 };
+const dateTimeFmt = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
 registerTile('line', {
   label: 'Line chart',
   multi: true,
   defaultSize: { w: 2, h: 2 },
   options: [
-    { key: 'points', label: 'Points kept', type: 'number' },
+    { key: 'range', label: 'Time range', type: 'select', choices: [['', 'Live'], ['1h', 'Last hour'], ['6h', 'Last 6 hours'], ['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days']] },
+    { key: 'points', label: 'Points kept (live)', type: 'number' },
     { key: 'min', label: 'Y min', type: 'number' }, { key: 'max', label: 'Y max', type: 'number' },
   ],
   create(el, cfg, ctx) {
     const o = cfg.options || {};
+    const span = RANGES[o.range] || 0; // 0 = live
     const fields = (cfg.fields || [cfg.field]).slice(0, SERIES.length);
     const cap = Math.min(5000, Math.max(10, num(o.points) ?? 300));
     const body = header(el, cfg, ctx, fields);
+    if (span) el.querySelector('h2').textContent += ` · ${o.range}`;
     const wrap = document.createElement('div'); wrap.className = 'chart';
     const cv = document.createElement('canvas');
     const tip = document.createElement('div'); tip.className = 'tip';
@@ -224,8 +236,32 @@ registerTile('line', {
       fields.forEach((f, k) => { const s = document.createElement('span'); s.style.setProperty('--c', `var(${SERIES[k]})`); s.textContent = f; lg.append(s); });
       body.append(lg);
     }
-    const series = fields.map(() => new Series(cap));
-    fields.forEach((f, k) => ctx.history(f, cap).then((h) => { series[k].load(h); ctx.invalidate(); }));
+    let series = fields.map(() => new Series(cap));
+    let bands = fields.map(() => null); // historical: { min: Float32Array, max: Float32Array }
+    let marks = [];                      // anomaly episodes { start, end, field, kind, message }
+    let timer = null, alive = true;
+
+    const loadMarks = (from) => ctx.api(`/api/anomalies?sensor=${encodeURIComponent(cfg.sensor)}&from=${from}&limit=200`)
+      .then((evs) => { marks = evs.filter((e) => !e.field || fields.includes(e.field)); ctx.invalidate(); })
+      .catch(() => {});
+
+    async function loadHistory() {
+      const from = Date.now() - span;
+      const res = await Promise.all(fields.map((f) =>
+        ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/series?field=${encodeURIComponent(f)}&from=${from}`).catch(() => null)));
+      if (!alive) return;
+      series = res.map((r) => { const s = new Series(Math.max(1, r?.t.length || 0)); if (r) s.load({ t: r.t, v: r.avg }); return s; });
+      bands = res.map((r) => r && { min: Float32Array.from(r.min), max: Float32Array.from(r.max) });
+      const bucket = res.find(Boolean)?.bucket || 60e3;
+      await loadMarks(from);
+      timer = setTimeout(loadHistory, Math.max(15e3, bucket)); // no point refreshing faster than a bucket fills
+    }
+    if (span) loadHistory();
+    else {
+      fields.forEach((f, k) => ctx.history(f, cap).then((h) => { series[k].load(h); ctx.invalidate(); }));
+      loadMarks(Date.now() - 3600e3);
+    }
+
     let hoverX = null;
     const pad = { l: 36, r: 6, t: 6, b: 16 };
     wrap.addEventListener('pointermove', (ev) => { hoverX = ev.offsetX; ctx.invalidate(); });
@@ -234,13 +270,26 @@ registerTile('line', {
 
     return {
       update(t, values) {
+        if (span) return; // historical view refreshes on its own schedule
         fields.forEach((f, k) => { const v = values[f]; if (typeof v === 'number') series[k].push(t, v); else if (typeof v === 'boolean') series[k].push(t, +v); });
+      },
+      anomaly(ev) {
+        if (ev.field && !fields.includes(ev.field)) return;
+        const i = marks.findIndex((m) => m.id === ev.id);
+        if (i >= 0) marks[i] = ev; else marks.push(ev);
       },
       render() {
         const [g, W, H] = fitCanvas(cv);
         const w = W - pad.l - pad.r, h = H - pad.t - pad.b;
         if (w < 10 || h < 10 || series.every((s) => s.n === 0)) return;
         const e = extent(series, o);
+        if (span) {
+          e.t1 = Date.now(); e.t0 = e.t1 - span;
+          bands.forEach((b) => { if (!b) return; for (let i = 0; i < b.min.length; i++) { if (num(o.min) == null) e.lo = Math.min(e.lo, b.min[i]); if (num(o.max) == null) e.hi = Math.max(e.hi, b.max[i]); } });
+        }
+        const X = (t) => pad.l + ((t - e.t0) / (e.t1 - e.t0)) * w;
+        const Y = (v) => pad.t + h - ((v - e.lo) / (e.hi - e.lo)) * h;
+        const tf = e.t1 - e.t0 >= 12 * 3600e3 ? dateTimeFmt : timeFmt; // dates once the ends can share a clock time
         g.font = '10px system-ui, sans-serif'; g.fillStyle = css('--muted'); g.textBaseline = 'middle'; g.textAlign = 'right';
         g.strokeStyle = css('--grid'); g.lineWidth = 1;
         for (let i = 0; i <= 3; i++) { // recessive hairline grid + y ticks
@@ -249,40 +298,156 @@ registerTile('line', {
           g.fillText(fmt(e.hi - ((e.hi - e.lo) * i) / 3), pad.l - 4, y);
         }
         g.textBaseline = 'alphabetic';
-        g.textAlign = 'left'; g.fillText(timeFmt.format(e.t0), pad.l, H - 2);
-        g.textAlign = 'right'; g.fillText(timeFmt.format(e.t1), pad.l + w, H - 2);
+        g.textAlign = 'left'; g.fillText(tf.format(e.t0), pad.l, H - 2);
+        g.textAlign = 'right'; g.fillText(tf.format(e.t1), pad.l + w, H - 2);
         const colors = fields.map((_, k) => css(SERIES[k]));
+
+        // min-max band behind each historical line
+        bands.forEach((b, k) => {
+          const s = series[k];
+          if (!b || s.n < 2) return;
+          g.beginPath();
+          for (let i = 0; i < s.n; i++) { const x = X(s.t[s.idx(i)]); i ? g.lineTo(x, Y(b.max[i])) : g.moveTo(x, Y(b.max[i])); }
+          for (let i = s.n - 1; i >= 0; i--) g.lineTo(X(s.t[s.idx(i)]), Y(b.min[i]));
+          g.closePath(); g.globalAlpha = 0.15; g.fillStyle = colors[k]; g.fill(); g.globalAlpha = 1;
+        });
         drawLines(g, series, colors, pad.l, pad.t, w, h, e, 2);
+
+        // anomaly markers: dashed rule + a small flag at the top
+        const crit = css('--critical');
+        g.strokeStyle = crit; g.fillStyle = crit; g.lineWidth = 1; g.setLineDash([3, 3]);
+        const seen = [];
+        for (const m of marks) {
+          if (m.start < e.t0 || m.start > e.t1) continue;
+          const x = Math.round(X(m.start)) + 0.5;
+          seen.push([x, m]);
+          g.beginPath(); g.moveTo(x, pad.t + 6); g.lineTo(x, pad.t + h); g.stroke();
+          g.beginPath(); g.moveTo(x - 4, pad.t); g.lineTo(x + 4, pad.t); g.lineTo(x, pad.t + 6); g.closePath(); g.fill();
+        }
+        g.setLineDash([]);
 
         if (hoverX == null || hoverX < pad.l || hoverX > pad.l + w) { tip.style.display = 'none'; return; }
         // Crosshair snaps to the nearest sample time of the first non-empty series.
         const tx = e.t0 + ((hoverX - pad.l) / w) * (e.t1 - e.t0);
-        const ref = series.find((s) => s.n) ;
+        const ref = series.find((s) => s.n);
         let best = 0, bd = Infinity;
         for (let i = 0; i < ref.n; i++) { const d = Math.abs(ref.t[ref.idx(i)] - tx); if (d < bd) { bd = d; best = i; } }
         const ts = ref.t[ref.idx(best)];
-        const x = pad.l + ((ts - e.t0) / (e.t1 - e.t0)) * w;
+        const x = X(ts);
         g.strokeStyle = css('--axis'); g.beginPath(); g.moveTo(Math.round(x) + 0.5, pad.t); g.lineTo(Math.round(x) + 0.5, pad.t + h); g.stroke();
         tip.replaceChildren();
-        const tt = document.createElement('div'); tt.className = 't'; tt.textContent = timeFmt.format(ts); tip.append(tt);
+        const tt = document.createElement('div'); tt.className = 't'; tt.textContent = tf.format(ts); tip.append(tt);
         series.forEach((s, k) => {
-          let v; // value at the nearest time in this series
+          let v, bi = -1; // value at the nearest time in this series
           let d = Infinity;
-          for (let i = 0; i < s.n; i++) { const j = s.idx(i), dd = Math.abs(s.t[j] - ts); if (dd < d) { d = dd; v = s.v[j]; } }
+          for (let i = 0; i < s.n; i++) { const j = s.idx(i), dd = Math.abs(s.t[j] - ts); if (dd < d) { d = dd; v = s.v[j]; bi = i; } }
           if (v === undefined) return;
           g.fillStyle = colors[k]; g.strokeStyle = css('--surface'); g.lineWidth = 2;
-          const y = pad.t + h - ((v - e.lo) / (e.hi - e.lo)) * h;
-          g.beginPath(); g.arc(x, y, 4, 0, 7); g.fill(); g.stroke();
+          g.beginPath(); g.arc(x, Y(v), 4, 0, 7); g.fill(); g.stroke();
           const row = document.createElement('div'); row.className = 'row'; row.style.setProperty('--c', `var(${SERIES[k]})`);
           const b = document.createElement('b'); b.textContent = fmt(v) + ' ' + ctx.unit(fields[k]);
-          const n = document.createElement('span'); n.textContent = fields[k];
+          const n = document.createElement('span');
+          n.textContent = bands[k] ? `${fields[k]} avg · ${fmt(bands[k].min[bi])}–${fmt(bands[k].max[bi])}` : fields[k];
           row.append(b, n); tip.append(row);
         });
+        for (const [mx, m] of seen) { // anomalies near the pointer
+          if (Math.abs(mx - hoverX) > 8) continue;
+          const row = document.createElement('div'); row.className = 'row'; row.style.setProperty('--c', 'var(--critical)');
+          const b = document.createElement('b'); b.textContent = m.kind;
+          const n = document.createElement('span'); n.textContent = m.message;
+          row.append(b, n); tip.append(row);
+        }
         tip.style.display = 'block';
         const left = x + 12 + tip.offsetWidth > W ? x - 12 - tip.offsetWidth : x + 12;
-        tip.style.left = left + 'px'; tip.style.top = pad.t + 'px';
+        tip.style.left = Math.max(0, left) + 'px'; tip.style.top = pad.t + 'px';
       },
-      destroy() { ro.disconnect(); },
+      destroy() { alive = false; clearTimeout(timer); ro.disconnect(); },
+    };
+  },
+});
+
+// ---- stats: summary over a time range -------------------------------------
+registerTile('stats', {
+  label: 'Statistics (mean, min, max, std)',
+  options: [{ key: 'range', label: 'Time range', type: 'select', choices: [['1h', 'Last hour'], ['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days']] }],
+  create(el, cfg, ctx) {
+    const range = (cfg.options || {}).range || '24h';
+    const body = header(el, cfg, ctx, [cfg.field]);
+    el.querySelector('h2').textContent += ` · ${range}`;
+    const val = document.createElement('div'); val.className = 'value';
+    const t = document.createTextNode('—');
+    const unit = document.createElement('span'); unit.className = 'unit'; unit.textContent = 'mean ' + ctx.unit(cfg.field);
+    val.append(t, unit);
+    const grid = document.createElement('dl'); grid.className = 'kv';
+    const cells = {};
+    for (const k of ['min', 'max', 'std', 'n']) {
+      const dt = document.createElement('dt'); dt.textContent = k === 'n' ? 'samples' : k;
+      const dd = document.createElement('dd'); dd.textContent = '—';
+      grid.append(dt, dd); cells[k] = dd;
+    }
+    body.append(val, grid);
+    let st = null, timer, alive = true;
+    const load = async () => {
+      st = await ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/stats?field=${encodeURIComponent(cfg.field)}&from=-${range}`).catch(() => null);
+      if (!alive) return;
+      ctx.invalidate();
+      timer = setTimeout(load, 30e3);
+    };
+    load();
+    return {
+      update() {},
+      render() {
+        const ok = st && st.n > 0;
+        t.nodeValue = ok ? fmt(st.mean) : '—';
+        cells.min.textContent = ok ? fmt(st.min) : '—';
+        cells.max.textContent = ok ? fmt(st.max) : '—';
+        cells.std.textContent = ok ? fmt(st.std) : '—';
+        cells.n.textContent = st ? st.n.toLocaleString() : '—';
+      },
+      destroy() { alive = false; clearTimeout(timer); },
+    };
+  },
+});
+
+// ---- anomalies: recent episodes, open ones first --------------------------
+registerTile('anomalies', {
+  label: 'Anomaly log',
+  sensorOptional: true,
+  noField: true,
+  defaultSize: { w: 2, h: 2 },
+  options: [],
+  create(el, cfg, ctx) {
+    const h = document.createElement('h2');
+    h.textContent = cfg.title || (cfg.sensor ? `Anomalies · ${ctx.sensor?.name || cfg.sensor}` : 'Anomalies');
+    const list = document.createElement('ul'); list.className = 'alog';
+    el.append(h, list);
+    let evs = [];
+    const q = cfg.sensor ? `&sensor=${encodeURIComponent(cfg.sensor)}` : '';
+    ctx.api(`/api/anomalies?limit=50${q}`).then((r) => { evs = r; ctx.invalidate(); }).catch(() => {});
+    const ago = (ms) => { const s = (Date.now() - ms) / 1000; return s < 90 ? `${Math.round(s)}s ago` : s < 5400 ? `${Math.round(s / 60)}m ago` : s < 129600 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`; };
+    return {
+      update() {},
+      anomaly(ev) {
+        const i = evs.findIndex((e) => e.id === ev.id);
+        if (i >= 0) evs[i] = ev; else evs.unshift(ev);
+        if (evs.length > 50) evs.length = 50;
+      },
+      render() {
+        list.replaceChildren();
+        const sorted = [...evs].sort((a, b) => (!a.end - !b.end) * -1 || b.start - a.start);
+        if (!sorted.length) { const li = document.createElement('li'); li.className = 'sub'; li.textContent = 'No anomalies recorded.'; list.append(li); }
+        for (const e of sorted.slice(0, 30)) {
+          const li = document.createElement('li');
+          const st = statusEl(); setStatus(st, e.end ? ['muted', 'Resolved'] : ['critical', 'Active']);
+          const kind = document.createElement('b'); kind.textContent = `${e.kind} · ${e.sensor}${e.field ? '.' + e.field : ''}`;
+          const msg = document.createElement('div'); msg.className = 'msg'; msg.textContent = e.message;
+          const when = document.createElement('span'); when.className = 'sub';
+          const secs = (e.end - e.start) / 1000;
+          when.textContent = e.end ? `${ago(e.start)} · lasted ${secs < 1 ? '<1s' : secs < 90 ? Math.round(secs) + 's' : Math.round(secs / 60) + 'm'}` : `since ${ago(e.start)}`;
+          li.append(st, kind, when, msg);
+          list.append(li);
+        }
+      },
     };
   },
 });

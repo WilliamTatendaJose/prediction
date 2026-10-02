@@ -24,6 +24,7 @@ func main() {
 	token := flag.String("token", "", "hub token")
 	every := flag.Duration("every", time.Second, "publish interval")
 	extra := flag.Int("extra", 0, "additional generic sensors (load test)")
+	faults := flag.Bool("faults", true, "inject occasional spikes and a sensor dropout to exercise anomaly detection")
 	flag.Parse()
 
 	var mc paho.Client
@@ -55,6 +56,8 @@ func main() {
 	}
 
 	door, locked, level := "Closed", true, 60.0
+	inrush := 0
+	start := time.Now()
 	for i := 0; ; i++ {
 		t := float64(i) * every.Seconds()
 		env := map[string]any{
@@ -63,6 +66,13 @@ func main() {
 		}
 		voltage := 230 + rand.NormFloat64()*1.5
 		current := 4 + 2*math.Sin(t/30) + rand.Float64()*0.3
+		if *faults && inrush == 0 && rand.Float64() < 0.003 {
+			inrush = 3 // motor start: 3 samples of high current
+		}
+		if inrush > 0 {
+			current *= 4
+			inrush--
+		}
 		power := map[string]any{"voltage": round(voltage, 1), "current": round(current, 2), "power": round(voltage*current, 0)}
 		if rand.Float64() < 0.05 {
 			if door == "Closed" {
@@ -88,6 +98,15 @@ func main() {
 				post("env-1", env)
 				post("door-1", map[string]any{"door": door, "locked": locked})
 				post("tank-1", map[string]any{"level": round(level, 1)})
+			}
+		}
+		// pump-1 goes silent for 90 s out of every 6 minutes (stale detection).
+		if !*faults || time.Since(start)%(6*time.Minute) < 4*time.Minute+30*time.Second {
+			pump := map[string]any{"vibration": round(1.2+0.1*rand.NormFloat64(), 3)}
+			if mc != nil {
+				pub("iot/pump-1", pump)
+			} else if *httpURL != "" {
+				post("pump-1", pump)
 			}
 		}
 		for k := 0; k < *extra; k++ {

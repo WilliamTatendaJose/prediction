@@ -9,13 +9,20 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
 )
 
 type Pipeline struct {
-	Store *store.Store
-	Hub   *stream.Hub
+	Store    *store.Store
+	Hub      *stream.Hub
+	Detector *anomaly.Detector // optional
+	Writer   *tsdb.Writer      // optional: persistence
+	// OnEvent receives every anomaly open/close (e.g. MQTT publish). Set
+	// before ingestion starts.
+	OnEvent func(anomaly.Event)
 }
 
 // Handle accepts either a JSON object of fields ({"temp":21.5,"door":"open"})
@@ -33,9 +40,50 @@ func (p *Pipeline) Handle(sensor, field string, payload []byte) (store.Reading, 
 		return r, err
 	}
 	if msg, err := json.Marshal(r); err == nil {
-		p.Hub.Publish(msg)
+		p.Hub.Publish(&stream.Msg{Sensor: sensor, Data: msg})
+	}
+	if p.Writer != nil {
+		for k, v := range r.Values {
+			switch x := v.(type) {
+			case float64:
+				p.Writer.Add(tsdb.Point{Sensor: sensor, Field: k, TS: r.TS, Value: x})
+			case bool:
+				f := 0.0
+				if x {
+					f = 1
+				}
+				p.Writer.Add(tsdb.Point{Sensor: sensor, Field: k, TS: r.TS, Value: f})
+			}
+		}
+		for _, k := range r.Changed {
+			p.Writer.Add(tsdb.Point{Sensor: sensor, Field: k, TS: r.TS, Text: r.Values[k].(string), IsText: true})
+		}
+	}
+	if p.Detector != nil {
+		p.Emit(p.Detector.Seen(sensor, time.Now().UnixMilli()))
+		for k, v := range r.Values {
+			if x, ok := v.(float64); ok {
+				p.Emit(p.Detector.Observe(sensor, k, r.TS, x, p.Store.Rule(sensor, k)))
+			}
+		}
 	}
 	return r, nil
+}
+
+// Emit distributes anomaly episodes to the live stream, the database and
+// OnEvent.
+func (p *Pipeline) Emit(evs []anomaly.Event) {
+	for _, e := range evs {
+		if msg, err := json.Marshal(e); err == nil {
+			p.Hub.Publish(&stream.Msg{Event: "anomaly", Sensor: e.Sensor, Data: msg})
+		}
+		if p.Writer != nil {
+			p.Writer.AddEvent(e)
+		}
+		if p.OnEvent != nil {
+			p.OnEvent(e)
+		}
+	}
 }
 
 func Parse(field string, payload []byte) (map[string]any, int64, error) {

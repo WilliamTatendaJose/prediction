@@ -11,7 +11,7 @@ COPY --from=build /iothub /iothub
 # Pre-create /data owned by nonroot so a fresh volume is writable.
 COPY --from=build --chown=65532:65532 /data /data
 # Soft heap cap: the GC works harder instead of growing past it.
-ENV GOMEMLIMIT=64MiB IOTHUB_DATA=/data/iothub.json
+ENV GOMEMLIMIT=64MiB IOTHUB_DATA=/data/iothub.json IOTHUB_DB=/data/readings.db
 VOLUME /data
 EXPOSE 8080 1883
 USER nonroot

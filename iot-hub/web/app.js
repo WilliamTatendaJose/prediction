@@ -8,6 +8,7 @@ let live = new Map();         // tile id -> { cfg, inst, el }
 const dirty = new Set();
 let es = null;
 let dirtyLayout = false;
+const active = new Map();     // open anomaly episodes by id
 
 // ---- API ------------------------------------------------------------------
 async function api(path, opts = {}) {
@@ -59,7 +60,7 @@ function mountTile(cfg) {
   const type = TILE_TYPES[cfg.type];
   const sensor = sensors[cfg.sensor];
   let inst = { update() {}, render() {} };
-  if (!type || !sensor) {
+  if (!type || (!sensor && !(type.sensorOptional && !cfg.sensor))) {
     const h = document.createElement('h2'); h.textContent = cfg.title || cfg.sensor;
     const p = document.createElement('p'); p.className = 'sub';
     p.textContent = !type ? `Unknown tile type "${cfg.type}"` : `Waiting for sensor "${cfg.sensor}"`;
@@ -67,13 +68,14 @@ function mountTile(cfg) {
   } else {
     const ctx = {
       sensor,
-      unit: (f) => sensor.fields?.[f]?.unit || '',
+      api,
+      unit: (f) => sensor?.fields?.[f]?.unit || '',
       history: (f, limit) => api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/history?field=${encodeURIComponent(f)}&limit=${limit}`).catch(() => ({ t: [], v: [] })),
       invalidate: () => invalidate(cfg.id),
     };
     inst = type.create(el, cfg, ctx);
     const f = tileFields(cfg);
-    if (sensor.last && f.some((k) => k in sensor.last)) {
+    if (sensor?.last && f.some((k) => k in sensor.last)) {
       inst.update(sensor.lastSeen, type.multi ? {} : sensor.last[cfg.field]);
     }
   }
@@ -123,6 +125,28 @@ function connect() {
       } else if (cfg.field in r.v) { inst.update(r.t, r.v[cfg.field]); invalidate(id); }
     }
   };
+  es.addEventListener('anomaly', (ev) => {
+    const a = JSON.parse(ev.data);
+    if (a.end) active.delete(a.id); else active.set(a.id, a);
+    renderAlerts();
+    for (const [id, { cfg, inst }] of live) {
+      if (inst.anomaly && (!cfg.sensor || cfg.sensor === a.sensor)) { inst.anomaly(a); invalidate(id); }
+    }
+  });
+}
+
+async function loadActive() {
+  const list = await api('/api/anomalies?active=1&limit=1000').catch(() => []);
+  active.clear();
+  for (const a of list) active.set(a.id, a);
+  renderAlerts();
+}
+
+function renderAlerts() {
+  const el = $('alerts');
+  el.hidden = active.size === 0;
+  el.textContent = `${active.size} active anomal${active.size === 1 ? 'y' : 'ies'}`;
+  el.title = [...active.values()].slice(0, 10).map((a) => `${a.sensor}${a.field ? '.' + a.field : ''}: ${a.message}`).join('\n');
 }
 
 function markStale() {
@@ -141,6 +165,7 @@ document.addEventListener('visibilitychange', async () => {
   await loadSensors().catch(() => {});
   build();
   connect();
+  loadActive();
 });
 
 // ---- editing ------------------------------------------------------------------
@@ -177,7 +202,11 @@ $('theme').onclick = () => {
 const dlg = $('dlg'), form = $('form');
 function opt(sel, value, text) { const o = document.createElement('option'); o.value = value; o.textContent = text; sel.append(o); }
 function fillFields() {
-  const s = sensors[form.sensor.value], multi = TILE_TYPES[form.type.value]?.multi;
+  const t = TILE_TYPES[form.type.value];
+  const s = sensors[form.sensor.value], multi = t?.multi;
+  const noField = !!t?.noField;
+  form.field.hidden = noField; form.field.required = !noField;
+  form.field.previousElementSibling.hidden = noField;
   form.field.multiple = !!multi;
   form.field.replaceChildren();
   for (const f of Object.keys(s?.fields || {}).sort()) {
@@ -191,10 +220,23 @@ function fillOptions() {
   box.replaceChildren();
   for (const o of t.options || []) {
     const l = document.createElement('label'); l.textContent = o.label; l.htmlFor = 'o-' + o.key;
-    const i = document.createElement('input'); i.id = 'o-' + o.key; i.name = 'o-' + o.key;
-    i.type = o.type === 'number' ? 'number' : 'text'; if (o.type === 'number') i.step = 'any';
+    let i;
+    if (o.type === 'select') {
+      i = document.createElement('select');
+      for (const [v, text] of o.choices) opt(i, v, text);
+    } else {
+      i = document.createElement('input');
+      i.type = o.type === 'number' ? 'number' : 'text'; if (o.type === 'number') i.step = 'any';
+    }
+    i.id = 'o-' + o.key; i.name = 'o-' + o.key;
     box.append(l, i);
   }
+  // Sensor list: "(all sensors)" only for tiles that support it.
+  const cur = form.sensor.value;
+  form.sensor.replaceChildren();
+  if (t.sensorOptional) opt(form.sensor, '', '(all sensors)');
+  for (const s of Object.values(sensors)) opt(form.sensor, s.id, s.name && s.name !== s.id ? `${s.name} (${s.id})` : s.id);
+  if ([...form.sensor.options].some((x) => x.value === cur)) form.sensor.value = cur;
   const d = t.defaultSize || {};
   form.w.value = d.w || 1; form.h.value = d.h || 1;
   fillFields();
@@ -203,7 +245,6 @@ $('add').onclick = async () => {
   await loadSensors().catch(() => {});
   form.type.replaceChildren(); form.sensor.replaceChildren();
   for (const [k, t] of Object.entries(TILE_TYPES)) opt(form.type, k, t.label);
-  for (const s of Object.values(sensors)) opt(form.sensor, s.id, s.name && s.name !== s.id ? `${s.name} (${s.id})` : s.id);
   form.title.value = '';
   fillOptions();
   dlg.showModal();
@@ -211,19 +252,19 @@ $('add').onclick = async () => {
 form.type.onchange = fillOptions;
 form.sensor.onchange = fillFields;
 dlg.addEventListener('close', () => {
-  if (dlg.returnValue !== 'ok' || !form.sensor.value) return;
   const t = TILE_TYPES[form.type.value];
+  if (dlg.returnValue !== 'ok' || (!form.sensor.value && !t.sensorOptional)) return;
   const fields = [...form.field.selectedOptions].map((o) => o.value);
-  if (!fields.length) return;
+  if (!fields.length && !t.noField) return;
   const options = {};
-  for (const o of t.options || []) { const v = form['o-' + o.key].value; if (v !== '') options[o.key] = o.type === 'number' ? +v : v; }
+  for (const o of t.options || []) { const v = form.elements['o-' + o.key].value; if (v !== '') options[o.key] = o.type === 'number' ? +v : v; }
   const cfg = {
     id: Math.random().toString(36).slice(2, 10),
     type: form.type.value, sensor: form.sensor.value,
     title: form.title.value.trim() || undefined,
     w: +form.w.value, h: +form.h.value, options,
   };
-  if (t.multi) cfg.fields = fields; else cfg.field = fields[0];
+  if (t.multi) cfg.fields = fields; else if (!t.noField) cfg.field = fields[0];
   layout.tiles.push(cfg);
   changed();
 });
@@ -239,3 +280,4 @@ try {
 }
 build();
 connect();
+loadActive();

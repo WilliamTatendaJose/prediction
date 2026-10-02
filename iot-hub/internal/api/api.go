@@ -8,8 +8,14 @@
 //	POST   /api/sensors/{id}/data/{field}   ingest one field (bare value)
 //	GET    /api/sensors/{id}/history?field=&limit=&since=
 //	GET    /api/dashboard | PUT /api/dashboard
-//	GET    /api/stream                      Server-Sent Events of readings
+//	GET    /api/sensors/{id}/series?field=&from=&to=&bucket=   bucketed min/avg/max
+//	GET    /api/sensors/{id}/stats?field=&from=&to=            count/min/max/mean/std
+//	GET    /api/anomalies?sensor=&from=&to=&limit=&active=1
+//	GET    /api/stream                      SSE: readings, plus "anomaly" events
 //	GET    /api/health
+//
+// from/to accept unix ms, RFC 3339, "now", or a duration before now such as
+// -15m, -24h, -7d.
 package api
 
 import (
@@ -24,9 +30,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
 )
 
 const (
@@ -42,7 +51,11 @@ type Server struct {
 	Token    string              // if set, required as Bearer token for writes
 	OnIngest func(store.Reading) // optional, e.g. republish to MQTT
 	Web      fs.FS
-	started  time.Time
+
+	Analytics *analytics.Service
+	Detector  *anomaly.Detector // optional
+	Writer    *tsdb.Writer      // optional, for health reporting
+	started   time.Time
 }
 
 func (s *Server) Handler() http.Handler {
@@ -56,6 +69,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sensors/{id}/data", s.auth(s.ingest))
 	mux.HandleFunc("POST /api/sensors/{id}/data/{field}", s.auth(s.ingest))
 	mux.HandleFunc("GET /api/sensors/{id}/history", s.history)
+	mux.HandleFunc("GET /api/sensors/{id}/series", s.series)
+	mux.HandleFunc("GET /api/sensors/{id}/stats", s.stats)
+	mux.HandleFunc("GET /api/anomalies", s.anomalies)
 	mux.HandleFunc("GET /api/dashboard", s.getDashboard)
 	mux.HandleFunc("PUT /api/dashboard", s.auth(s.putDashboard))
 	mux.HandleFunc("GET /api/stream", s.stream)
@@ -105,7 +121,7 @@ func storeErr(w http.ResponseWriter, err error) {
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	writeJSON(w, http.StatusOK, map[string]any{
+	h := map[string]any{
 		"ok":            true,
 		"uptimeSec":     int(time.Since(s.started).Seconds()),
 		"sensors":       s.Store.Count(),
@@ -113,7 +129,23 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 		"streamDropped": s.Hub.Dropped.Load(),
 		"heapMB":        float64(m.HeapAlloc) / (1 << 20),
 		"goroutines":    runtime.NumGoroutine(),
-	})
+	}
+	if s.Detector != nil {
+		h["anomaliesActive"] = len(s.Detector.Active())
+	}
+	if s.Writer != nil {
+		db := map[string]any{
+			"queued":  s.Writer.Queued(),
+			"written": s.Writer.Written.Load(),
+			"dropped": s.Writer.Dropped.Load(),
+			"errors":  s.Writer.Errors.Load(),
+		}
+		if e := s.Writer.LastError(); e != "" {
+			db["lastError"] = e
+		}
+		h["db"] = db
+	}
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (s *Server) listSensors(w http.ResponseWriter, _ *http.Request) {
@@ -148,6 +180,9 @@ func (s *Server) deleteSensor(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.Delete(r.PathValue("id")); err != nil {
 		storeErr(w, err)
 		return
+	}
+	if s.Detector != nil {
+		s.Detector.Forget(r.PathValue("id"))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -208,8 +243,8 @@ func (s *Server) putDashboard(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// stream sends readings as SSE. Optional ?sensors=a,b filters server-side so
-// a tile-less page does not receive traffic it will discard.
+// stream sends readings (default event) and anomaly episodes (event
+// "anomaly") as SSE. Optional ?sensors=a,b filters server-side.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -235,6 +270,17 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	defer s.Hub.Unsubscribe(ch)
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
+	write := func(m *stream.Msg) {
+		if filter != nil && !filter[m.Sensor] {
+			return
+		}
+		if m.Event != "" {
+			_, _ = io.WriteString(w, "event: "+m.Event+"\n")
+		}
+		_, _ = io.WriteString(w, "data: ")
+		_, _ = w.Write(m.Data)
+		_, _ = io.WriteString(w, "\n\n")
+	}
 	for {
 		select {
 		case <-r.Context().Done():
@@ -242,41 +288,14 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		case <-ping.C:
 			_, _ = io.WriteString(w, ": ping\n\n")
 			flusher.Flush()
-		case msg := <-ch:
-			if filter != nil && !filter[sensorOf(msg)] {
-				continue
-			}
-			_, _ = io.WriteString(w, "data: ")
-			_, _ = w.Write(msg)
-			_, _ = io.WriteString(w, "\n\n")
+		case m := <-ch:
+			write(m)
 			// Drain whatever else is queued before flushing: one syscall per
-			// burst instead of one per reading.
+			// burst instead of one per message.
 			for n := len(ch); n > 0; n-- {
-				msg = <-ch
-				if filter != nil && !filter[sensorOf(msg)] {
-					continue
-				}
-				_, _ = io.WriteString(w, "data: ")
-				_, _ = w.Write(msg)
-				_, _ = io.WriteString(w, "\n\n")
+				write(<-ch)
 			}
 			flusher.Flush()
 		}
 	}
-}
-
-// sensorOf reads the sensor id from a pre-encoded Reading ({"s":"id",...})
-// without unmarshalling it.
-func sensorOf(msg []byte) string {
-	const p = `{"s":"`
-	if len(msg) < len(p) || string(msg[:len(p)]) != p {
-		return ""
-	}
-	rest := msg[len(p):]
-	for i, c := range rest {
-		if c == '"' {
-			return string(rest[:i])
-		}
-	}
-	return ""
 }

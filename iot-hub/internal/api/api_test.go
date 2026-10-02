@@ -13,6 +13,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
@@ -47,7 +48,8 @@ func setup(t *testing.T, token string) env {
 	if err := b.Serve(); err != nil {
 		t.Fatal(err)
 	}
-	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Token: token, OnIngest: b.Republish}
+	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Token: token, OnIngest: b.Republish,
+		Analytics: &analytics.Service{Store: st}}
 	h := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { h.Close(); b.Close() })
 	return env{http: h, mqtt: "tcp://" + addr, broker: b}

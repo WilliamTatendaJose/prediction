@@ -111,3 +111,18 @@ dialog select, dialog input { width: 100%; }
 dialog .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 dialog select[multiple] { height: 90px; }
+
+.alerts { font-size: 12px; color: var(--ink); display: inline-flex; align-items: center; gap: 6px; cursor: default; }
+.alerts::before { content: "!"; display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; background: var(--critical); color: #fff; font-weight: 700; font-size: 11px; }
+
+.kv { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 2px 8px; margin: 8px 0 0; font-size: 12px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.alog { list-style: none; margin: 4px 0 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; }
+.alog li { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 8px; align-items: center; padding: 6px 0; border-top: 1px solid var(--grid); font-size: 12px; }
+.alog li:first-child { border-top: 0; }
+.alog li .status { margin: 0; }
+.alog li b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alog li .msg { grid-column: 2 / -1; color: var(--ink-2); }
+[hidden] { display: none !important; }

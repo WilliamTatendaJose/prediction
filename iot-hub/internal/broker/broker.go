@@ -20,6 +20,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/listeners"
 	"github.com/mochi-mqtt/server/v2/packets"
 
+	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 )
@@ -141,3 +142,13 @@ func (a *tokenAuth) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bo
 }
 
 func (a *tokenAuth) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool { return true }
+
+// PublishEvent sends an anomaly episode to {prefix}-events/anomaly/{sensor}.
+// It sits outside the ingest prefix so subscribers to iot/# see only data.
+func (b *Broker) PublishEvent(e anomaly.Event) {
+	payload, err := json.Marshal(e)
+	if err != nil {
+		return
+	}
+	_ = b.srv.Publish(b.prefix+"-events/anomaly/"+e.Sensor, payload, false, 0)
+}

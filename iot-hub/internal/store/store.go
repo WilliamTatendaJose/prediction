@@ -15,6 +15,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 )
 
 var (
@@ -30,8 +32,10 @@ func ValidID(s string) bool { return idRe.MatchString(s) }
 type Field struct {
 	Label string   `json:"label,omitempty"`
 	Unit  string   `json:"unit,omitempty"`
-	Min   *float64 `json:"min,omitempty"`
+	Min   *float64 `json:"min,omitempty"` // display range
 	Max   *float64 `json:"max,omitempty"`
+	// Detect configures anomaly detection; nil uses the server defaults.
+	Detect *anomaly.Rule `json:"detect,omitempty"`
 }
 
 type Sensor struct {
@@ -54,6 +58,9 @@ type Reading struct {
 	Sensor string         `json:"s"`
 	TS     int64          `json:"t"`
 	Values map[string]any `json:"v"`
+	// Changed lists string fields whose value differs from the previous one;
+	// only these are worth persisting.
+	Changed []string `json:"-"`
 }
 
 type Options struct {
@@ -243,6 +250,7 @@ func (s *Store) Ingest(id string, ts int64, values map[string]any) (Reading, err
 		s.sensors[id] = e
 		s.markDirty()
 	}
+	var changed []string
 	for k, v := range clean {
 		if _, known := e.def.Fields[k]; !known {
 			if !s.opts.AutoRegister || len(e.def.Fields) >= s.opts.MaxFields {
@@ -251,6 +259,9 @@ func (s *Store) Ingest(id string, ts int64, values map[string]any) (Reading, err
 			}
 			e.def.Fields[k] = Field{}
 			s.markDirty()
+		}
+		if str, ok := v.(string); ok && e.last[k] != str {
+			changed = append(changed, k)
 		}
 		e.last[k] = v
 		var f float32
@@ -277,7 +288,19 @@ func (s *Store) Ingest(id string, ts int64, values map[string]any) (Reading, err
 	if ts > e.seen {
 		e.seen = ts
 	}
-	return Reading{Sensor: id, TS: ts, Values: clean}, nil
+	return Reading{Sensor: id, TS: ts, Values: clean, Changed: changed}, nil
+}
+
+// Rule returns the anomaly rule for a field (zero value if none).
+func (s *Store) Rule(sensor, field string) anomaly.Rule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if e, ok := s.sensors[sensor]; ok {
+		if f, ok := e.def.Fields[field]; ok && f.Detect != nil {
+			return *f.Detect
+		}
+	}
+	return anomaly.Rule{}
 }
 
 func (s *Store) History(id, field string, limit int, since int64) ([]int64, []float32, error) {
