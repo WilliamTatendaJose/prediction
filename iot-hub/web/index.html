@@ -2,8 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>IoT Hub</title>
+  <meta name="theme-color" content="#2a78d6">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="IoT Hub">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="stylesheet" href="style.css">
   <script type="module" src="app.js"></script>
 </head>
@@ -12,6 +19,7 @@
     <h1>IoT Hub</h1>
     <span class="alerts" id="alerts" role="status" hidden></span>
     <span class="conn" id="conn" data-state="idle">Connecting…</span>
+    <button id="install" hidden title="Install the dashboard as an app">Install</button>
     <button id="theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
     <button id="edit">Edit</button>
     <button id="logout" hidden>Sign out</button>

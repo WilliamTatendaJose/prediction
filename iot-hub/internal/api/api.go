@@ -130,7 +130,11 @@ func (s *Server) Handler() http.Handler {
 	if s.Web != nil {
 		// The dashboard shell holds no data, so it loads without a token
 		// and shows a login form when the API answers 401.
-		mux.Handle("GET /", http.FileServerFS(s.Web))
+		assets, err := loadAssets(s.Web)
+		if err != nil {
+			panic("dashboard assets: " + err.Error()) // embedded at build time; can't fail at run time
+		}
+		mux.HandleFunc("GET /", staticHandler(assets))
 	}
 	return secureHeaders(mux, s.TLS)
 }

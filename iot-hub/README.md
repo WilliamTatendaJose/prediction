@@ -578,6 +578,31 @@ curl -H "Authorization: Bearer $ADMIN" -O https://hub:8443/api/backups/iothub-20
 - **Rotation and downloads:** files are rotated, with `0600`/`0700` modes. Path traversal (`../`, wrong names, `.partial` files) is refused. Viewers get 403.
 - **Restore drill:** the built binary, 3000 readings → backup → data directory deleted → snapshot copied back and config imported. Same statistics (n 3000, mean 49.5) and the same sensor definition.
 
+## Install as an app (PWA)
+
+The dashboard can be installed on phones, tablets and PCs: it opens in its own window from the home screen or start menu, like a native app. There is nothing extra to deploy, because the hub serves the manifest, icons and service worker.
+
+- **Android / Chrome / Edge:** the **Install** button in the header, or the browser's install icon.
+- **iPhone / iPad:** Safari → Share → **Add to Home Screen**.
+- **Requires HTTPS** (`-tls-cert`/`-tls-key`, or a TLS reverse proxy), or `localhost`. Browsers only install from a secure origin. On plain HTTP the dashboard still works as a web page.
+
+**Offline behaviour, by design:**
+- **The app shell is cached; data is not.** The service worker never caches `/api/` responses, so no plant data or signed-in content is stored on the device. An offline dashboard never shows old values as if they were live.
+- **Opened without a connection,** it says so ("Offline", or "Hub unreachable" when the network is up but the hub isn't). It loads by itself when the hub answers: it retries with back-off up to every 60 s, and at once when the device reconnects.
+- **Updates.** The shell is fetched network-first, so a hub upgrade reaches installed apps on their next online start.
+
+**Serving:**
+- **ETags.** Dashboard files carry a content-hash ETag and `Cache-Control: no-cache`, so an unchanged file costs a 304 on revisits instead of a full download.
+- **Gzip.** Files are pre-compressed once at start and sent gzipped when the browser accepts it; `tiles.js`, for example, goes from 39 KB to 11.6 KB.
+
+**Tested** in Chromium (Playwright, phone-sized viewport):
+- **Installable:** Chrome reported no installability or manifest errors (`Page.getInstallabilityErrors`). The service worker controls the page and caches only the shell.
+- **Offline:** launched offline, the shell opened with "Offline" and an explanation. Back online, the dashboard came up live without a reload. Zero API responses were in the cache.
+- **Hub down:** reloaded while the hub was stopped, the page showed "Hub unreachable"; it went live by itself when the hub restarted.
+- **Sign-in** still works with auth on.
+- **Unit test:** gzip negotiation (including `q=0`), 304 revalidation, content types and 404s.
+- **Not tested:** installing on real iOS and Android devices.
+
 ## Dashboard tiles
 
 | Tile | Shows |

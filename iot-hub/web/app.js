@@ -311,20 +311,61 @@ dlg.addEventListener('close', () => {
 // ---- boot -------------------------------------------------------------------
 const savedTheme = safeGet('iothub.theme');
 if (savedTheme) document.documentElement.dataset.theme = savedTheme;
-try {
-  const r = await fetch('/api/me', { credentials: 'same-origin' });
-  me = await r.json();
-  if (r.status === 401 && !me.publicRead) showLogin();
-} catch { /* offline: handled below */ }
-$('edit').hidden = !canManage();
-$('logout').hidden = !me.authEnabled || !me.identity;
-if (me.identity && me.authEnabled) $('logout').title = `Signed in as ${me.identity.id} (${me.identity.role})`;
-try {
-  const [, dash] = await Promise.all([loadSensors(), api('/api/dashboard')]);
-  layout = dash && Array.isArray(dash.tiles) ? dash : { tiles: [] };
-  build();
-  connect();
-  loadActive();
-} catch (e) {
-  if (!(e instanceof Unauthorized)) { $('conn').dataset.state = 'down'; $('conn').textContent = 'API unreachable'; }
+// Boot retries until the hub answers: an installed dashboard is often
+// opened before the network (or the hub) is back.
+let bootDelay = 2000, bootTimer = null, booting = false, booted = false;
+function offlineText() { return navigator.onLine ? 'Hub unreachable, retrying…' : 'Offline'; }
+async function boot() {
+  if (booting || booted) return;
+  booting = true;
+  clearTimeout(bootTimer);
+  try {
+    const r = await fetch('/api/me', { credentials: 'same-origin' });
+    me = await r.json();
+    if (r.status === 401 && !me.publicRead) showLogin();
+    $('edit').hidden = !canManage();
+    $('logout').hidden = !me.authEnabled || !me.identity;
+    if (me.identity && me.authEnabled) $('logout').title = `Signed in as ${me.identity.id} (${me.identity.role})`;
+    const [, dash] = await Promise.all([loadSensors(), api('/api/dashboard')]);
+    layout = dash && Array.isArray(dash.tiles) ? dash : { tiles: [] };
+    booted = true;
+    build();
+    connect();
+    loadActive();
+  } catch (e) {
+    if (!(e instanceof Unauthorized)) {
+      $('conn').dataset.state = 'down';
+      $('conn').textContent = offlineText();
+      const p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = navigator.onLine
+        ? "Can't reach the hub. The dashboard will load by itself when it answers."
+        : 'No network connection. The dashboard will load by itself when the connection returns.';
+      grid.replaceChildren(p);
+      bootTimer = setTimeout(boot, bootDelay);
+      bootDelay = Math.min(bootDelay * 2, 60000);
+    }
+  } finally {
+    booting = false;
+  }
 }
+$('edit').hidden = true; // until /api/me says what this user may do
+addEventListener('online', () => { bootDelay = 2000; boot(); });
+addEventListener('offline', () => { $('conn').dataset.state = 'down'; $('conn').textContent = 'Offline'; });
+boot();
+
+// ---- install (PWA) ----------------------------------------------------------
+// Service workers need a secure context: HTTPS (-tls-cert) or localhost.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('/sw.js').catch(() => { /* still works as a page */ });
+}
+let installPrompt = null;
+addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installPrompt = e; $('install').hidden = false; });
+addEventListener('appinstalled', () => { installPrompt = null; $('install').hidden = true; });
+$('install').addEventListener('click', async () => {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  await installPrompt.userChoice.catch(() => {});
+  installPrompt = null;
+  $('install').hidden = true;
+});
