@@ -214,6 +214,56 @@ func (d *Detector) Observe(sensor, field string, ts int64, v float64, r Rule) []
 	return out
 }
 
+// Warm feeds restored history (oldest first) into a field's baseline
+// without opening episodes, so spike detection works right after a restart
+// instead of re-learning for Warmup samples. Outliers are clipped as in
+// Observe, so a past spike does not inflate the baseline.
+func (d *Detector) Warm(sensor, field string, vals []float64, r Rule) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	k := sensor + "\x00" + field
+	s := d.fields[k]
+	if s == nil {
+		s = &fieldState{}
+		d.fields[k] = s
+	}
+	z := d.cfg.Z
+	if r.Z > 0 {
+		z = r.Z
+	}
+	for _, v := range vals {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		x := v
+		if s.n >= d.cfg.Warmup {
+			sd := math.Max(math.Sqrt(s.vr), 1e-6+1e-4*math.Abs(s.mean))
+			if lim := z * sd; math.Abs(v-s.mean) > lim {
+				x = s.mean + math.Copysign(lim, v-s.mean)
+			}
+		}
+		a := math.Max(d.alpha, 1/float64(s.n+1))
+		diff := x - s.mean
+		inc := a * diff
+		s.mean += inc
+		s.vr = (1 - a) * (s.vr + diff*inc)
+		s.n++
+	}
+}
+
+// Resume restores a sensor's reporting rhythm after a restart. It counts as
+// seen at now (not at its last stored reading), so the time the hub itself
+// was down never makes every sensor look stale at once.
+func (d *Detector) Resume(sensor string, intervalMs float64, now int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := &sensorState{last: now}
+	if intervalMs > 0 {
+		st.interval, st.n = intervalMs, 3
+	}
+	d.sensors[sensor] = st
+}
+
 // Seen records that a sensor reported at arrival time now (ms). It closes a
 // stale episode and learns the sensor's usual interval.
 func (d *Detector) Seen(sensor string, now int64) []Event {

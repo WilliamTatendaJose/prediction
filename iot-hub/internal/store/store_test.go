@@ -97,3 +97,39 @@ func TestPersistRoundTrip(t *testing.T) {
 		t.Fatalf("dashboard %s", buf.String())
 	}
 }
+
+func TestRestore(t *testing.T) {
+	s := New(Options{AutoRegister: true, Capacity: 3})
+	// Types are learnt on ingest (and persisted with the definition).
+	if _, err := s.Ingest("d", 1, map[string]any{"locked": true, "door": "Open", "t": 1.0}); err != nil {
+		t.Fatal(err)
+	}
+	s2 := New(Options{AutoRegister: true, Capacity: 3})
+	sv, _ := s.Get("d")
+	_ = s2.Upsert(sv.Sensor) // as if loaded from iothub.json
+	if sv.Fields["locked"].Type != "bool" || sv.Fields["door"].Type != "text" || sv.Fields["t"].Type != "number" {
+		t.Fatalf("types: %+v", sv.Fields)
+	}
+	s2.Restore("d", "t", []int64{10, 20, 30, 40, 50}, []float64{1, 2, 3, 4, 5}, "", 0)
+	s2.Restore("d", "locked", []int64{10, 60}, []float64{1, 0}, "", 0)
+	s2.Restore("d", "door", nil, nil, "Closed", 70)
+	got, _ := s2.Get("d")
+	if got.Last["t"] != 5.0 || got.Last["locked"] != false || got.Last["door"] != "Closed" || got.LastSeen != 70 {
+		t.Fatalf("restored last: %+v seen %d", got.Last, got.LastSeen)
+	}
+	ts, v, _ := s2.History("d", "t", 0, 0)
+	if len(ts) != 3 || ts[0] != 30 || v[2] != 5 {
+		t.Fatalf("ring keeps the newest capacity points: %v %v", ts, v)
+	}
+	// Live data that arrived first is never overwritten by older history.
+	s2.Ingest("d", 100, map[string]any{"t": 42.0})
+	s2.Restore("d", "t", []int64{10}, []float64{1}, "", 0)
+	if got, _ := s2.Get("d"); got.Last["t"] != 42.0 {
+		t.Fatalf("restore overwrote live value: %v", got.Last["t"])
+	}
+	// Unknown sensors come back only with auto-register.
+	s3 := New(Options{})
+	if s3.Restore("x", "t", []int64{1}, []float64{1}, "", 0) {
+		t.Fatal("restored an unknown sensor without auto-register")
+	}
+}

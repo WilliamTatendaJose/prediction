@@ -144,3 +144,36 @@ func TestAutoBucket(t *testing.T) {
 		}
 	}
 }
+
+func TestLatest(t *testing.T) {
+	for name, db := range backends(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var pts []Point
+			for i := int64(1); i <= 10; i++ {
+				pts = append(pts, Point{Sensor: "m", Field: "v", TS: i * 1000, Value: float64(i)})
+			}
+			pts = append(pts,
+				Point{Sensor: "d", Field: "door", TS: 1000, Text: "Open", IsText: true},
+				Point{Sensor: "d", Field: "door", TS: 5000, Text: "Closed", IsText: true})
+			if err := db.WritePoints(ctx, pts); err != nil {
+				t.Fatal(err)
+			}
+			got := map[string][]any{}
+			err := db.Latest(ctx, 4, func(sensor, field string, ts []int64, vals []float64, text string, textTS int64) {
+				got[sensor+"."+field] = []any{ts, vals, text, textTS}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := got["m.v"]
+			ts, vals := m[0].([]int64), m[1].([]float64)
+			if len(ts) != 4 || ts[0] != 7000 || ts[3] != 10000 || vals[3] != 10 {
+				t.Fatalf("numeric: newest 4, oldest first: %v %v", ts, vals)
+			}
+			if d := got["d.door"]; d[2] != "Closed" || d[3] != int64(5000) {
+				t.Fatalf("text: %v", d)
+			}
+		})
+	}
+}

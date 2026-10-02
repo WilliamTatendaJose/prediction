@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -234,6 +235,13 @@ func main() {
 	}()
 
 	var mq *broker.Broker
+	// Restore live state from the database before any transport starts, so
+	// tiles show the last known values (and recent history) immediately
+	// after a restart instead of staying blank until each sensor reports.
+	if an.DB != nil {
+		restoreLive(ctx, an.DB, st, pipe.Detector, *capacity, log)
+	}
+
 	mqttsAddr := ""
 	if tlsCfg != nil {
 		mqttsAddr = *mqttTLS
@@ -355,6 +363,47 @@ func main() {
 	if writer != nil {
 		<-writer.Done() // final flush before the deferred db.Close
 	}
+}
+
+func restoreLive(ctx context.Context, db tsdb.DB, st *store.Store, det *anomaly.Detector, limit int, log *slog.Logger) {
+	t0 := time.Now()
+	series, points := 0, 0
+	gaps := map[string]float64{} // sensor -> typical reporting interval (ms)
+	err := db.Latest(ctx, limit, func(sensor, field string, ts []int64, vals []float64, text string, textTS int64) {
+		if !st.Restore(sensor, field, ts, vals, text, textTS) {
+			return
+		}
+		series++
+		points += len(ts)
+		if det == nil || len(vals) == 0 {
+			return
+		}
+		sv, _ := st.Get(sensor)
+		if sv.Fields[field].Type != "bool" { // booleans are not spike-checked
+			det.Warm(sensor, field, vals, st.Rule(sensor, field))
+		}
+		if len(ts) >= 4 {
+			d := make([]float64, 0, len(ts)-1)
+			for i := 1; i < len(ts); i++ {
+				d = append(d, float64(ts[i]-ts[i-1]))
+			}
+			sort.Float64s(d)
+			if m := d[len(d)/2]; m > 0 && (gaps[sensor] == 0 || m < gaps[sensor]) {
+				gaps[sensor] = m // median gap: robust to outages in the history
+			}
+		}
+	})
+	if err != nil {
+		log.Error("restore live state", "err", err)
+		return
+	}
+	if det != nil {
+		now := time.Now().UnixMilli()
+		for _, sv := range st.List() {
+			det.Resume(sv.ID, gaps[sv.ID], now)
+		}
+	}
+	log.Info("restored live state", "series", series, "points", points, "took", time.Since(t0).Round(time.Millisecond))
 }
 
 // defineFields adds units/labels declared by a connector to the sensor

@@ -36,6 +36,19 @@ type Field struct {
 	Max   *float64 `json:"max,omitempty"`
 	// Detect configures anomaly detection; nil uses the server defaults.
 	Detect *anomaly.Rule `json:"detect,omitempty"`
+	// Type is learnt from the first value: number | bool | text. The
+	// database stores booleans as 0/1, so restore needs it to give them back.
+	Type string `json:"type,omitempty"`
+}
+
+func kindOf(v any) string {
+	switch v.(type) {
+	case bool:
+		return "bool"
+	case string:
+		return "text"
+	}
+	return "number"
 }
 
 type Sensor struct {
@@ -260,6 +273,11 @@ func (s *Store) Ingest(id string, ts int64, values map[string]any) (Reading, err
 			e.def.Fields[k] = Field{}
 			s.markDirty()
 		}
+		if f := e.def.Fields[k]; f.Type == "" {
+			f.Type = kindOf(v)
+			e.def.Fields[k] = f
+			s.markDirty()
+		}
 		if str, ok := v.(string); ok && e.last[k] != str {
 			changed = append(changed, k)
 		}
@@ -289,6 +307,65 @@ func (s *Store) Ingest(id string, ts int64, values map[string]any) (Reading, err
 		e.seen = ts
 	}
 	return Reading{Sensor: id, TS: ts, Values: clean, Changed: changed}, nil
+}
+
+// Restore loads persisted history into a sensor's live state after a
+// restart: numeric points into the ring buffer (oldest first), and the
+// newest value as "last". Unknown sensors are recreated if auto-register
+// is on. It does not publish, persist or run detection.
+func (s *Store) Restore(sensor, field string, ts []int64, vals []float64, text string, textTS int64) bool {
+	if !ValidID(sensor) || !ValidID(field) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.sensors[sensor]
+	if !ok {
+		if !s.opts.AutoRegister || len(s.sensors) >= s.opts.MaxSensors {
+			return false
+		}
+		e = s.newEntry(Sensor{ID: sensor, Name: sensor})
+		s.sensors[sensor] = e
+		s.markDirty()
+	}
+	f, known := e.def.Fields[field]
+	if !known {
+		if !s.opts.AutoRegister || len(e.def.Fields) >= s.opts.MaxFields {
+			return false
+		}
+		e.def.Fields[field] = Field{}
+		s.markDirty()
+	}
+	var lastTS int64
+	var last any
+	if len(ts) > 0 {
+		r := e.series[field]
+		if r == nil {
+			r = NewRing(s.opts.Capacity)
+			e.series[field] = r
+		}
+		start := max(0, len(ts)-s.opts.Capacity)
+		for i := start; i < len(ts); i++ {
+			r.Push(ts[i], float32(vals[i]))
+		}
+		lastTS, last = ts[len(ts)-1], vals[len(vals)-1]
+		if f.Type == "bool" {
+			last = vals[len(vals)-1] != 0
+		}
+	}
+	if textTS > lastTS {
+		lastTS, last = textTS, text
+	}
+	if last == nil {
+		return false
+	}
+	if _, live := e.last[field]; !live { // never overwrite data that arrived meanwhile
+		e.last[field] = last
+	}
+	if lastTS > e.seen {
+		e.seen = lastTS
+	}
+	return true
 }
 
 // Rule returns the anomaly rule for a field (zero value if none).

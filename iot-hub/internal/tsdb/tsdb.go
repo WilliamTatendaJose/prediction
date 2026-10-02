@@ -66,6 +66,10 @@ type DB interface {
 	Series(ctx context.Context, sensor, field string, from, to, bucket int64) ([]Bucket, error)
 	Stats(ctx context.Context, sensor, field string, from, to int64) (Stats, error)
 	Events(ctx context.Context, q EventQuery) ([]anomaly.Event, error)
+	// Latest calls fn for every series with its newest numeric points (up to
+	// limit, oldest first) and its newest text value, for restoring live
+	// state after a restart.
+	Latest(ctx context.Context, limit int, fn func(sensor, field string, ts []int64, vals []float64, text string, textTS int64)) error
 	// CloseOpenEvents ends episodes left open by a previous run.
 	CloseOpenEvents(ctx context.Context, at int64) error
 	Prune(ctx context.Context, rawBefore, rollupBefore, eventsBefore int64) error

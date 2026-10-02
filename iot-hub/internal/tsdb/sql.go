@@ -232,6 +232,70 @@ func (s *sqlDB) WritePoints(ctx context.Context, pts []Point) error {
 	return nil
 }
 
+func (s *sqlDB) Latest(ctx context.Context, limit int, fn func(sensor, field string, ts []int64, vals []float64, text string, textTS int64)) error {
+	type ser struct {
+		id            int64
+		sensor, field string
+	}
+	var all []ser
+	rows, err := s.db.QueryContext(ctx, `SELECT id, sensor, field FROM series ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var x ser
+		if err := rows.Scan(&x.id, &x.sensor, &x.field); err != nil {
+			rows.Close()
+			return err
+		}
+		all = append(all, x)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// One index range scan per series on the (series, ts) key: newest rows
+	// first, so the cost is bounded by limit, not by history length.
+	q := s.q(`SELECT ts, value, text FROM readings WHERE series = ? ORDER BY ts DESC LIMIT ?`)
+	for _, x := range all {
+		rs, err := s.db.QueryContext(ctx, q, x.id, limit)
+		if err != nil {
+			return err
+		}
+		var ts []int64
+		var vals []float64
+		var text string
+		var textTS int64
+		for rs.Next() {
+			var t int64
+			var v sql.NullFloat64
+			var tx sql.NullString
+			if err := rs.Scan(&t, &v, &tx); err != nil {
+				rs.Close()
+				return err
+			}
+			if v.Valid {
+				ts = append(ts, t)
+				vals = append(vals, v.Float64)
+			} else if tx.Valid && textTS == 0 {
+				text, textTS = tx.String, t
+			}
+		}
+		rs.Close()
+		if err := rs.Err(); err != nil {
+			return err
+		}
+		for i, j := 0, len(ts)-1; i < j; i, j = i+1, j-1 { // oldest first
+			ts[i], ts[j] = ts[j], ts[i]
+			vals[i], vals[j] = vals[j], vals[i]
+		}
+		if len(ts) > 0 || textTS != 0 {
+			fn(x.sensor, x.field, ts, vals, text, textTS)
+		}
+	}
+	return nil
+}
+
 func (s *sqlDB) SaveEvent(ctx context.Context, e anomaly.Event) error {
 	var end any
 	if e.End > 0 {

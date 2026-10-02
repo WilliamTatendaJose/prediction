@@ -150,3 +150,29 @@ func TestPersistIgnoresSingleGlitch(t *testing.T) {
 		t.Fatal("already open")
 	}
 }
+
+func TestWarmAndResume(t *testing.T) {
+	d := New(Config{StaleMin: time.Second})
+	r := rand.New(rand.NewPCG(21, 22))
+	hist := make([]float64, 200)
+	for i := range hist {
+		hist[i] = 20 + r.NormFloat64()*0.5
+	}
+	hist[100] = 500 // a past glitch must not inflate the baseline
+	d.Warm("s", "t", hist, Rule{})
+	// Spike detection works on the first live samples after restart.
+	if evs := d.Observe("s", "t", 1, 40, Rule{}); len(evs) != 0 {
+		t.Fatal("persist=2: first outlier alone must not open")
+	}
+	if evs := d.Observe("s", "t", 2, 40, Rule{}); len(evs) != 1 || evs[0].Kind != "spike" {
+		t.Fatalf("warm detector should catch a spike immediately: %+v", evs)
+	}
+	// Resume: the restart moment counts as seen, so no instant stale storm.
+	d.Resume("s", 1000, 100_000)
+	if evs := d.CheckStale(101_000); len(evs) != 0 {
+		t.Fatal("stale right after restart")
+	}
+	if evs := d.CheckStale(110_000); len(evs) != 1 {
+		t.Fatal("still detects a sensor that stays silent after restart")
+	}
+}

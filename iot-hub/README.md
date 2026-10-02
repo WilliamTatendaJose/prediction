@@ -234,6 +234,14 @@ Schema (identical on both):
 - **`rollup_1m(series, minute, n, sum, sumsq, min, max)`** is updated in the same transaction as each batch. Every column is mergeable, so any bucket ≥ 1 minute and stats over windows > 6 h come from rollups instead of raw rows.
 - **`anomalies`** holds one row per episode, closed in place (`end_ts`).
 
+**After a restart** the hub reloads live state from the database before it accepts any data, so tiles show the last known values straight away. It restores:
+- each field's newest value, with booleans and text restored as such
+- up to `-points` recent readings per field, so live charts and sparklines are full
+
+It also warms each field's anomaly baseline from that history, so spike detection works on the first live readings instead of re-learning for 30 samples. The silent-sensor check counts the restart itself as "last seen", so time the hub spent down never raises a stale alarm for every sensor at once.
+
+Restore takes about **0.4 s for 600 series × 1,024 points** (614k rows) on both SQLite and Postgres. Each series is one index range scan, newest first.
+
 How writes work:
 
 - Points go into a bounded queue (16k). One goroutine flushes it every second or every 500 points, as multi-row `INSERT`s plus the rollup upserts in a single transaction.
