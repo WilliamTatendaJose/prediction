@@ -59,6 +59,7 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-notify-resolved` | `IOTHUB_NOTIFY_RESOLVED` | `true` | also send "resolved" messages |
 | `-notify-cooldown` | `IOTHUB_NOTIFY_COOLDOWN` | `10m` | hold repeats for the same sensor/field/kind |
 | `-notify-per-minute` | `IOTHUB_NOTIFY_PER_MINUTE` | `20` | global cap |
+| `-report-to` (repeatable) | `IOTHUB_REPORT_TO` (space-separated) | | shift report targets, same kinds as `-notify`; sent at every shift change |
 | `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
 | `-shifts` | `IOTHUB_SHIFTS` | `06:00,14:00,22:00` | shift start times for OEE `from=shift` (empty disables) |
 | `-tz` | `IOTHUB_TZ` | system | plant time zone, e.g. `Africa/Harare` |
@@ -209,6 +210,8 @@ Units and labels from the file are added to the sensor definition, without overw
 | GET | `/api/anomalies?sensor=&from=&to=&limit=&active=1` | anomaly episodes, newest first |
 | GET / PUT | `/api/dashboard` | layout JSON (opaque to the server) |
 | GET | `/api/stream[?sensors=a,b]` | SSE: readings as `data: {"s","t","v"}`; anomalies as `event: anomaly` |
+| GET | `/api/reports?shift=previous\|current&format=json\|html\|text` | shift report (also `from`/`to`); see [Shift reports](#shift-reports) |
+| POST | `/api/reports/send` | send the previous shift's report to the `-report-to` targets now (admin) |
 | GET | `/api/connectors` | PLC connector status |
 | GET | `/api/health` | heap, stream and DB writer counters, active anomalies |
 
@@ -481,6 +484,44 @@ curl https://hub:8443/api/notifications -H "Authorization: Bearer $ADMIN"       
 - **End to end:** a real hub sending range anomalies to a local receiver. Signatures verified; cooldown hold; no orphan "resolved"; the test endpoint.
 - **Unit tests:** retry vs no-retry, the rate cap, every chat payload shape, and SMTP including AUTH against a fake server.
 - **Not tested:** delivery to the real Slack, Teams, Discord and Telegram services, which aren't reachable from here.
+
+## Shift reports
+
+At every shift change the hub sends a report for the shift that just ended to the `-report-to` targets. The report contains:
+- **Machines:** OEE with availability, performance and quality, parts and rejects, run time, and any OEE warnings.
+- **Energy:** consumption over the shift for every integrated field, e.g. `energy_kwh` (resets handled like counters).
+- **Alarms:** total, unacknowledged and shelved; counts by kind; the longest episodes with their verdict and who acknowledged them.
+- **Silent sensors:** sensors that went stale during the shift.
+
+The numbers come from the same code as the dashboard tiles and `/api/sensors/{id}/oee`, so a report never disagrees with what operators saw.
+
+```bash
+IOTHUB_REPORT_TO="email=smtp://reports:PASS@smtp.office365.com:587?from=hub@plant.co&to=production@plant.co teams=https://…" \
+IOTHUB_SHIFTS=06:00,14:00,22:00 IOTHUB_TZ=Africa/Harare IOTHUB_PUBLIC_URL=https://iothub.plant.local:8443 iothub …
+
+curl 'https://hub:8443/api/reports?format=html' > last-shift.html                # print or save as PDF from the browser
+curl 'https://hub:8443/api/reports?shift=current&format=text'                    # the shift so far
+curl -X POST https://hub:8443/api/reports/send -H "Authorization: Bearer $ADMIN"  # check the targets now
+```
+
+| Target | Gets |
+|---|---|
+| `email` | HTML report with a plain-text alternative (multipart, quoted-printable) |
+| `slack`, `teams`, `discord`, `telegram` | the text summary, shortened to each service's message limit |
+| `webhook` | the full report as JSON under `report`, signed with `-notify-secret` |
+
+**Behaviour:**
+- **Timing.** The report is sent 5 s after each shift start in `-shifts`, so the last readings of the shift are in.
+- **Separate from alerts.** Report targets are independent of the `-notify` alert targets and are not affected by the alert cooldown or rate cap.
+- **Missed reports.** A report missed while the hub was down is not sent later; produce it from the API with `from`/`to`.
+- **Without a database**, a report covers only what the in-memory buffers still hold. Use `-db` for full shifts.
+- **Escaping.** Sensor names and alarm messages come from devices, so the HTML is built with Go's `html/template`, which escapes them.
+
+**Tested:**
+- **API test:** the report over a 2 h window matches the OEE endpoint (OEE 0.6) and the energy meter (1 kWh), in JSON, HTML and text.
+- **Unit tests:** shift windows including the night shift either side of midnight; HTML escaping of a `<script>` sensor name, an `<img onerror>` alarm message and a `javascript:` link; chat clipping that never splits a multi-byte character; the multipart email against a fake SMTP server, with no line over the SMTP limit of 998 bytes.
+- **End to end:** the built binary with a shift change set a minute ahead delivered the report to a local webhook 5 s after the change, covering exactly the shift that ended.
+- **Not tested:** rendering in real mail clients (Outlook, Gmail), and delivery to the real chat services.
 
 ## Dashboard tiles
 

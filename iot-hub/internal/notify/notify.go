@@ -17,14 +17,18 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 )
@@ -142,6 +146,53 @@ type Message struct {
 	Link     string        `json:"link,omitempty"`
 	Held     int           `json:"suppressedSimilar,omitempty"`
 	Severity string        `json:"severity"`
+	// Reports: HTML for email, the structured report for webhooks.
+	HTML   string `json:"-"`
+	Report any    `json:"report,omitempty"`
+}
+
+// SendReport delivers a report to every target now (one retry on transient
+// failure) and returns the outcome per target. Email gets HTML with a
+// plain-text alternative; chat targets get the text, clipped to their limits;
+// webhooks get the structured report.
+func (n *Notifier) SendReport(ctx context.Context, title, text, html string, data any) map[string]string {
+	m := Message{Status: "report", Title: title, Text: text, HTML: html, Report: data, Severity: "info"}
+	out := map[string]string{}
+	for _, t := range n.cfg.Targets {
+		err := n.deliver(ctx, t, m)
+		if err != nil && !errors.Is(err, errPermanent) {
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+				err = n.deliver(ctx, t, m)
+			}
+		}
+		if err != nil {
+			t.Failed.Add(1)
+			t.last.Store(err.Error())
+			out[t.Redacted()] = err.Error()
+			continue
+		}
+		t.Sent.Add(1)
+		out[t.Redacted()] = "ok"
+	}
+	return out
+}
+
+// clip shortens chat text to a service's message limit.
+func clip(s string, n int) string {
+	const more = "\n… (shortened; full report by email or on the dashboard)"
+	if len(s) <= n {
+		return s
+	}
+	cut := s[:n-len(more)]
+	for len(cut) > 0 && !utf8.RuneStart(s[len(cut)]) { // don't split a character
+		cut = cut[:len(cut)-1]
+	}
+	if i := strings.LastIndex(cut, "\n"); i > n/2 {
+		cut = cut[:i]
+	}
+	return cut + more
 }
 
 func New(cfg Config) *Notifier {
@@ -384,16 +435,19 @@ func payload(kind string, u *url.URL, m Message) ([]byte, error) {
 	}
 	switch kind {
 	case "slack":
-		return json.Marshal(map[string]string{"text": "*" + m.Title + "*\n" + m.Text + linkSuffix(m.Link)})
+		return json.Marshal(map[string]string{"text": clip("*"+m.Title+"*\n"+m.Text+linkSuffix(m.Link), 3900)})
 	case "discord":
-		return json.Marshal(map[string]string{"content": "**" + m.Title + "**\n" + m.Text + linkSuffix(m.Link)})
+		return json.Marshal(map[string]string{"content": clip("**"+m.Title+"**\n"+m.Text+linkSuffix(m.Link), 2000)})
 	case "telegram":
-		return json.Marshal(map[string]string{"chat_id": u.Query().Get("chat_id"), "text": line})
+		return json.Marshal(map[string]string{"chat_id": u.Query().Get("chat_id"), "text": clip(line, 4096)})
 	case "teams":
 		// Teams Workflows webhooks take a message with an Adaptive Card.
 		color := "Attention"
-		if m.Status == "resolved" {
+		switch m.Status {
+		case "resolved":
 			color = "Good"
+		case "report":
+			color = "Default"
 		}
 		card := map[string]any{
 			"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -429,10 +483,32 @@ func sendEmail(u *url.URL, m Message) error {
 	to := strings.Split(q.Get("to"), ",")
 	host := u.Hostname()
 	var b strings.Builder
-	fmt.Fprintf(&b, "From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n%s\r\n",
-		from, strings.Join(to, ", "), mime.QEncoding.Encode("utf-8", m.Title), time.Now().Format(time.RFC1123Z), m.Text)
-	if m.Link != "" {
-		b.WriteString("\r\n" + m.Link + "\r\n")
+	fmt.Fprintf(&b, "From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\n",
+		from, strings.Join(to, ", "), mime.QEncoding.Encode("utf-8", m.Title), time.Now().Format(time.RFC1123Z))
+	text := m.Text
+	if m.Link != "" && !strings.Contains(text, m.Link) {
+		text += "\n" + m.Link
+	}
+	if m.HTML == "" {
+		b.WriteString("Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n")
+		writeQP(&b, text)
+	} else {
+		// multipart/alternative: HTML for mail clients, plain text for the rest.
+		mw := multipart.NewWriter(&b)
+		fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=%s\r\n\r\n", mw.Boundary())
+		for _, part := range []struct{ typ, body string }{{"text/plain", text}, {"text/html", m.HTML}} {
+			w, err := mw.CreatePart(textproto.MIMEHeader{
+				"Content-Type":              {part.typ + "; charset=utf-8"},
+				"Content-Transfer-Encoding": {"quoted-printable"},
+			})
+			if err != nil {
+				return err
+			}
+			var pb strings.Builder
+			writeQP(&pb, part.body)
+			io.WriteString(w, pb.String())
+		}
+		mw.Close()
 	}
 	var auth smtp.Auth
 	if u.User != nil {
@@ -440,6 +516,15 @@ func sendEmail(u *url.URL, m Message) error {
 		auth = smtp.PlainAuth("", u.User.Username(), pass, host) // refuses to send over plain text
 	}
 	return smtpSend(u.Scheme == "smtps", u.Host, host, auth, from, to, []byte(b.String()))
+}
+
+// writeQP encodes with quoted-printable: keeps SMTP lines under 998 bytes
+// and survives 7-bit relays.
+func writeQP(b *strings.Builder, s string) {
+	w := quotedprintable.NewWriter(b)
+	io.WriteString(w, strings.ReplaceAll(s, "\n", "\r\n"))
+	w.Close()
+	b.WriteString("\r\n")
 }
 
 // smtpSend is net/smtp.SendMail with a deadline (a hung server must not

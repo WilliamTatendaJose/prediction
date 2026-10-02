@@ -104,10 +104,10 @@ func stateAt(s Series, t, hold int64) (float64, bool) {
 	return s.V[i], true
 }
 
-// counted sums positive steps of a counter over [from, to), the same
+// Counted sums positive steps of a counter over [from, to), the same
 // half-open window as the state integration: a count stamped exactly at a
 // shift change belongs to the shift that starts then.
-func counted(s Series, from, to int64) float64 {
+func Counted(s Series, from, to int64) float64 {
 	var sum float64
 	prev, have := 0.0, false
 	for i, t := range s.TS {
@@ -174,13 +174,13 @@ func Compute(c Config, from, to int64, running, total, good, reject, planned Ser
 	if to > from {
 		r.Coverage = 1 - noDataMs/float64(to-from)
 	}
-	r.Total = counted(total, from, to)
+	r.Total = Counted(total, from, to)
 	switch {
 	case len(good.TS) > 0:
-		r.Good = counted(good, from, to)
+		r.Good = Counted(good, from, to)
 		r.Reject = math.Max(0, r.Total-r.Good)
 	case len(reject.TS) > 0:
-		r.Reject = counted(reject, from, to)
+		r.Reject = Counted(reject, from, to)
 		r.Good = math.Max(0, r.Total-r.Reject)
 	default:
 		r.Good = r.Total

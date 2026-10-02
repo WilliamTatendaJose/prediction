@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 )
@@ -266,5 +267,31 @@ func TestEmail(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no email")
+	}
+}
+
+func TestReportDelivery(t *testing.T) {
+	long := strings.Repeat("• línea de informe\n", 400) // > every chat limit, multi-byte
+	if c := clip(long, 2000); len(c) > 2000 || !utf8.ValidString(c) || !strings.HasSuffix(c, "dashboard)") {
+		t.Fatalf("clip: %d bytes, valid %v", len(c), utf8.ValidString(c))
+	}
+	addr, got := fakeSMTP(t)
+	tg, _ := ParseTarget("email=smtp://" + addr + "?from=hub@plant.test&to=a@plant.test")
+	n := New(Config{Targets: []*Target{tg}})
+	res := n.SendReport(context.Background(), "Shift report — Fri 06:00–14:00", "OEE 61.0%\n"+strings.Repeat("x", 1200), "<p>OEE 61.0%</p>", nil)
+	if res[tg.Redacted()] != "ok" {
+		t.Fatalf("send: %v", res)
+	}
+	s := <-got
+	for _, want := range []string{"multipart/alternative; boundary=", "Content-Type: text/plain; charset=utf-8", "Content-Type: text/html; charset=utf-8",
+		"quoted-printable", "<p>OEE 61.0%</p>"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("email missing %q", want)
+		}
+	}
+	for _, l := range strings.Split(s, "\r\n") {
+		if len(l) > 998 {
+			t.Fatalf("SMTP line of %d bytes", len(l))
+		}
 	}
 }

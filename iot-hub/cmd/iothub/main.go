@@ -32,6 +32,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/report"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
@@ -97,6 +98,11 @@ func main() {
 	}
 	flag.Func("notify", "notification target kind=URL (repeatable; or IOTHUB_NOTIFY, space-separated). kinds: webhook slack teams discord telegram email", func(v string) error {
 		notifySpecs = append(notifySpecs, v)
+		return nil
+	})
+	reportSpecs := strings.Fields(os.Getenv("IOTHUB_REPORT_TO"))
+	flag.Func("report-to", "shift report target kind=URL, same kinds as -notify (repeatable; or IOTHUB_REPORT_TO). Sent at every shift change", func(v string) error {
+		reportSpecs = append(reportSpecs, v)
 		return nil
 	})
 	notifySecret := flag.String("notify-secret", env("IOTHUB_NOTIFY_SECRET", ""), "HMAC secret for generic webhook signatures")
@@ -173,7 +179,7 @@ func main() {
 		}
 	}
 	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Web: web.FS, Analytics: an, Shifts: shiftStarts,
-		Auth: creds, PublicRead: *publicRead, SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil}
+		Auth: creds, PublicRead: *publicRead, SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil, PublicURL: *publicURL}
 
 	var writer *tsdb.Writer
 	stopWriter := func() {}
@@ -263,6 +269,36 @@ func main() {
 			names[i] = t.Redacted()
 		}
 		log.Info("notifications", "targets", names)
+	}
+
+	if len(reportSpecs) > 0 {
+		var targets []*notify.Target
+		names := make([]string, 0, len(reportSpecs))
+		for _, spec := range reportSpecs {
+			t, err := notify.ParseTarget(spec)
+			if err != nil {
+				log.Error("report-to", "err", err)
+				os.Exit(2)
+			}
+			targets = append(targets, t)
+			names = append(names, t.Redacted())
+		}
+		srv.Reporter = notify.New(notify.Config{Targets: targets, Secret: *notifySecret, BaseURL: *publicURL})
+		if len(shiftStarts) > 0 {
+			go report.Schedule(ctx, shiftStarts, time.Local, func(from, to time.Time) {
+				rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				rep, err := report.Build(rctx, st, an, from.UnixMilli(), to.UnixMilli(), "", time.Local)
+				if err != nil {
+					log.Error("shift report", "err", err)
+					return
+				}
+				rep.Link = *publicURL
+				res := srv.Reporter.SendReport(rctx, rep.Title+" — "+rep.Period, rep.Text(time.Local), rep.HTML(time.Local), rep)
+				log.Info("shift report sent", "period", rep.Period, "results", res)
+			}, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) })
+		}
+		log.Info("shift reports", "targets", names, "shifts", shiftStarts)
 	}
 
 	if *anomalyOn {

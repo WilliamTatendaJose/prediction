@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strings"
@@ -81,6 +82,46 @@ func TestCalculatedFieldsAndOEE(t *testing.T) {
 	if len(o.Buckets) != 2 || *o.Buckets[0].OEE >= *o.Buckets[1].OEE {
 		t.Fatalf("hourly buckets: the first hour had the stop, so lower OEE: %+v", o.Buckets)
 	}
+	// The shift report over the same window agrees with the OEE endpoint
+	// and picks up the energy meter.
+	rurl := fmt.Sprintf("%s/api/reports?from=%d&to=%d", e.url, start.UnixMilli(), start.Add(2*time.Hour).UnixMilli())
+	var rep struct {
+		Machines []struct {
+			Sensor string
+			Result struct{ OEE *float64 }
+		}
+		Energy []struct {
+			Sensor, Field string
+			Consumed      float64
+		}
+		Period string
+	}
+	if code := getJSON(t, rurl, &rep); code != 200 || len(rep.Machines) != 1 || math.Abs(*rep.Machines[0].Result.OEE-0.6) > 1e-9 ||
+		len(rep.Energy) != 1 || rep.Energy[0].Field != "energy_kwh" || math.Abs(rep.Energy[0].Consumed-1) > 1e-6 || rep.Period == "" {
+		t.Fatalf("report %d %+v", code, rep)
+	}
+	for format, want := range map[string]string{"html": "<td>press</td>", "text": "• press: OEE 60.0% (typical) — A 75.0%, P 90.0%, Q 88.9%; 81 parts, 9 rejected; ran 1 h 30 min of 2 h 00 min"} {
+		res, err := http.Get(rurl + "&format=" + format)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if !strings.Contains(string(b), want) || !strings.HasPrefix(res.Header.Get("Content-Type"), map[string]string{"html": "text/html", "text": "text/plain"}[format]) {
+			t.Errorf("%s report missing %q (%s):\n%s", format, want, res.Header.Get("Content-Type"), b)
+		}
+	}
+	res, _ := http.Get(rurl + "&format=json")
+	if b, _ := io.ReadAll(res.Body); !strings.Contains(string(b), `"longest":[]`) {
+		t.Errorf("empty lists must be [] not null: %s", b)
+	}
+	if res, _ := http.Get(e.url + "/api/reports?shift=yesterday"); res.StatusCode != 400 {
+		t.Errorf("bad shift: %d", res.StatusCode)
+	}
+	if res, _ := http.Post(e.url+"/api/reports/send", "", nil); res.StatusCode != 409 {
+		t.Errorf("send without targets: %d", res.StatusCode)
+	}
+
 	var all []struct{ Sensor string }
 	getJSON(t, fmt.Sprintf("%s/api/oee?from=%d&to=%d", e.url, start.UnixMilli(), start.Add(2*time.Hour).UnixMilli()), &all)
 	if len(all) != 1 || all[0].Sensor != "press" {

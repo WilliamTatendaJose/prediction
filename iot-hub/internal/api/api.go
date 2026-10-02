@@ -67,8 +67,10 @@ type Server struct {
 	Connectors    func() []connect.Status // optional
 	Notifier      *notify.Notifier        // optional
 	Alarms        *alarm.Manager
-	Shifts        []string       // shift start times "06:00", for from=shift
-	Location      *time.Location // plant time zone (default local)
+	Shifts        []string         // shift start times "06:00", for from=shift
+	Location      *time.Location   // plant time zone (default local)
+	Reporter      *notify.Notifier // optional: shift report targets
+	PublicURL     string           // linked from reports
 	started       time.Time
 }
 
@@ -111,6 +113,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/labels.csv", read(s.labels))
 	mux.HandleFunc("GET /api/sensors/{id}/oee", read(s.oeeHandler))
 	mux.HandleFunc("GET /api/oee", read(s.oeeOverview))
+	mux.HandleFunc("GET /api/reports", read(s.reports))
+	mux.HandleFunc("POST /api/reports/send", s.require(auth.Manage, s.sendReport))
 	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))
 	mux.HandleFunc("POST /api/notifications/test", s.require(auth.Manage, s.testNotification))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
