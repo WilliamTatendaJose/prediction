@@ -21,7 +21,8 @@ import (
 func main() {
 	mqttURL := flag.String("mqtt", "tcp://localhost:1883", "MQTT broker (empty to skip)")
 	httpURL := flag.String("http", "http://localhost:8080", "hub REST base URL (empty to skip)")
-	token := flag.String("token", "", "hub token")
+	token := flag.String("token", "", "hub token (MQTT password and HTTP bearer)")
+	user := flag.String("user", "sim", "MQTT username: must equal the device id when the hub uses per-device tokens")
 	every := flag.Duration("every", time.Second, "publish interval")
 	extra := flag.Int("extra", 0, "additional generic sensors (load test)")
 	faults := flag.Bool("faults", true, "inject occasional spikes and a sensor dropout to exercise anomaly detection")
@@ -30,7 +31,7 @@ func main() {
 	var mc paho.Client
 	if *mqttURL != "" {
 		o := paho.NewClientOptions().AddBroker(*mqttURL).SetClientID(fmt.Sprintf("sim-%d", rand.IntN(1e6))).
-			SetPassword(*token).SetUsername("sim").SetAutoReconnect(true)
+			SetPassword(*token).SetUsername(*user).SetAutoReconnect(true)
 		mc = paho.NewClient(o)
 		if t := mc.Connect(); t.Wait() && t.Error() != nil {
 			log.Fatalf("mqtt: %v", t.Error())

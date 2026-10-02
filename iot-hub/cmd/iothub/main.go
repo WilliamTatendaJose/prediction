@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
@@ -69,7 +71,12 @@ func main() {
 	maxSensors := flag.Int("max-sensors", envInt("IOTHUB_MAX_SENSORS", 500), "maximum sensors")
 	maxFields := flag.Int("max-fields", envInt("IOTHUB_MAX_FIELDS", 16), "maximum fields per sensor")
 	autoReg := flag.Bool("auto-register", env("IOTHUB_AUTO_REGISTER", "true") == "true", "create sensors/fields on first data")
-	token := flag.String("token", env("IOTHUB_TOKEN", ""), "shared secret for writes (HTTP Bearer / MQTT password)")
+	token := flag.String("token", env("IOTHUB_TOKEN", ""), "admin token; enables authentication (HTTP Bearer / MQTT password)")
+	authFile := flag.String("auth-file", env("IOTHUB_AUTH_FILE", "data/devices.json"), "per-device credentials (token hashes)")
+	publicRead := flag.Bool("public-read", env("IOTHUB_PUBLIC_READ", "") == "true", "allow reads without a token")
+	tlsCert := flag.String("tls-cert", env("IOTHUB_TLS_CERT", ""), "TLS certificate (PEM); enables HTTPS and MQTT over TLS")
+	tlsKey := flag.String("tls-key", env("IOTHUB_TLS_KEY", ""), "TLS private key (PEM)")
+	mqttTLS := flag.String("mqtts", env("IOTHUB_MQTTS", ":8883"), "MQTT over TLS address (used when -tls-cert is set)")
 	dbURL := flag.String("db", env("IOTHUB_DB", "data/readings.db"), "database: path.db, sqlite:path, postgres://... (empty = memory only)")
 	rawKeep := flag.Duration("raw-retention", envDur("IOTHUB_RAW_RETENTION", 7*24*time.Hour), "keep raw readings this long (0 = forever)")
 	rollupKeep := flag.Duration("rollup-retention", envDur("IOTHUB_ROLLUP_RETENTION", 365*24*time.Hour), "keep 1-minute rollups this long (0 = forever)")
@@ -105,7 +112,28 @@ func main() {
 	hub := stream.NewHub(64)
 	pipe := &ingest.Pipeline{Store: st, Hub: hub}
 	an := &analytics.Service{Store: st}
-	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Token: *token, Web: web.FS, Analytics: an}
+	creds := auth.New(*authFile, *token)
+	if err := creds.Load(); err != nil {
+		log.Error("load credentials", "err", err)
+		os.Exit(1)
+	}
+	if !creds.Enabled() {
+		log.Warn("AUTHENTICATION IS OFF: anyone who can reach this hub can read and write. Set -token to enable it.")
+	}
+	var tlsCfg *tls.Config
+	if *tlsCert != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Error("tls", "err", err)
+			os.Exit(1)
+		}
+		tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		if *mqttAddr != "" {
+			log.Warn("plain MQTT is still enabled; tokens cross the network unencrypted. Use -mqtt \"\" to serve MQTT over TLS only")
+		}
+	}
+	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Web: web.FS, Analytics: an,
+		Auth: creds, PublicRead: *publicRead, SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil}
 
 	var writer *tsdb.Writer
 	stopWriter := func() {}
@@ -146,10 +174,14 @@ func main() {
 	}()
 
 	var mq *broker.Broker
-	if *mqttAddr != "" || *mqttWS != "" {
+	mqttsAddr := ""
+	if tlsCfg != nil {
+		mqttsAddr = *mqttTLS
+	}
+	if *mqttAddr != "" || *mqttWS != "" || mqttsAddr != "" {
 		var err error
 		mq, err = broker.New(broker.Config{
-			TCPAddr: *mqttAddr, WSAddr: *mqttWS, Prefix: *prefix, Token: *token,
+			TCPAddr: *mqttAddr, WSAddr: *mqttWS, TLSAddr: mqttsAddr, TLS: tlsCfg, Prefix: *prefix, Auth: creds,
 			Logger: log.With("component", "mqtt"),
 		}, pipe)
 		if err != nil {
@@ -157,12 +189,13 @@ func main() {
 			os.Exit(1)
 		}
 		srv.OnIngest = mq.Republish
+		srv.OnRevoke = func(id string) { mq.Kick(id) }
 		pipe.OnEvent = mq.PublishEvent
 		if err := mq.Serve(); err != nil {
 			log.Error("mqtt serve", "err", err)
 			os.Exit(1)
 		}
-		log.Info("mqtt listening", "tcp", *mqttAddr, "ws", *mqttWS, "topics", *prefix+"/{sensor}[/{field}]")
+		log.Info("mqtt listening", "tcp", *mqttAddr, "tls", mqttsAddr, "ws", *mqttWS, "topics", *prefix+"/{sensor}[/{field}]")
 	}
 
 	// Started only after the pipeline is fully wired (OnEvent above).
@@ -192,7 +225,14 @@ func main() {
 	}
 	go func() {
 		log.Info("http listening", "addr", *httpAddr)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if tlsCfg != nil {
+			httpSrv.TLSConfig = tlsCfg
+			err = httpSrv.ListenAndServeTLS("", "")
+		} else {
+			err = httpSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http", "err", err)
 			stop()
 		}

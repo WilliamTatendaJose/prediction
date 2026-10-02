@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -20,7 +21,17 @@ public class IotHubOptions
     public bool Enabled { get; set; } = true;
     public string Host { get; set; } = "localhost";
     public int Port { get; set; } = 1883;
-    /// <summary>Hub token (IOTHUB_TOKEN); sent as MQTT password and HTTP bearer.</summary>
+    /// <summary>MQTT over TLS (hub -mqtts, usually port 8883). The certificate is
+    /// validated against the OS trust store; for a self-signed hub, install its
+    /// CA certificate there.</summary>
+    public bool UseTls { get; set; }
+    /// <summary>Check certificate revocation online. Off by default, like HttpClient:
+    /// private CAs usually publish no revocation list, which would fail every connect.</summary>
+    public bool CheckCertificateRevocation { get; set; }
+    /// <summary>Hub credential: MQTT username = this id, password = Token. Create it on
+    /// the hub as role "service" with sensors ["*-ml"].</summary>
+    public string Username { get; set; } = "mlnet-bridge";
+    /// <summary>Hub token; sent as MQTT password and HTTP bearer.</summary>
     public string? Token { get; set; }
     public string TopicPrefix { get; set; } = "iot";
     /// <summary>Results go to {prefix}/{sensor}{OutputSuffix}.</summary>
@@ -83,10 +94,13 @@ public sealed partial class IotHubBridge(
             .WithTcpServer(_o.Host, _o.Port)
             .WithClientId($"mlnet-bridge-{Environment.MachineName}")
             .WithCleanSession(true);
+        if (_o.UseTls)
+            builder = builder.WithTlsOptions(t => t.UseTls().WithRevocationMode(
+                _o.CheckCertificateRevocation ? X509RevocationMode.Online : X509RevocationMode.NoCheck));
         // An empty password with the password flag set is a protocol
         // violation, so credentials are sent only when a token is configured.
         if (!string.IsNullOrEmpty(_o.Token))
-            builder = builder.WithCredentials("mlnet-bridge", _o.Token);
+            builder = builder.WithCredentials(_o.Username, _o.Token);
         var mqttOptions = builder.Build();
 
         // Connect, and reconnect with capped backoff; quiet while the hub is down.

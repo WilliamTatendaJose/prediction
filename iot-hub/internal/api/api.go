@@ -19,7 +19,6 @@
 package api
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -32,6 +31,7 @@ import (
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
@@ -48,51 +48,54 @@ type Server struct {
 	Store    *store.Store
 	Hub      *stream.Hub
 	Pipeline *ingest.Pipeline
-	Token    string              // if set, required as Bearer token for writes
 	OnIngest func(store.Reading) // optional, e.g. republish to MQTT
 	Web      fs.FS
 
 	Analytics *analytics.Service
 	Detector  *anomaly.Detector // optional
 	Writer    *tsdb.Writer      // optional, for health reporting
-	started   time.Time
+
+	Auth          *auth.Store // nil = open
+	PublicRead    bool        // reads need no token (writes still do)
+	SecureCookies bool        // set when serving TLS
+	TLS           bool        // adds HSTS
+	OnRevoke      func(id string)
+	started       time.Time
 }
 
 func (s *Server) Handler() http.Handler {
 	s.started = time.Now()
+	if s.Auth == nil {
+		s.Auth = auth.New("", "")
+	}
+	read := func(h http.HandlerFunc) http.HandlerFunc { return s.require(auth.Read, h) }
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
-	mux.HandleFunc("GET /api/sensors", s.listSensors)
-	mux.HandleFunc("GET /api/sensors/{id}", s.getSensor)
-	mux.HandleFunc("PUT /api/sensors/{id}", s.auth(s.putSensor))
-	mux.HandleFunc("DELETE /api/sensors/{id}", s.auth(s.deleteSensor))
-	mux.HandleFunc("POST /api/sensors/{id}/data", s.auth(s.ingest))
-	mux.HandleFunc("POST /api/sensors/{id}/data/{field}", s.auth(s.ingest))
-	mux.HandleFunc("GET /api/sensors/{id}/history", s.history)
-	mux.HandleFunc("GET /api/sensors/{id}/series", s.series)
-	mux.HandleFunc("GET /api/sensors/{id}/stats", s.stats)
-	mux.HandleFunc("GET /api/anomalies", s.anomalies)
-	mux.HandleFunc("GET /api/dashboard", s.getDashboard)
-	mux.HandleFunc("PUT /api/dashboard", s.auth(s.putDashboard))
-	mux.HandleFunc("GET /api/stream", s.stream)
+	mux.HandleFunc("POST /api/login", s.login)
+	mux.HandleFunc("POST /api/logout", s.logout)
+	mux.HandleFunc("GET /api/me", s.me)
+	mux.HandleFunc("GET /api/sensors", read(s.listSensors))
+	mux.HandleFunc("GET /api/sensors/{id}", read(s.getSensor))
+	mux.HandleFunc("PUT /api/sensors/{id}", s.require(auth.Define, s.putSensor))
+	mux.HandleFunc("DELETE /api/sensors/{id}", s.require(auth.Define, s.deleteSensor))
+	mux.HandleFunc("POST /api/sensors/{id}/data", s.require(auth.Ingest, s.ingest))
+	mux.HandleFunc("POST /api/sensors/{id}/data/{field}", s.require(auth.Ingest, s.ingest))
+	mux.HandleFunc("GET /api/sensors/{id}/history", read(s.history))
+	mux.HandleFunc("GET /api/sensors/{id}/series", read(s.series))
+	mux.HandleFunc("GET /api/sensors/{id}/stats", read(s.stats))
+	mux.HandleFunc("GET /api/anomalies", read(s.anomalies))
+	mux.HandleFunc("GET /api/dashboard", read(s.getDashboard))
+	mux.HandleFunc("PUT /api/dashboard", s.require(auth.Manage, s.putDashboard))
+	mux.HandleFunc("GET /api/stream", read(s.stream))
+	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
+	mux.HandleFunc("POST /api/devices", s.require(auth.Manage, s.addDevice))
+	mux.HandleFunc("DELETE /api/devices/{id}", s.require(auth.Manage, s.deleteDevice))
 	if s.Web != nil {
+		// The dashboard shell holds no data, so it loads without a token
+		// and shows a login form when the API answers 401.
 		mux.Handle("GET /", http.FileServerFS(s.Web))
 	}
-	return mux
-}
-
-func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	if s.Token == "" {
-		return next
-	}
-	want := []byte("Bearer " + s.Token)
-	return func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
-			writeErr(w, http.StatusUnauthorized, errors.New("missing or invalid bearer token"))
-			return
-		}
-		next(w, r)
-	}
+	return secureHeaders(mux, s.TLS)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

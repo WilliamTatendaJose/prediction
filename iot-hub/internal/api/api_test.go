@@ -15,6 +15,7 @@ import (
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
@@ -41,14 +42,15 @@ func setup(t *testing.T, token string) env {
 	hub := stream.NewHub(16)
 	pipe := &ingest.Pipeline{Store: st, Hub: hub}
 	addr := freeAddr(t)
-	b, err := broker.New(broker.Config{TCPAddr: addr, Token: token}, pipe)
+	creds := auth.New("", token)
+	b, err := broker.New(broker.Config{TCPAddr: addr, Auth: creds}, pipe)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Serve(); err != nil {
 		t.Fatal(err)
 	}
-	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Token: token, OnIngest: b.Republish,
+	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Auth: creds, OnIngest: b.Republish,
 		Analytics: &analytics.Service{Store: st}}
 	h := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { h.Close(); b.Close() })
@@ -164,8 +166,8 @@ func TestTokenAuth(t *testing.T) {
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("want 202, got %s", res.Status)
 	}
-	if res, _ := http.Get(e.http.URL + "/api/sensors"); res.StatusCode != 200 {
-		t.Fatal("reads stay open")
+	if res, _ := http.Get(e.http.URL + "/api/sensors"); res.StatusCode != 401 {
+		t.Fatal("reads need a token when auth is on")
 	}
 	if _, err := mqttClient(t, e.mqtt, "wrong"); err == nil {
 		t.Fatal("mqtt should reject wrong password")

@@ -11,17 +11,41 @@ let dirtyLayout = false;
 const active = new Map();     // open anomaly episodes by id
 
 // ---- API ------------------------------------------------------------------
+// Auth lives in an HttpOnly cookie set by /api/login: scripts never see the
+// token. X-Requested-With is the server's CSRF guard for cookie writes.
+class Unauthorized extends Error {}
 async function api(path, opts = {}) {
-  const tok = safeGet('iothub.token');
-  const headers = { ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...(tok ? { Authorization: 'Bearer ' + tok } : {}) };
-  const res = await fetch(path, { ...opts, headers });
-  if (res.status === 401) {
-    const t = prompt('This hub requires an access token for changes:');
-    if (t) { safeSet('iothub.token', t); return api(path, opts); }
-  }
+  const headers = { 'X-Requested-With': 'iothub', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) };
+  const res = await fetch(path, { ...opts, headers, credentials: 'same-origin' });
+  if (res.status === 401) { showLogin(); throw new Unauthorized('login required'); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
   return res.status === 204 ? null : res.json();
 }
+
+let me = { authEnabled: false, identity: { role: 'admin' } };
+const canManage = () => !me.authEnabled || me.identity?.role === 'admin';
+
+function showLogin(msg) {
+  const d = $('login');
+  if (d.open) return;
+  $('login-err').textContent = msg || '';
+  $('login-token').value = '';
+  d.showModal();
+}
+$('login-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const res = await fetch('/api/login', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'iothub' },
+    body: JSON.stringify({ token: $('login-token').value.trim() }),
+  });
+  if (!res.ok) { $('login-err').textContent = 'That token was not accepted.'; return; }
+  location.reload();
+});
+$('logout').onclick = async () => {
+  await fetch('/api/logout', { method: 'POST', credentials: 'same-origin', headers: { 'X-Requested-With': 'iothub' } });
+  location.reload();
+};
 function safeGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 function safeSet(k, v) { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } }
 
@@ -273,11 +297,19 @@ dlg.addEventListener('close', () => {
 const savedTheme = safeGet('iothub.theme');
 if (savedTheme) document.documentElement.dataset.theme = savedTheme;
 try {
+  const r = await fetch('/api/me', { credentials: 'same-origin' });
+  me = await r.json();
+  if (r.status === 401 && !me.publicRead) showLogin();
+} catch { /* offline: handled below */ }
+$('edit').hidden = !canManage();
+$('logout').hidden = !me.authEnabled || !me.identity;
+if (me.identity && me.authEnabled) $('logout').title = `Signed in as ${me.identity.id} (${me.identity.role})`;
+try {
   const [, dash] = await Promise.all([loadSensors(), api('/api/dashboard')]);
   layout = dash && Array.isArray(dash.tiles) ? dash : { tiles: [] };
+  build();
+  connect();
+  loadActive();
 } catch (e) {
-  $('conn').dataset.state = 'down'; $('conn').textContent = 'API unreachable';
+  if (!(e instanceof Unauthorized)) { $('conn').dataset.state = 'down'; $('conn').textContent = 'API unreachable'; }
 }
-build();
-connect();
-loadActive();

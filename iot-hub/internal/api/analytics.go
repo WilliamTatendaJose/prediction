@@ -50,11 +50,13 @@ func parseDuration(v string) (time.Duration, error) {
 	return d, nil
 }
 
-// rangeParams reads from/to; from defaults to defFrom before now.
-func rangeParams(r *http.Request, defFrom time.Duration) (from, to int64, err error) {
+// rangeParams reads from/to; from defaults to defFrom before now. Ranges
+// exclude "to", so its default is defTo after now: a reading stamped this
+// very millisecond is still included.
+func rangeParams(r *http.Request, defFrom, defTo time.Duration) (from, to int64, err error) {
 	q := r.URL.Query()
 	now := time.Now()
-	if to, err = parseTime(q.Get("to"), now); err != nil {
+	if to, err = parseTime(q.Get("to"), now.Add(defTo)); err != nil {
 		return
 	}
 	if from, err = parseTime(q.Get("from"), now.Add(-defFrom)); err != nil {
@@ -74,7 +76,7 @@ func fieldParam(r *http.Request) string {
 }
 
 func (s *Server) series(w http.ResponseWriter, r *http.Request) {
-	from, to, err := rangeParams(r, time.Hour)
+	from, to, err := rangeParams(r, time.Hour, time.Second)
 	if err != nil {
 		storeErr(w, err)
 		return
@@ -101,7 +103,7 @@ func (s *Server) series(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
-	from, to, err := rangeParams(r, time.Hour)
+	from, to, err := rangeParams(r, time.Hour, time.Second)
 	if err != nil {
 		storeErr(w, err)
 		return
@@ -116,7 +118,7 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) anomalies(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to, err := rangeParams(r, 7*24*time.Hour)
+	from, to, err := rangeParams(r, 7*24*time.Hour, 24*time.Hour) // devices may run ahead by up to 24 h
 	if err != nil {
 		storeErr(w, err)
 		return

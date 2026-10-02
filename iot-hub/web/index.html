@@ -14,10 +14,22 @@
     <span class="conn" id="conn" data-state="idle">Connecting…</span>
     <button id="theme" title="Toggle theme" aria-label="Toggle theme">◐</button>
     <button id="edit">Edit</button>
+    <button id="logout" hidden>Sign out</button>
     <button id="add" class="primary" hidden>Add tile</button>
     <button id="save" class="primary" hidden>Save layout</button>
   </header>
   <main id="grid"></main>
+
+  <dialog id="login">
+    <form id="login-form">
+      <h3>Sign in</h3>
+      <p class="sub">This hub requires an access token. Ask an administrator for a viewer token.</p>
+      <label for="login-token">Access token</label>
+      <input id="login-token" type="password" autocomplete="current-password" required>
+      <p id="login-err" class="sub" role="alert"></p>
+      <div class="actions"><button class="primary">Sign in</button></div>
+    </form>
+  </dialog>
 
   <dialog id="dlg">
     <form method="dialog" id="form">

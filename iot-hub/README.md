@@ -53,7 +53,62 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-anomaly-persist` | `IOTHUB_ANOMALY_PERSIST` | `2` | consecutive outliers before a spike opens |
 | `-anomaly-warmup` | `IOTHUB_ANOMALY_WARMUP` | `30` | samples before spike detection starts |
 | `-stale-min` | `IOTHUB_STALE_MIN` | `1m` | minimum silence before "stale" (0 disables) |
-| `-token` | `IOTHUB_TOKEN` | — | shared secret: HTTP `Authorization: Bearer …` for writes, MQTT password |
+| `-token` | `IOTHUB_TOKEN` | — | admin token; setting it turns authentication on (see Security) |
+| `-auth-file` | `IOTHUB_AUTH_FILE` | `data/devices.json` | per-device credentials (hashes only, mode 0600) |
+| `-public-read` | `IOTHUB_PUBLIC_READ` | `false` | allow reads without a token (writes still need one) |
+| `-tls-cert` / `-tls-key` | `IOTHUB_TLS_CERT` / `_KEY` | — | PEM files; enable HTTPS and MQTT over TLS |
+| `-mqtts` | `IOTHUB_MQTTS` | `:8883` | MQTT over TLS address (when a certificate is set) |
+
+## Security
+
+With no `-token` and no credentials file, the hub is **open**, and it logs a warning saying so. Setting `-token` turns authentication on for HTTP and MQTT. That token is the **admin** bootstrap; everything else gets its own token:
+
+| Role | HTTP | MQTT | Typical holder |
+|---|---|---|---|
+| `admin` | everything, including devices and dashboard layout | publish/subscribe anything | you |
+| `service` | read; ingest and define **its** sensors | subscribe all; publish its sensors | the ML.NET bridge (`*-ml`) |
+| `device` | ingest to **its** sensors only | publish its sensors only | a PLC gateway, an ESP32 |
+| `viewer` | read only | subscribe only | a wall screen, a supervisor |
+
+"Its sensors" are glob patterns such as `env-*`, `line3-*` or `*-ml`. A device that is compromised can only write the sensors it was given. It can't read anything, spoof anomaly events, or touch the dashboard.
+
+```bash
+# create (admin only); the token is shown once
+curl -X POST https://hub:8443/api/devices -H "Authorization: Bearer $ADMIN" \
+     -d '{"id":"env-node-1","role":"device","sensors":["env-*"],"note":"roof"}'
+curl https://hub:8443/api/devices -H "Authorization: Bearer $ADMIN"                 # list (no secrets)
+curl -X DELETE https://hub:8443/api/devices/env-node-1 -H "Authorization: Bearer $ADMIN"  # revoke
+```
+
+- **Tokens.** Each is 256 bits of randomness, stored only as a SHA-256 hash.
+- **Revocation** takes effect immediately and also drops the device's live MQTT sessions.
+- **Auth can't silently switch off.** Once a credentials file exists, removing the last device does not turn authentication off.
+- **MQTT** username = device id, password = token. The admin token accepts any username.
+- **Dashboard.** It asks for a token once, and `/api/login` stores it in an **HttpOnly, SameSite=Strict** cookie (Secure under TLS), so page scripts never see it.
+  - Cookie-authenticated writes also need an `X-Requested-With: iothub` header, which another site can't send without a CORS preflight. The hub never approves one.
+  - Viewers don't see the Edit button.
+- **Headers.** Every response carries a strict Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, and HSTS under TLS.
+- **`/api/health` stays public** for load balancers. It reveals counts, not data.
+
+**TLS.** Use a real certificate if the hub has a DNS name. Otherwise make a small private CA once:
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 -subj "/CN=Plant IoT CA" -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=iothub" -keyout hub.key -out hub.csr
+printf "subjectAltName=DNS:iothub,DNS:localhost,IP:192.168.1.10\nextendedKeyUsage=serverAuth\n" > ext.cnf
+openssl x509 -req -in hub.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 -extfile ext.cnf -out hub.crt
+iothub -token "$(openssl rand -base64 32)" -tls-cert hub.crt -tls-key hub.key -mqtt "" -http :8443
+```
+
+Install `ca.crt` in each client's trust store: Windows *Trusted Root*, Linux `/usr/local/share/ca-certificates` + `update-ca-certificates`, or the device firmware. `-mqtt ""` turns plain MQTT off; while it stays on, the hub warns that tokens cross the network in clear text.
+
+**Tested end to end:** a TLS-only hub with a private CA in the OS store. The emulator posted over HTTPS with a `device` token, the ML.NET bridge connected over MQTT/TLS with a `service` token, and a browser signed in with a `viewer` token. The automated tests also cover:
+- the role matrix
+- MQTT topic ACLs (a device publishing outside its patterns, or to `iot-events/…`, is dropped)
+- revocation kicking live sessions
+- a username/id mismatch being rejected
+- an untrusted certificate failing
+- the CSRF header requirement
 
 ## Sending data
 
@@ -189,7 +244,9 @@ Configuration lives in `prediction.Server/appsettings.json` under `IotHub`, or i
 |---|---|---|
 | `Enabled` | `true` | |
 | `Host` / `Port` | `localhost` / `1883` | hub MQTT broker |
-| `Token` | — | the hub's `IOTHUB_TOKEN`, if set |
+| `Username` / `Token` | `mlnet-bridge` / — | a hub credential with role `service` and sensors `["*-ml"]` |
+| `UseTls` | `false` | MQTT over TLS (set `Port` to 8883); certificate checked against the OS trust store |
+| `CheckCertificateRevocation` | `false` | online revocation check; private CAs usually have no revocation list |
 | `RequiredFields` | `AccessMethod, AccessStatus, LocationID` | message must have these to be scored |
 | `NormalLabel` | `Normal` | the model's classes are `Normal`, `Abnormal` |
 | `RiskThreshold` | `0.5` | risk above this opens an anomaly |
@@ -267,7 +324,8 @@ Without the database (`-db ""`): 20 MB RSS and 2.2% CPU at the same 1,000 msgs/s
 
 ## Limits and next steps
 
-- **Auth is a single shared token.** Reads (dashboard, stream, analytics) are open. Put it behind a reverse proxy with TLS, or add per-device credentials, before exposing it beyond a LAN.
+- **No per-IP rate limiting or lockout.** Tokens are 256-bit, so guessing is not feasible, but noisy scanners are not throttled. Put the hub behind a firewall or reverse proxy if it faces the internet.
+- **Device credentials are tokens, not client certificates.** Mutual TLS would bind identity to hardware keys; the listener supports it, but it isn't wired up.
 - **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits, and models (see ML.NET integration) for multi-field judgements.
 - **No notifications yet.** Anomalies go to the dashboard, the database and MQTT. Email/Slack/webhook delivery would be a small subscriber on `iot-events/anomaly/#` or an `OnEvent` hook.
 - **Statistics are mean/std/min/max.** No percentiles: they don't merge across rollups, so they would need raw scans or sketches.
