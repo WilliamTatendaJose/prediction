@@ -18,6 +18,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
@@ -37,7 +38,7 @@ func full(t *testing.T, withDB bool) fullEnv {
 	st := store.New(store.Options{AutoRegister: true, Capacity: 4096})
 	hub := stream.NewHub(256)
 	det := anomaly.New(anomaly.Config{Warmup: 20, Persist: 1})
-	pipe := &ingest.Pipeline{Store: st, Hub: hub, Detector: det}
+	pipe := &ingest.Pipeline{Store: st, Hub: hub, Detector: det, Calc: calc.NewEngine()}
 	an := &analytics.Service{Store: st, Detector: det}
 	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Analytics: an, Detector: det}
 	var w *tsdb.Writer

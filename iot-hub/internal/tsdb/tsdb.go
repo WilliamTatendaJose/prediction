@@ -67,6 +67,9 @@ type DB interface {
 	Stats(ctx context.Context, sensor, field string, from, to int64) (Stats, error)
 	Events(ctx context.Context, q EventQuery) ([]anomaly.Event, error)
 	Event(ctx context.Context, id string) (anomaly.Event, bool, error)
+	// Raw returns numeric samples in [from, to) plus the last sample before
+	// from (state and counter baselines), oldest first, at most limit.
+	Raw(ctx context.Context, sensor, field string, from, to int64, limit int) ([]int64, []float64, error)
 	// Latest calls fn for every series with its newest numeric points (up to
 	// limit, oldest first) and its newest text value, for restoring live
 	// state after a restart.

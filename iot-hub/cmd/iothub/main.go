@@ -28,6 +28,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/notify"
@@ -104,6 +105,8 @@ func main() {
 	notifyCooldown := flag.Duration("notify-cooldown", envDur("IOTHUB_NOTIFY_COOLDOWN", 10*time.Minute), "hold repeat alerts for the same sensor/field/kind")
 	notifyRate := flag.Int("notify-per-minute", envInt("IOTHUB_NOTIFY_PER_MINUTE", 20), "maximum notifications per minute")
 	publicURL := flag.String("public-url", env("IOTHUB_PUBLIC_URL", ""), "dashboard URL used in notification links")
+	shifts := flag.String("shifts", env("IOTHUB_SHIFTS", "06:00,14:00,22:00"), "shift start times for OEE (comma-separated HH:MM; empty disables)")
+	tz := flag.String("tz", env("IOTHUB_TZ", ""), "plant time zone for shifts and daily reports, e.g. Africa/Harare (default: system)")
 	connectorsFile := flag.String("connectors", env("IOTHUB_CONNECTORS", ""), "Modbus/OPC UA connectors config (JSON); empty disables")
 	debug := flag.Bool("debug", env("IOTHUB_DEBUG", "") == "true", "debug logging")
 	flag.Parse()
@@ -151,7 +154,25 @@ func main() {
 			log.Warn("plain MQTT is still enabled; tokens cross the network unencrypted. Use -mqtt \"\" to serve MQTT over TLS only")
 		}
 	}
-	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Web: web.FS, Analytics: an,
+	if *tz != "" {
+		loc, err := time.LoadLocation(*tz)
+		if err != nil {
+			log.Error("tz", "err", err)
+			os.Exit(1)
+		}
+		time.Local = loc
+	}
+	var shiftStarts []string
+	for _, s := range strings.Split(*shifts, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			if _, err := time.Parse("15:04", s); err != nil {
+				log.Error("shifts", "err", fmt.Errorf("bad shift start %q (want HH:MM)", s))
+				os.Exit(1)
+			}
+			shiftStarts = append(shiftStarts, s)
+		}
+	}
+	srv := &api.Server{Store: st, Hub: hub, Pipeline: pipe, Web: web.FS, Analytics: an, Shifts: shiftStarts,
 		Auth: creds, PublicRead: *publicRead, SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil}
 
 	var writer *tsdb.Writer
@@ -197,6 +218,10 @@ func main() {
 		hub.Publish(&stream.Msg{Event: "alarms", Data: []byte(`{"kind":"` + kind + `"}`)})
 	}
 	pipe.Alarms, an.Alarms, srv.Alarms = alarms, alarms, alarms
+	pipe.Calc = calc.NewEngine()
+	pipe.Calc.Errors = func(sensor, field string, err error) {
+		log.Debug("calculated field", "sensor", sensor, "field", field, "err", err)
+	}
 
 	var notifier *notify.Notifier
 	if len(notifySpecs) > 0 {

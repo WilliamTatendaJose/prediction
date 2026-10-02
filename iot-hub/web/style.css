@@ -138,3 +138,16 @@ dialog select[multiple] { height: 90px; }
 .aform { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0; }
 .aform input { flex: 1 1 200px; }
 .aform .sub { flex-basis: 100%; color: var(--critical); }
+
+.oee-top { display: flex; gap: 16px; align-items: center; }
+.oee-top .value { font-size: 44px; }
+.oee-bars { display: grid; gap: 4px; margin-top: 8px; }
+.oee-row { display: grid; grid-template-columns: 90px 1fr 52px; gap: 8px; align-items: center; font-size: 12px; color: var(--ink-2); }
+.oee-row .meter { margin: 0; height: 8px; }
+.oee-row b { color: var(--ink); text-align: right; font-variant-numeric: tabular-nums; }
+.oee-hours { display: flex; align-items: flex-end; gap: 3px; flex: 1; min-height: 40px; margin-top: 10px; }
+.oee-col { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; min-width: 0; }
+.oee-col div { background: var(--s1); border-radius: 3px 3px 0 0; min-height: 2px; }
+.oee-col div.nodata { background: var(--grid); }
+.oee-col span { font-size: 9px; color: var(--muted); text-align: center; overflow: hidden; white-space: nowrap; }
+.oee-warn { color: var(--ink-2); margin-top: 4px; }

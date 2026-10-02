@@ -664,6 +664,78 @@ registerTile('anomalies', {
   },
 });
 
+// ---- oee: availability x performance x quality for a machine ------------
+const pct = (x) => (x == null ? '—' : `${Math.round(x * 1000) / 10}%`);
+const hm = (sec) => { const m = Math.round(sec / 60); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`; };
+registerTile('oee', {
+  label: 'OEE (machine efficiency)',
+  noField: true,
+  defaultSize: { w: 2, h: 2 },
+  options: [{ key: 'range', label: 'Period', type: 'select', choices: [['shift', 'Current shift'], ['today', 'Today'], ['-24h', 'Last 24 hours'], ['-7d', 'Last 7 days']] }],
+  create(el, cfg, ctx) {
+    const range = (cfg.options || {}).range || 'shift';
+    const h = el_('h2', null, cfg.title || `${ctx.sensor.name || ctx.sensor.id} · OEE`);
+    const top = el_('div', 'oee-top');
+    const big = el_('div', 'value');
+    const side = el_('div');
+    const st = statusEl();
+    const sub = el_('div', 'sub');
+    side.append(st, sub);
+    top.append(big, side);
+    const bars = el_('div', 'oee-bars');
+    const rows = {};
+    for (const [k, label, tip] of [['availability', 'Availability', 'run time ÷ planned time'], ['performance', 'Performance', 'actual vs ideal speed'], ['quality', 'Quality', 'good ÷ total parts']]) {
+      const row = el_('div', 'oee-row'); row.title = tip;
+      const name = el_('span', null, label);
+      const meter = el_('div', 'meter'); const fill = el_('div'); meter.append(fill);
+      const v = el_('b');
+      row.append(name, meter, v); bars.append(row);
+      rows[k] = { fill, v };
+    }
+    const hours = el_('div', 'oee-hours');
+    const warn = el_('div', 'sub oee-warn');
+    el.append(h, top, bars, hours, warn);
+    let d = null, err = '', timer, alive = true;
+    const load = async () => {
+      const bucket = range === 'shift' || range === 'today' ? '&bucket=1h' : range === '-7d' ? '&bucket=24h' : '&bucket=1h';
+      try { d = await ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/oee?from=${range}${bucket}`); err = ''; } catch (e) { d = null; err = e.message; }
+      if (!alive) return;
+      ctx.invalidate();
+      timer = setTimeout(load, 60e3);
+    };
+    load();
+    const hourFmt = new Intl.DateTimeFormat(undefined, range === '-7d' ? { weekday: 'short' } : { hour: '2-digit' });
+    return {
+      update() {},
+      render() {
+        if (!d) { big.textContent = '—'; sub.textContent = err; return; }
+        const r = d.result;
+        big.textContent = pct(r.oee);
+        // Common benchmarks: 85 % "world class", 60 % typical discrete manufacturing.
+        setStatus(st, r.oee == null ? null : r.oee >= 0.85 ? ['good', 'World class (≥ 85%)'] : r.oee >= 0.6 ? ['warning', 'Typical (60–85%)'] : ['critical', 'Below 60%']);
+        sub.textContent = `${d.range} · ${fmt(r.total)} parts (${fmt(r.reject)} rejected) · ran ${hm(r.runSec)} of ${hm(r.plannedSec)} planned`;
+        for (const k of ['availability', 'performance', 'quality']) {
+          const x = r[k];
+          rows[k].v.textContent = pct(x);
+          rows[k].fill.style.width = x == null ? '0' : `${Math.min(100, x * 100)}%`;
+          rows[k].fill.style.background = x == null ? '' : x >= 0.9 ? 'var(--s1)' : x >= 0.7 ? 'var(--warning)' : 'var(--critical)';
+        }
+        hours.replaceChildren();
+        for (const b of d.buckets || []) {
+          const col = el_('div', 'oee-col');
+          col.title = `${hourFmt.format(b.from)}: OEE ${pct(b.oee)} · A ${pct(b.availability)} P ${pct(b.performance)} Q ${pct(b.quality)}`;
+          const bar = el_('div'); bar.style.height = `${Math.max(2, Math.min(100, (b.oee || 0) * 100))}%`;
+          if (b.oee == null) bar.className = 'nodata';
+          col.append(bar, el_('span', null, hourFmt.format(b.from)));
+          hours.append(col);
+        }
+        warn.textContent = r.warnings.length ? '⚠ ' + r.warnings.join(' · ') : r.coverage < 1 ? `Data coverage ${pct(r.coverage)}` : '';
+      },
+      destroy() { alive = false; clearTimeout(timer); },
+    };
+  },
+});
+
 // ---- state: text / boolean with an "ok" value -----------------------------
 registerTile('state', {
   label: 'State (text / on-off)',

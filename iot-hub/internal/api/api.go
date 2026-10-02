@@ -67,6 +67,8 @@ type Server struct {
 	Connectors    func() []connect.Status // optional
 	Notifier      *notify.Notifier        // optional
 	Alarms        *alarm.Manager
+	Shifts        []string       // shift start times "06:00", for from=shift
+	Location      *time.Location // plant time zone (default local)
 	started       time.Time
 }
 
@@ -107,6 +109,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/shelves/{key}", s.require(auth.Operate, s.unshelve))
 	mux.HandleFunc("GET /api/audit", s.require(auth.Manage, s.auditLog))
 	mux.HandleFunc("GET /api/labels.csv", read(s.labels))
+	mux.HandleFunc("GET /api/sensors/{id}/oee", read(s.oeeHandler))
+	mux.HandleFunc("GET /api/oee", read(s.oeeOverview))
 	mux.HandleFunc("GET /api/notifications", s.require(auth.Manage, s.notifications))
 	mux.HandleFunc("POST /api/notifications/test", s.require(auth.Manage, s.testNotification))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
@@ -244,6 +248,9 @@ func (s *Server) putSensor(w http.ResponseWriter, r *http.Request) {
 	}
 	if b, err := json.Marshal(def.Fields); err == nil {
 		s.audit(r, "sensor.define", def.ID, string(b))
+	}
+	if s.Pipeline != nil && s.Pipeline.Calc != nil {
+		s.Pipeline.Calc.Forget(def.ID) // integrals restart from the stored total
 	}
 	v, _ := s.Store.Get(def.ID)
 	writeJSON(w, http.StatusOK, v)

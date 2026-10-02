@@ -60,6 +60,8 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-notify-cooldown` | `IOTHUB_NOTIFY_COOLDOWN` | `10m` | hold repeats for the same sensor/field/kind |
 | `-notify-per-minute` | `IOTHUB_NOTIFY_PER_MINUTE` | `20` | global cap |
 | `-public-url` | `IOTHUB_PUBLIC_URL` | — | dashboard link included in messages |
+| `-shifts` | `IOTHUB_SHIFTS` | `06:00,14:00,22:00` | shift start times for OEE `from=shift` (empty disables) |
+| `-tz` | `IOTHUB_TZ` | system | plant time zone, e.g. `Africa/Harare` |
 | `-connectors` | `IOTHUB_CONNECTORS` | — | Modbus / OPC UA connectors file (see PLCs and meters) |
 | `-token` | `IOTHUB_TOKEN` | — | admin token; setting it turns authentication on (see Security) |
 | `-auth-file` | `IOTHUB_AUTH_FILE` | `data/devices.json` | per-device credentials (hashes only, mode 0600) |
@@ -283,6 +285,68 @@ curl -X PUT localhost:8080/api/sensors/tank-1 -d '{
 | **5** | **300** | **2 (default)** | **0** | **0** |
 
 Real sensor noise is usually heavier-tailed than Gaussian. With `persist=1`, a 5 Hz sensor would raise about 30 false alerts an hour. The cost of `persist=2` is that a single-sample glitch goes unreported; set `persist: 1` on fields where those matter. Detector state is in memory, so after a restart each field re-learns for `warmup` samples, and episodes left open by the previous run are closed in the database.
+
+## Calculated fields
+
+A field can be calculated from the sensor's other fields, either as a formula or as an integral over time. Results are stored, charted, forecast and alarmed like measured fields. Devices can't write them directly; the calculated value wins.
+
+```bash
+curl -X PUT https://hub:8443/api/sensors/press-1-power -H "Authorization: Bearer $ADMIN" -d '{
+  "fields": {
+    "power_kw":   { "unit": "kW",  "calc": { "formula": "sqrt(3) * voltage * current * 0.85 / 1000" } },
+    "energy_kwh": { "unit": "kWh", "calc": { "integrate": "power_kw", "per": "1h" } } } }'
+```
+
+Formulas may use **measured** fields only, which keeps calculations free of chains and cycles. A formula over another calculated field, such as `energy_kwh * 0.11` for cost, is rejected. Integrals may use measured fields or formulas.
+
+**Formulas:**
+- **Operators:** `+ - * / % ^` and parentheses.
+- **Functions:** `abs sqrt min max round(x, digits) clamp(x, lo, hi) if(cond, a, b)`.
+- **Inputs:** booleans count as 1/0.
+- **Safety:** formulas are parsed by a small parser (no code is executed) and validated when the definition is saved.
+- **Bad results:** a missing input, division by zero or a non-finite result produces *no* value rather than a wrong one.
+- **When they run:** a formula recalculates only when one of its inputs arrives.
+
+**Integrals** use the trapezoid rule:
+- **Exact for linear changes,** e.g. 1 kW for 1 h gives exactly 1 kWh in testing.
+- **Gaps:** a gap longer than `maxGap` (default 5 m) adds nothing, rather than assuming the last value held.
+- **Restarts:** the total continues across restarts from the stored value.
+
+Field names used in formulas can contain letters, digits, `_` and `.` (a `-` would read as minus).
+
+## OEE (machine efficiency)
+
+Overall Equipment Effectiveness = **availability × performance × quality**. Add an `oee` block to a machine's sensor:
+
+```bash
+curl -X PUT https://hub:8443/api/sensors/press-1 -H "Authorization: Bearer $ADMIN" -d '{
+  "fields": { "running": {}, "cycles": {}, "rejects": {}, "break": {} },
+  "oee": { "running": "running", "total": "cycles", "reject": "rejects",
+           "plannedStop": "break", "idealCycleSec": 28 } }'
+curl 'https://hub:8443/api/sensors/press-1/oee?from=shift&bucket=1h'   # also from=today, -24h, -7d, or ms/RFC 3339
+curl 'https://hub:8443/api/oee?from=shift'                             # every machine, worst first
+```
+
+| Part | Formula | Tag |
+|---|---|---|
+| Availability | run time ÷ planned time | `running` (bool); optional `plannedStop` (bool) removes breaks and changeovers from planned time |
+| Performance | ideal cycle × parts ÷ run time | `total` counter + `idealCycleSec` |
+| Quality | good ÷ parts | `good` **or** `reject` counter (without either, Q is assumed 100 % and the result says so) |
+
+**Rules**, chosen to be explainable on the shop floor:
+- **State tags** hold their value until the next sample, for at most `maxHold` (default 5 m). Longer gaps are **no data**: excluded from planned time and reported as `coverage`, rather than guessed as running or stopped.
+- **Counters** count positive steps from the last value *before* the window; a counter's first-ever value is a baseline, not production. A drop is a counter reset (PLC restart), so the new value counts from zero and the result is never negative.
+- **Windows** are half-open `[from, to)` for both time and counts, so a part counted exactly at a shift change belongs to the new shift.
+- **Warnings** appear in the result and the tile: performance over 105 % (the ideal cycle time is probably wrong), coverage under 90 %, and a machine that ran without counting.
+
+**Dashboard:**
+- **`oee` tile:** OEE with the 85 % / 60 % benchmarks (labelled, not colour alone), A/P/Q bars, parts and run time, hourly bars for the shift, and any warnings.
+- **Shifts** come from `-shifts`, in the plant time zone `-tz`.
+
+**Tested:**
+- **Unit test:** a synthetic 8 h shift with a counter reset, a planned break and an unplanned stop reproduces the exact answer (A 0.8, P 0.9, Q 616/648, OEE 0.6844).
+- **API test:** the same through the API gives OEE 0.6.
+- **Demo:** a seeded live shift matched a hand calculation of planned time, run time and availability to the second.
 
 ## Forecasting
 

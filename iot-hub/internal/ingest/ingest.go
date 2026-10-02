@@ -11,6 +11,7 @@ import (
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/alarm"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
@@ -26,6 +27,8 @@ type Pipeline struct {
 	OnEvent func(anomaly.Event)
 	// Alarms marks episodes as shelved/acknowledged before they go out.
 	Alarms *alarm.Manager
+	// Calc computes calculated fields (formulas, integrals) per reading.
+	Calc *calc.Engine
 }
 
 // Handle accepts either a JSON object of fields ({"temp":21.5,"door":"open"})
@@ -44,6 +47,23 @@ func (p *Pipeline) Handle(sensor, field string, payload []byte) (store.Reading, 
 // HandleValues ingests already-decoded values (used by PLC connectors).
 // ts <= 0 means now.
 func (p *Pipeline) HandleValues(sensor string, ts int64, values map[string]any) (store.Reading, error) {
+	if ts <= 0 {
+		ts = time.Now().UnixMilli()
+	}
+	if p.Calc != nil {
+		if specs, last := p.Store.CalcState(sensor); specs != nil {
+			in := make(map[string]any, len(values)+len(specs))
+			for k, v := range values {
+				if specs[k] == nil { // calculated fields cannot be written directly
+					in[k] = v
+				}
+			}
+			for k, v := range p.Calc.Apply(sensor, ts, in, last, specs) {
+				in[k] = v
+			}
+			values = in
+		}
+	}
 	r, err := p.Store.Ingest(sensor, ts, values)
 	if err != nil {
 		return r, err

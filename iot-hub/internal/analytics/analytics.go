@@ -28,6 +28,28 @@ func (s *Service) decorate(evs []anomaly.Event) []anomaly.Event {
 	return evs
 }
 
+// Raw returns samples in [from, to) plus the last one before from.
+func (s *Service) Raw(ctx context.Context, sensor, field string, from, to int64, limit int) ([]int64, []float64, error) {
+	if s.DB != nil {
+		return s.DB.Raw(ctx, sensor, field, from, to, limit)
+	}
+	ts, vs, err := s.Store.History(sensor, field, 0, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	var ots []int64
+	var ovs []float64
+	for i, t := range ts {
+		switch {
+		case t < from:
+			ots, ovs = append(ots[:0], t), append(ovs[:0], float64(vs[i])) // keep only the latest before
+		case t < to && len(ots) < limit:
+			ots, ovs = append(ots, t), append(ovs, float64(vs[i]))
+		}
+	}
+	return ots, ovs, nil
+}
+
 // Event finds one episode: open/recent ones from the detector (authoritative
 // for what is open), older ones from the database.
 func (s *Service) Event(ctx context.Context, id string) (anomaly.Event, bool, error) {

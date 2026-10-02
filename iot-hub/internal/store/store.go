@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/calc"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/oee"
 )
 
 var (
@@ -39,6 +41,8 @@ type Field struct {
 	// Type is learnt from the first value: number | bool | text. The
 	// database stores booleans as 0/1, so restore needs it to give them back.
 	Type string `json:"type,omitempty"`
+	// Calc makes this a calculated field (formula or integral).
+	Calc *calc.Spec `json:"calc,omitempty"`
 }
 
 func kindOf(v any) string {
@@ -57,6 +61,8 @@ type Sensor struct {
 	Kind     string           `json:"kind,omitempty"`
 	Location string           `json:"location,omitempty"`
 	Fields   map[string]Field `json:"fields"`
+	// OEE makes this sensor a machine with efficiency tracking.
+	OEE *oee.Config `json:"oee,omitempty"`
 }
 
 // SensorView is a definition plus its latest state.
@@ -179,9 +185,26 @@ func (s *Store) Upsert(def Sensor) error {
 	if len(def.Fields) > s.opts.MaxFields {
 		return fmt.Errorf("%w: max %d fields", ErrLimit, s.opts.MaxFields)
 	}
-	for k := range def.Fields {
+	specs := map[string]*calc.Spec{}
+	for k, f := range def.Fields {
 		if !ValidID(k) {
 			return fmt.Errorf("%w: field %q", ErrInvalid, k)
+		}
+		if f.Calc != nil {
+			specs[k] = f.Calc
+		}
+	}
+	if err := calc.Validate(specs); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if def.OEE != nil {
+		if err := def.OEE.Validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+		for _, f := range def.OEE.Fields() {
+			if !ValidID(f) {
+				return fmt.Errorf("%w: oee field %q", ErrInvalid, f)
+			}
 		}
 	}
 	s.mu.Lock()
@@ -366,6 +389,34 @@ func (s *Store) Restore(sensor, field string, ts []int64, vals []float64, text s
 		e.seen = lastTS
 	}
 	return true
+}
+
+// CalcState returns a sensor's calculated-field specs and a copy of its
+// latest values; nil specs when it has none (the common, cheap case).
+func (s *Store) CalcState(sensor string) (map[string]*calc.Spec, map[string]any) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.sensors[sensor]
+	if !ok {
+		return nil, nil
+	}
+	var specs map[string]*calc.Spec
+	for k, f := range e.def.Fields {
+		if f.Calc != nil {
+			if specs == nil {
+				specs = map[string]*calc.Spec{}
+			}
+			specs[k] = f.Calc
+		}
+	}
+	if specs == nil {
+		return nil, nil
+	}
+	last := make(map[string]any, len(e.last))
+	for k, v := range e.last {
+		last[k] = v
+	}
+	return specs, last
 }
 
 // Rule returns the anomaly rule for a field (zero value if none).

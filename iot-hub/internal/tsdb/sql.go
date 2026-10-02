@@ -415,6 +415,35 @@ func (s *sqlDB) Event(ctx context.Context, id string) (anomaly.Event, bool, erro
 	return e, err == nil, err
 }
 
+func (s *sqlDB) Raw(ctx context.Context, sensor, field string, from, to int64, limit int) ([]int64, []float64, error) {
+	id, err := s.lookupID(ctx, s.db, sensor, field)
+	if err != nil || id == 0 {
+		return nil, nil, err
+	}
+	var ts []int64
+	var vs []float64
+	var t int64
+	var v float64
+	err = s.db.QueryRowContext(ctx, s.q(`SELECT ts, value FROM readings WHERE series = ? AND ts < ? AND value IS NOT NULL ORDER BY ts DESC LIMIT 1`), id, from).Scan(&t, &v)
+	if err == nil {
+		ts, vs = append(ts, t), append(vs, v)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, s.q(`SELECT ts, value FROM readings WHERE series = ? AND ts >= ? AND ts < ? AND value IS NOT NULL ORDER BY ts LIMIT ?`), id, from, to, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := rows.Scan(&t, &v); err != nil {
+			return nil, nil, err
+		}
+		ts, vs = append(ts, t), append(vs, v)
+	}
+	return ts, vs, rows.Err()
+}
+
 func (s *sqlDB) Prune(ctx context.Context, rawBefore, rollupBefore, eventsBefore int64) error {
 	ids := []int64{}
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM series`)
