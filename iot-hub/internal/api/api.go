@@ -42,6 +42,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/twin"
 )
 
 const (
@@ -83,6 +84,7 @@ type Server struct {
 	Escalations func() any
 	Jobs        JobsStore
 	Forward     func() any // edge store-and-forward status (optional)
+	Twins       *twin.Service
 
 	liveMu  sync.RWMutex // guards Notifier, Reporter, Shifts, Location after start
 	batches batches      // recent batch ids (idempotent retries)
@@ -143,6 +145,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/targets/{target}/test", s.require(auth.Manage, s.testTarget))
 	mux.HandleFunc("POST /api/calc/test", read(s.calcTest))
 	mux.HandleFunc("GET /api/forward", s.require(auth.Manage, s.forwardStatus))
+	mux.HandleFunc("GET /api/twins", s.requireAny(s.listTwins)) // filtered to what the caller may control
+	mux.HandleFunc("PATCH /api/twins", s.require(auth.Manage, s.patchTwins))
+	mux.HandleFunc("GET /api/twins/{id}", s.require(auth.Control, s.getTwin))
+	mux.HandleFunc("PATCH /api/twins/{id}", s.require(auth.Control, s.patchTwin))
+	mux.HandleFunc("POST /api/devices/{id}/methods/{method}", s.require(auth.Control, s.invokeMethod))
+	mux.HandleFunc("POST /api/devices/{id}/messages", s.require(auth.Control, s.sendMessage))
+	mux.HandleFunc("GET /api/devices/{id}/messages", s.require(auth.Control, s.listMessages))
+	mux.HandleFunc("GET /api/device/twin", s.requireAny(s.deviceTwin))
+	mux.HandleFunc("PATCH /api/device/twin/reported", s.requireAny(s.deviceReport))
+	mux.HandleFunc("GET /api/device/messages", s.requireAny(s.deviceReceive))
+	mux.HandleFunc("POST /api/device/messages/{mid}/{action}", s.requireAny(s.deviceSettle))
 	mux.HandleFunc("GET /api/jobs", read(s.listJobs))
 	mux.HandleFunc("POST /api/jobs/test", s.require(auth.Manage, s.testJob))
 	mux.HandleFunc("PUT /api/jobs/{job}", s.require(auth.Manage, s.putJob))

@@ -207,6 +207,14 @@ func main() {
 				mq.KickTenant(t, id)
 			}
 		},
+		DeviceListening: func(t, id, sub string) bool { return mq != nil && mq.DeviceListening(t, id, sub) },
+		DeviceConnected: func(t, id string) bool { return mq != nil && mq.DeviceConnected(t, id) },
+		SendToDevice: func(t, id, sub string, p []byte) int {
+			if mq == nil {
+				return 0
+			}
+			return mq.SendToDevice(t, id, sub, p)
+		},
 	}
 	base := tenant.Options{
 		Capacity: *capacity, MaxSensors: *maxSensors, MaxFields: *maxFields, AutoRegister: *autoReg,
@@ -222,6 +230,7 @@ func main() {
 
 	var handler http.Handler
 	var resolver broker.Resolver
+	var twins func(string) broker.DeviceHandler
 	var pipe *ingest.Pipeline
 	var closeTenants func()
 	brokerAuth := creds
@@ -252,6 +261,12 @@ func main() {
 		gw := &gateway.Gateway{Platform: plat, Creds: creds.Platform(), Static: static,
 			SecureCookies: tlsCfg != nil, TLS: tlsCfg != nil, Logger: log}
 		handler, resolver, closeTenants = gw.Handler(), platformResolver{plat}, plat.Close
+		twins = func(t string) broker.DeviceHandler {
+			if rt, err := plat.Runtime(t); err == nil && rt != nil {
+				return rt.Twins
+			}
+			return nil
+		}
 		brokerAuth = creds.Platform()
 		log.Info("multi-tenant", "tenants", len(plat.List()), "dir", plat.Dir)
 	} else {
@@ -262,6 +277,7 @@ func main() {
 		// the API, settings.json is the source and these flags are ignored.
 		o.SettingsPath = filepath.Join(filepath.Dir(*dataPath), "settings.json")
 		o.JobsPath = filepath.Join(filepath.Dir(*dataPath), "jobs.json")
+		o.TwinsPath = filepath.Join(filepath.Dir(*dataPath), "twins.json")
 		seed := &o.Seed
 		seed.WebhookSecret = *notifySecret
 		seed.Notify = tenant.NotifyCfg{Resolved: *notifyResolved, CooldownMin: int(notifyCooldown.Minutes()), PerMinute: *notifyRate}
@@ -318,6 +334,7 @@ func main() {
 			log.Info("backups", "dir", *backupDir, "every", *backupEvery, "keep", *backupKeep)
 		}
 		handler, pipe, closeTenants = rt.Handler, rt.Pipe, rt.Close
+		twins = func(string) broker.DeviceHandler { return rt.Twins }
 		if fwd != nil {
 			fctx, fstop := context.WithCancel(context.Background())
 			go fwd.Run(fctx)
@@ -336,7 +353,7 @@ func main() {
 		var err error
 		mq, err = broker.New(broker.Config{
 			TCPAddr: *mqttAddr, WSAddr: *mqttWS, TLSAddr: mqttsAddr, TLS: tlsCfg, Prefix: *prefix, Auth: brokerAuth,
-			Tenants: resolver, Logger: log.With("component", "mqtt"),
+			Tenants: resolver, Twins: twins, Logger: log.With("component", "mqtt"),
 		}, pipe)
 		if err != nil {
 			fatal(log, "mqtt", err)

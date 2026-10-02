@@ -35,6 +35,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/tsdb"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/twin"
 )
 
 // Hooks connect a runtime to shared transports (set by the platform).
@@ -42,6 +43,10 @@ type Hooks struct {
 	Publish      func(tenant string, r store.Reading) // republish to MQTT
 	PublishEvent func(tenant string, e anomaly.Event) // anomaly to MQTT
 	Kick         func(tenant, id string)              // drop MQTT sessions
+	// Device transport for twins, methods and messages.
+	DeviceListening func(tenant, id, sub string) bool
+	DeviceConnected func(tenant, id string) bool
+	SendToDevice    func(tenant, id, sub string, payload []byte) int
 }
 
 // Options configure a runtime. The platform fills them from flags and the
@@ -62,6 +67,7 @@ type Options struct {
 	Seed         Settings
 	SettingsPath string
 	JobsPath     string
+	TwinsPath    string
 	MaxJobs      func() int
 	PublicURL    string
 
@@ -99,6 +105,7 @@ type Runtime struct {
 	API       *api.Server
 	Escalate  *escalate.Engine
 	Jobs      *jobs.Engine
+	Twins     *twin.Service
 	Limiter   *Limiter
 	Handler   http.Handler
 
@@ -289,6 +296,21 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 		r.Pipe.Observe = func(rd store.Reading) { r.Jobs.Observe(rd); fw(rd) }
 	}
 	r.API.Forward = o.ForwardStatus
+
+	// Device twins, direct methods and cloud-to-device messages.
+	r.Twins = twin.New(o.TwinsPath, o.Creds.Exists)
+	if err := r.Twins.Load(); err != nil {
+		return fail(err)
+	}
+	if h.SendToDevice != nil {
+		r.Twins.SetTransport(twin.Transport{
+			Listening: func(dev, sub string) bool { return h.DeviceListening(id, dev, sub) },
+			Connected: func(dev string) bool { return h.DeviceConnected(id, dev) },
+			Send:      func(dev, sub string, p []byte) int { return h.SendToDevice(id, dev, sub, p) },
+		})
+	}
+	r.API.Twins = r.Twins
+	r.goRun(func() { r.Twins.Run(ctx, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) }) })
 	r.goRun(func() { r.Jobs.Run(ctx) })
 	r.goRun(func() { r.sendHooks(ctx, hooks) })
 	if o.BackupDir != "" {

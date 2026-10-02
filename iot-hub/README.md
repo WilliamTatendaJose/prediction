@@ -921,6 +921,94 @@ registerTile('big-number', {
 
 Option types are `number`, `text` and `select` (`choices: [[value, label]]`). `sensorOptional: true` lets a tile watch all sensors, and `noField: true` hides the field picker.
 
+## Device twins, direct methods and cloud-to-device messages
+
+The three Azure IoT Hub ways of talking back to devices, for every `device` or `service` identity:
+
+| | What | When the device is offline |
+|---|---|---|
+| **Twin** | `tags` (cloud-only, for grouping and queries), **desired** properties (cloud → device configuration), **reported** properties (device → cloud state). JSON merge patches (`null` deletes); `$version` on desired and reported | kept; the device reads its twin when it reconnects |
+| **Direct method** | a call with a JSON payload that the device answers (status + JSON) within a timeout (default 30 s, max 5 min) | fails at once with 404, so the caller knows |
+| **Cloud-to-device message** | a queued JSON message with a TTL (default 1 h, max 48 h), up to 50 per device | queued; delivered when it listens, redelivered until completed, dead-lettered after 10 deliveries |
+
+```bash
+A="Authorization: Bearer $ADMIN"
+curl -X PATCH https://hub:8443/api/twins/pump-1 -H "$A" -H 'If-Match: "3"' \
+     -d '{"tags":{"site":"plant1"},"properties":{"desired":{"interval":15,"mode":null}}}'
+curl 'https://hub:8443/api/twins?where=tags.site=plant1&where=properties.reported.firmware=1.0.0' -H "$A"
+curl -X PATCH 'https://hub:8443/api/twins?where=tags.site=plant1' -H "$A" -d '{"properties":{"desired":{"interval":30}}}'  # many at once
+curl -X POST 'https://hub:8443/api/devices/pump-1/methods/reboot?timeout=30s' -H "$A" -d '{"delay":5}'
+#   → {"status":200,"payload":{…the device's answer…}}
+curl -X POST 'https://hub:8443/api/devices/pump-1/messages?ttl=1h' -H "$A" -d '{"cmd":"close-valve"}'
+curl https://hub:8443/api/devices/pump-1/messages -H "$A"            # queued / delivered / completed / expired / deadlettered
+```
+
+**On the device, over MQTT.** Topics are under `devices/{id}/`, or `{tenant}/devices/{id}/` in multi-tenant mode. Subscribe to `devices/{id}/#`.
+
+| Direction | Topic | Payload |
+|---|---|---|
+| hub → device | `twin/desired` | the desired patch, with `$version` |
+| device → hub | `twin/get/{rid}` | — ; answer on `twin/res/200/{rid}`: `{desired, reported}` |
+| device → hub | `twin/reported/{rid}` | a reported patch; answer on `twin/res/204/{rid}` `{"version":n}` (or `400`) |
+| hub → device | `methods/{name}/{rid}` | the request payload |
+| device → hub | `methods/res/{status}/{rid}` | the answer (JSON) |
+| hub → device | `messages/{mid}` | the message body |
+| device → hub | `messages/complete/{mid}` (or `reject`, `abandon`) | — |
+
+**On the device, over HTTP** (no MQTT), with its token or SAS:
+- `GET /api/device/twin` and `PATCH /api/device/twin/reported`;
+- `GET /api/device/messages` returns the next message (204 if none) and locks it for a minute;
+- `POST /api/device/messages/{mid}/complete` (or `reject`, `abandon`).
+
+`go run ./cmd/devicesim -cs "<connection string>"` is a sample device and a reference for firmware. It applies desired properties and reports them back, answers `ping` and `reboot`, and completes every message.
+
+**Who may do what:**
+
+| Action | Allowed |
+|---|---|
+| Read and write twins, invoke methods, send messages | admins; `service` identities for devices whose id matches their patterns |
+| Bulk twin updates | admins |
+| Write desired properties | not the device itself |
+| Everyone else | viewers and operators have no access to twins |
+
+The settings page has a **Twin** button per device: tags and desired editors (saved with an etag check, so a concurrent change isn't overwritten), reported properties, method invocation and messages.
+
+**Confidentiality.** Device topics are **never routed** through the broker:
+- **Device to hub:** what a device publishes on them is processed by the hub and then dropped.
+- **Hub to device:** the hub writes straight to that device's own subscribed sessions.
+- **Wildcards see nothing.** A viewer subscribed to `#` (or `acme/#`) receives nothing from device topics; mochi also re-checks the ACL on each delivery.
+- **Own topics only.** A device may subscribe only under its own `devices/{id}/` and publish only the topics above. No identity can publish into another device's topics, not even an admin, so nobody can impersonate the hub over MQTT.
+
+**Limits** (as in Azure):
+- **Twin size:** desired and reported 32 KiB each, tags 8 KiB, nesting 5 levels;
+- **Property names:** letters, digits, `_` and `-` (`$` is reserved);
+- **Payloads:** method payloads 128 KiB, message bodies 64 KiB.
+
+**Storage.** Twins and queues are saved per tenant in `twins.json` (0600), at most once a second. Deleting a device deletes its twin and queue.
+
+**Tested:**
+- **Service unit tests:**
+  - merge patches with deletes and nested merges, versions, etags (a stale `If-Match` gets 412), and the device view without tags;
+  - six kinds of invalid patch, queries and bulk updates;
+  - methods: answers, a non-JSON answer, timeout, an offline device, and an answer from the wrong device ignored;
+  - messages: offline queueing, in-order delivery, lock expiry and redelivery, TTL expiry, dead-lettering after 10, HTTP receive and settle, the queue limit, and reload (a delivery lock doesn't survive a restart).
+- **End to end through the gateway with MQTT clients:**
+  - desired pushed with `$version`, reported acknowledged, twin get, connection state, a query;
+  - a method answered while another device's forged answer is refused;
+  - a method to an offline device gets 404;
+  - a message sent while the device was offline is delivered on subscribe and completed;
+  - **no eavesdropping:** a viewer on `acme/#` and another device saw nothing, and an admin's MQTT publish into a device topic never reached it;
+  - another tenant gets 404, a viewer gets 403, a device writing its own desired gets 403;
+  - the HTTP device side works, and deleting a device deletes its twin.
+- **Mutation check:** both the "never routed" rule and the device-topic ACL are caught by the test when removed.
+- **Single-tenant mode:** unprefixed topics, and twins survive a restart.
+- **In the browser,** with `devicesim` connected by its connection string:
+  - tags and desired saved;
+  - the device applied and reported them back;
+  - a key removed in the editor reached the device as `null`;
+  - `ping` answered 200 and an unknown method 404 (from the device);
+  - a message was completed.
+
 ## Store-and-forward (edge to cloud)
 
 An **edge hub** at a plant runs single-tenant mode next to the PLCs and keeps working when the internet doesn't. With `-forward` it also sends every reading to its tenant on a **cloud hub** (multi-tenant mode), much as Azure IoT Edge forwards to IoT Hub. Readings queue on disk while the link is down and go up in order when it's back.
@@ -1032,7 +1120,8 @@ Without the database (`-db ""`): 20 MB RSS and 2.2% CPU at the same 1,000 msgs/s
 - **No per-IP rate limiting or lockout.** Tokens are 256-bit, so guessing is not feasible, but noisy scanners are not throttled. Put the hub behind a firewall or reverse proxy if it faces the internet.
 - **Device credentials are tokens or keys (SAS), not client certificates.** Mutual TLS (Azure's X.509 option) would bind identity to hardware keys; the listener supports it, but it isn't wired up.
 - **Multi-tenant mode runs on one node.** Every tenant's runtime lives in one process; the limit is memory (each tenant's live buffers) and one machine's CPU. Sharding tenants across nodes (by tenant id at a load balancer) is the next step if it outgrows that.
-- **No device twins or cloud-to-device commands.** Azure's desired/reported properties and direct methods aren't implemented; the hub is telemetry-in only.
+- **Twins have no change history or scheduled jobs.** Bulk updates apply at once; there is no Azure-style job scheduler or per-device result tracking for them.
+- **Direct methods need MQTT.** HTTP devices get twins and messages (by polling) but can't take synchronous method calls.
 - **Grafana and multi-tenant PostgreSQL.** Each tenant has its own schema (`t_{id}`); the provisioned Grafana datasource reads the public schema only, so per-tenant dashboards need a datasource per schema.
 - **Stream jobs are one step.** A job can't read another job's output (no chains), and there are no joins between streams.
 - **Anomalies are statistical, not semantic.** The detector knows "unusual for this field", not "bad for this machine". Use `range` rules for known limits, and models (see ML.NET integration) for multi-field judgements.

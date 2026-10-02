@@ -76,6 +76,7 @@ const (
 	Manage                  // dashboard layout, devices, settings, jobs
 	Operate                 // acknowledge/shelve alarms, notes
 	Platform                // tenants, quotas: superadmin only
+	Control                 // device twins (desired), direct methods, cloud-to-device messages
 )
 
 // DefaultTenant is the only tenant in single-tenant mode.
@@ -117,7 +118,7 @@ func (i *Identity) Can(a Action, sensor string) bool {
 		switch a {
 		case Read, Subscribe:
 			return true
-		case Ingest, Define:
+		case Ingest, Define, Control: // Control: on devices whose id matches
 			return i.matches(sensor)
 		}
 	case Device:
@@ -823,6 +824,14 @@ func (s *Store) List() []DeviceInfo {
 			Expires: r.Expires, Token: r.Hash != "", Keys: r.Keys != nil}
 	}
 	return out
+}
+
+// Exists reports whether an identity exists in this tenant.
+func (s *Store) Exists(id string) bool {
+	s.c.mu.RLock()
+	defer s.c.mu.RUnlock()
+	_, ok := s.c.byKey[s.tenant+"\x00"+id]
+	return ok
 }
 
 // Count is the number of identities in this view.

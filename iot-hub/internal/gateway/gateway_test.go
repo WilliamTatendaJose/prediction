@@ -67,9 +67,12 @@ func start(t *testing.T, dbURL string) saas {
 		Base: tenant.Options{Capacity: 256, MaxSensors: 100, MaxFields: 16, AutoRegister: true, Anomaly: true,
 			AnomalyCf: anomaly.Config{Warmup: 20, Persist: 1},
 			Hooks: tenant.Hooks{
-				Publish:      func(tn string, r store.Reading) { mq.RepublishTo(tn, r) },
-				PublishEvent: func(tn string, e anomaly.Event) { mq.PublishEventTo(tn, e) },
-				Kick:         func(tn, id string) { mq.KickTenant(tn, id) },
+				Publish:         func(tn string, r store.Reading) { mq.RepublishTo(tn, r) },
+				PublishEvent:    func(tn string, e anomaly.Event) { mq.PublishEventTo(tn, e) },
+				Kick:            func(tn, id string) { mq.KickTenant(tn, id) },
+				DeviceListening: func(tn, id, sub string) bool { return mq.DeviceListening(tn, id, sub) },
+				DeviceConnected: func(tn, id string) bool { return mq.DeviceConnected(tn, id) },
+				SendToDevice:    func(tn, id, sub string, p []byte) int { return mq.SendToDevice(tn, id, sub, p) },
 			}},
 		OnStop: func(id string) { mq.KickTenant(id, "") },
 	}
@@ -79,7 +82,13 @@ func start(t *testing.T, dbURL string) saas {
 	}
 	addr := freeAddr(t)
 	var err error
-	mq, err = broker.New(broker.Config{TCPAddr: addr, Auth: creds.Platform(), Tenants: resolver{plat}}, nil)
+	twins := func(tn string) broker.DeviceHandler {
+		if rt, err := plat.Runtime(tn); err == nil && rt != nil {
+			return rt.Twins
+		}
+		return nil
+	}
+	mq, err = broker.New(broker.Config{TCPAddr: addr, Auth: creds.Platform(), Tenants: resolver{plat}, Twins: twins}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,7 +29,7 @@ let me = {};
 let tenant = null;
 
 async function api(path, opts = {}) {
-  const headers = { 'X-Requested-With': 'iothub', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) };
+  const headers = { 'X-Requested-With': 'iothub', ...(opts.body ? { 'Content-Type': 'application/json' } : {}), ...(opts.headers || {}) };
   if (tenant && !path.startsWith('/api/admin/')) headers['X-Tenant'] = tenant;
   const res = await fetch(path, { ...opts, headers, credentials: 'same-origin' });
   if (res.status === 401) { location.href = './'; throw new Error('sign in on the dashboard first'); }
@@ -233,6 +233,7 @@ async function devicesTab() {
         d.disabled ? h('span', { class: 'pill bad', text: 'disabled' }) : null),
       h('td', { text: d.expires ? when(d.expires) : '' }),
       h('td', {}, h('div', { class: 'row' },
+        (d.role === 'device' || d.role === 'service') && h('button', { class: 'small', onclick: () => twinPanel(d.id).catch(fail) }, 'Twin'),
         d.keys && act('Keys', async () => showSecrets('Keys for ' + d.id, await api(p + '/keys'))),
         d.keys && act('SAS 24h', async () => showSecrets('SAS token for ' + d.id + ' (24 h)', await post(p + '/sas', { ttl: '24h' }))),
         act(d.keys ? 'Rotate primary' : 'Add keys', async () => {
@@ -282,6 +283,86 @@ async function devicesTab() {
       h('p', { class: 'hint', text: 'Devices and services need sensor patterns; they can only touch those sensors.' }),
       err, h('button', { class: 'primary', onclick: create }, 'Create')),
   ].filter(Boolean));
+}
+
+// ---- device twin, direct methods, cloud-to-device messages -------------------
+const pretty = (o) => JSON.stringify(o, null, 2);
+const strip = (o) => Object.fromEntries(Object.entries(o || {}).filter(([k]) => !k.startsWith('$')));
+
+async function twinPanel(id) {
+  const p = '/api/twins/' + enc(id);
+  const tw = await api(p);
+  const tags = h('textarea', { 'aria-label': 'Tags (JSON)', spellcheck: 'false' });
+  const desired = h('textarea', { 'aria-label': 'Desired properties (JSON)', spellcheck: 'false' });
+  tags.value = pretty(tw.tags || {});
+  desired.value = pretty(strip(tw.properties.desired));
+  const err = h('p', { class: 'err', role: 'alert' });
+  const save = async () => {
+    err.textContent = '';
+    let t, d;
+    try { t = JSON.parse(tags.value || '{}'); d = JSON.parse(desired.value || '{}'); } catch (e) { err.textContent = 'Not valid JSON: ' + e.message; return; }
+    // A merge patch: keys removed in the editor become null (deleted).
+    const del = (before, after) => Object.fromEntries(Object.keys(before).filter((k) => !(k in after)).map((k) => [k, null]));
+    const body = { tags: { ...del(tw.tags || {}, t), ...t }, properties: { desired: { ...del(strip(tw.properties.desired), d), ...d } } };
+    try {
+      await api(p, { method: 'PATCH', body: JSON.stringify(body), headers: { 'If-Match': tw.etag } });
+      toast('Twin saved; desired changes sent to ' + id);
+      twinPanel(id);
+    } catch (e) { err.textContent = e.message + (e.message.includes('etag') ? ' — reopen to see the latest.' : ''); }
+  };
+
+  const mname = h('input', { placeholder: 'reboot', 'aria-label': 'Method name' });
+  const mpay = h('input', { placeholder: '{"delay": 5}', 'aria-label': 'Method payload (JSON)', class: 'wide' });
+  const mto = h('select', { 'aria-label': 'Timeout' }, ...['10s', '30s', '60s', '300s'].map((x) => opt(x, 'wait ' + x, x === '30s')));
+  const mout = h('pre', { class: 'hint' });
+  const invoke = async () => {
+    if (!mname.value.trim()) { mout.textContent = 'Enter a method name.'; return; }
+    mout.textContent = 'Calling…';
+    try {
+      const r = await post(`/api/devices/${enc(id)}/methods/${enc(mname.value.trim())}?timeout=${mto.value}`, mpay.value.trim() ? JSON.parse(mpay.value) : null);
+      mout.textContent = `status ${r.status}\n` + pretty(r.payload);
+    } catch (e) { mout.textContent = e.message; }
+  };
+
+  const body = h('input', { placeholder: '{"cmd": "close-valve"}', 'aria-label': 'Message body', class: 'wide' });
+  const ttl = h('select', { 'aria-label': 'Time to live' }, ...['10m', '1h', '24h', '48h'].map((x) => opt(x, 'keep ' + x, x === '1h')));
+  const msgs = h('tbody');
+  const loadMsgs = async () => {
+    const list = await api(`/api/devices/${enc(id)}/messages`);
+    msgs.replaceChildren(...list.slice(0, 20).map((m) => h('tr', {},
+      h('td', { text: when(m.created) }), h('td', { text: JSON.stringify(m.body) }),
+      h('td', {}, h('span', { class: 'pill ' + ({ completed: 'on', deadlettered: 'bad', rejected: 'bad', expired: 'bad' }[m.status] || ''), text: m.status })),
+      h('td', { class: 'n', text: m.deliveries }), h('td', { text: when(m.expires) }))));
+  };
+  const send = async () => {
+    let b = body.value.trim();
+    try { JSON.parse(b); } catch { b = JSON.stringify(b); } // plain text is sent as a JSON string
+    try { await api(`/api/devices/${enc(id)}/messages?ttl=${ttl.value}`, { method: 'POST', body: b }); toast('Queued for ' + id); loadMsgs(); } catch (e) { fail(e); }
+  };
+
+  view.replaceChildren(
+    h('section', { class: 'card' },
+      h('h2', { text: 'Device twin: ' + id }),
+      h('p', { class: 'sub' }, h('span', { class: 'pill ' + (tw.connectionState === 'Connected' ? 'on' : ''), text: tw.connectionState }),
+        ` version ${tw.version} · desired v${tw.properties.desired.$version} · reported v${tw.properties.reported.$version} · last activity ${when(tw.lastActivityTime)}`),
+      h('div', { class: 'grid2' },
+        h('div', {}, h('h3', { text: 'Tags (cloud only: grouping and queries)' }), tags),
+        h('div', {}, h('h3', { text: 'Desired properties (sent to the device)' }), desired)),
+      h('h3', { text: 'Reported by the device' }), h('pre', { class: 'hint', text: pretty(strip(tw.properties.reported)) }),
+      err,
+      h('div', { class: 'row' }, h('button', { class: 'primary', onclick: save }, 'Save twin'), h('button', { onclick: devicesTab }, 'Back to devices'))),
+    h('section', { class: 'card' },
+      h('h2', { text: 'Direct method' }),
+      h('p', { class: 'sub', text: 'A call the device answers now. It must be connected and subscribed to devices/' + id + '/methods/#.' }),
+      h('div', { class: 'row' }, field('Method', mname), field('Payload', mpay), field('Timeout', mto), h('button', { onclick: invoke }, 'Invoke')),
+      mout),
+    h('section', { class: 'card' },
+      h('h2', { text: 'Cloud-to-device messages' }),
+      h('p', { class: 'sub', text: 'Queued until the device listens (MQTT devices/' + id + '/messages/#, or HTTP polling), redelivered until it completes them.' }),
+      h('div', { class: 'row' }, field('Body', body), field('Keep', ttl), h('button', { onclick: send }, 'Send')),
+      h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' },
+        h('thead', {}, h('tr', {}, ...['Sent', 'Body', 'Status', 'Deliveries', 'Expires'].map((t) => h('th', { text: t })))), msgs))));
+  loadMsgs().catch(fail);
 }
 
 // ---- alerts & reports -------------------------------------------------------

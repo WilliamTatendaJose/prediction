@@ -113,6 +113,7 @@ func (p *Platform) start(in Info) error {
 	o.ConfigPath = filepath.Join(p.dir(in.ID), "config.json")
 	o.SettingsPath = filepath.Join(p.dir(in.ID), "settings.json")
 	o.JobsPath = filepath.Join(p.dir(in.ID), "jobs.json")
+	o.TwinsPath = filepath.Join(p.dir(in.ID), "twins.json")
 	tid := in.ID
 	o.MaxJobs = func() int {
 		if q, _, _ := p.effective(p.info(tid)); q.MaxJobs > 0 {

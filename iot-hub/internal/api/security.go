@@ -400,6 +400,9 @@ func (s *Server) deleteDevice(w http.ResponseWriter, r *http.Request) {
 	if s.OnRevoke != nil {
 		s.OnRevoke(id) // drop live MQTT sessions
 	}
+	if s.Twins != nil {
+		s.Twins.Delete(id) // its twin and message queue go with it
+	}
 	s.audit(r, "device.revoke", id, "")
 	w.WriteHeader(http.StatusNoContent)
 }

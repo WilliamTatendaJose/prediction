@@ -42,6 +42,14 @@ type Config struct {
 	// Tenants switches to multi-tenant topics: {tenant}/{prefix}/{sensor}.
 	// Usernames are {tenant}/{id}; Auth must then be the platform view.
 	Tenants Resolver
+	// Twins finds a tenant's device twin service (device topics).
+	Twins func(tenant string) DeviceHandler
+}
+
+// DeviceHandler processes device-to-cloud twin, method and message topics.
+type DeviceHandler interface {
+	HandleMQTT(id, sub string, payload []byte)
+	Listening(id string)
 }
 
 // Resolver finds an active tenant's pipeline.
@@ -88,6 +96,9 @@ func New(cfg Config, p *ingest.Pipeline) (*Broker, error) {
 		return nil, err
 	}
 	if err := srv.AddHook(&ingestHook{p: p, prefix: cfg.Prefix + "/", log: srv.Log, tenants: cfg.Tenants}, nil); err != nil {
+		return nil, err
+	}
+	if err := srv.AddHook(&deviceHook{acl: acl, twins: cfg.Twins, multi: cfg.Tenants != nil}, nil); err != nil {
 		return nil, err
 	}
 	if cfg.TCPAddr != "" {
@@ -255,9 +266,16 @@ func (h *aclHook) OnACLCheck(cl *mqtt.Client, topic string, write bool) bool {
 				return false
 			}
 			topic = rest
-		} else if _, rest, ok := strings.Cut(topic, "/"); ok && write {
+		} else if _, rest, ok := strings.Cut(topic, "/"); ok {
 			topic = rest
 		}
+	}
+	// Device topics: a device (or service acting as one) may use only its
+	// own, and only these. Nothing on them is ever routed to subscribers:
+	// the hub processes device publishes and writes to the device's own
+	// sessions directly, so commands and twins can't be overheard.
+	if topic == "devices" || strings.HasPrefix(topic, "devices/") {
+		return deviceTopicAllowed(id, topic, write)
 	}
 	if !write {
 		return id.Can(auth.Subscribe, "")
@@ -303,4 +321,163 @@ func (b *Broker) PublishEventTo(tenant string, e anomaly.Event) {
 		return
 	}
 	_ = b.srv.Publish(b.root(tenant)+b.prefix+"-events/anomaly/"+e.Sensor, payload, false, 0)
+}
+
+func deviceTopicAllowed(id *auth.Identity, topic string, write bool) bool {
+	if id.Role != auth.Device && id.Role != auth.Service {
+		return false
+	}
+	sub, ok := strings.CutPrefix(topic, "devices/"+id.ID+"/")
+	if !ok {
+		return false
+	}
+	if !write {
+		return true // any filter under its own devices/{id}/
+	}
+	p := strings.Split(sub, "/")
+	switch {
+	case len(p) >= 2 && len(p) <= 3 && p[0] == "twin" && (p[1] == "get" || p[1] == "reported"):
+		return true
+	case len(p) == 4 && p[0] == "methods" && p[1] == "res":
+		return true
+	case len(p) == 3 && p[0] == "messages" && (p[1] == "complete" || p[1] == "reject" || p[1] == "abandon"):
+		return true
+	}
+	return false
+}
+
+// deviceHook hands device publishes to the twin service and keeps them
+// out of normal routing; it also tells the service when a device starts
+// listening, so queued messages go out.
+type deviceHook struct {
+	mqtt.HookBase
+	acl   *aclHook
+	twins func(tenant string) DeviceHandler
+	multi bool
+}
+
+func (h *deviceHook) ID() string { return "iot-devices" }
+
+func (h *deviceHook) Provides(b byte) bool { return b == mqtt.OnPublish || b == mqtt.OnSubscribed }
+
+// split returns tenant and the topic below it.
+func (h *deviceHook) split(cl *mqtt.Client, topic string) (*auth.Identity, string, string, bool) {
+	h.acl.mu.Lock()
+	id := h.acl.ids[cl]
+	h.acl.mu.Unlock()
+	if id == nil {
+		return nil, "", "", false
+	}
+	tenant := auth.DefaultTenant
+	if h.multi {
+		t, rest, ok := strings.Cut(topic, "/")
+		if !ok {
+			return nil, "", "", false
+		}
+		tenant, topic = t, rest
+	}
+	return id, tenant, topic, true
+}
+
+func (h *deviceHook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
+	if cl.Net.Inline {
+		return pk, nil
+	}
+	id, tenant, topic, ok := h.split(cl, pk.TopicName)
+	if !ok || !strings.HasPrefix(topic, "devices/") {
+		return pk, nil
+	}
+	// The ACL has checked it is this identity's own device topic.
+	if sub, ok := strings.CutPrefix(topic, "devices/"+id.ID+"/"); ok && h.twins != nil && tenant == id.Tenant {
+		if d := h.twins(tenant); d != nil {
+			d.HandleMQTT(id.ID, sub, bytes.Clone(pk.Payload))
+		}
+	}
+	return pk, packets.CodeSuccessIgnore // acknowledged, never routed
+}
+
+func (h *deviceHook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, codes []byte) {
+	for i, f := range pk.Filters {
+		if i < len(codes) && codes[i] >= 0x80 {
+			continue
+		}
+		id, tenant, topic, ok := h.split(cl, f.Filter)
+		if ok && strings.HasPrefix(topic, "devices/"+id.ID+"/") && h.twins != nil && tenant == id.Tenant {
+			if d := h.twins(tenant); d != nil {
+				go d.Listening(id.ID) // deliver queued messages
+			}
+		}
+	}
+}
+
+// sessions returns a device's connected clients.
+func (b *Broker) sessions(tenant, id string) []*mqtt.Client {
+	b.acl.mu.Lock()
+	defer b.acl.mu.Unlock()
+	var out []*mqtt.Client
+	for cl, ident := range b.acl.ids {
+		if ident.Tenant == tenant && ident.ID == id {
+			out = append(out, cl)
+		}
+	}
+	return out
+}
+
+func subscribed(cl *mqtt.Client, topic string) bool {
+	for f := range cl.State.Subscriptions.GetAll() {
+		if match(f, topic) {
+			return true
+		}
+	}
+	return false
+}
+
+// match reports whether an MQTT topic filter matches a topic.
+func match(filter, topic string) bool {
+	fs, ts := strings.Split(filter, "/"), strings.Split(topic, "/")
+	for i, f := range fs {
+		if f == "#" {
+			return true
+		}
+		if i >= len(ts) || f != "+" && f != ts[i] {
+			return false
+		}
+	}
+	return len(fs) == len(ts)
+}
+
+func (b *Broker) deviceTopic(tenant, id, sub string) string {
+	return b.root(tenant) + "devices/" + id + "/" + sub
+}
+
+// DeviceConnected reports whether a device has a session.
+func (b *Broker) DeviceConnected(tenant, id string) bool { return len(b.sessions(tenant, id)) > 0 }
+
+// DeviceListening reports whether a device has a session subscribed to
+// devices/{id}/{sub}.
+func (b *Broker) DeviceListening(tenant, id, sub string) bool {
+	t := b.deviceTopic(tenant, id, sub)
+	for _, cl := range b.sessions(tenant, id) {
+		if subscribed(cl, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// SendToDevice writes a message to the device's subscribed sessions only
+// (never through routing) and returns how many got it.
+func (b *Broker) SendToDevice(tenant, id, sub string, payload []byte) int {
+	t := b.deviceTopic(tenant, id, sub)
+	n := 0
+	for _, cl := range b.sessions(tenant, id) {
+		if !subscribed(cl, t) {
+			continue
+		}
+		pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish}, TopicName: t, Payload: payload}
+		if cl.WritePacket(pk) == nil {
+			n++
+		}
+	}
+	return n
 }
