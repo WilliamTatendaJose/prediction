@@ -1,6 +1,6 @@
 # IoT Hub
 
-A reusable sensor platform in one Go binary of ~15 MB (stripped):
+A reusable sensor platform in one Go binary of ~16 MB (stripped):
 
 - **Ingest** over an embedded **MQTT broker** (port 1883) or the **REST API**.
 - **Persist** to **SQLite** (embedded, default) or **PostgreSQL/TimescaleDB**, with automatic 1-minute rollups and retention.
@@ -53,6 +53,7 @@ Docker: `docker build -t iothub . && docker run -p 8080:8080 -p 1883:1883 -v iot
 | `-anomaly-persist` | `IOTHUB_ANOMALY_PERSIST` | `2` | consecutive outliers before a spike opens |
 | `-anomaly-warmup` | `IOTHUB_ANOMALY_WARMUP` | `30` | samples before spike detection starts |
 | `-stale-min` | `IOTHUB_STALE_MIN` | `1m` | minimum silence before "stale" (0 disables) |
+| `-connectors` | `IOTHUB_CONNECTORS` | — | Modbus / OPC UA connectors file (see PLCs and meters) |
 | `-token` | `IOTHUB_TOKEN` | — | admin token; setting it turns authentication on (see Security) |
 | `-auth-file` | `IOTHUB_AUTH_FILE` | `data/devices.json` | per-device credentials (hashes only, mode 0600) |
 | `-public-read` | `IOTHUB_PUBLIC_READ` | `false` | allow reads without a token (writes still need one) |
@@ -132,6 +133,58 @@ curl -X POST localhost:8080/api/sensors/env-1/data -d '{"temperature":21.5}'
 
 Every reading, whatever transport it came in on, is also published on `iot/{sensor}`, and every anomaly on `iot-events/anomaly/{sensor}`. Other services can subscribe there, for example the ML.NET prediction server in this repo. The existing `AccessControlEmulator` payload works unchanged if you point it at `POST /api/sensors/access-1/data`.
 
+## PLCs and meters (Modbus, OPC UA)
+
+The hub reads industrial equipment directly, with no gateway software. Connectors are declared in a JSON file passed with `-connectors`; see [`examples/connectors.json`](examples/connectors.json). Each connector feeds a hub sensor through the normal pipeline, so PLC tags get:
+- live tiles, history, analytics and anomaly detection
+- the MQTT republish on `iot/{sensor}`, so the ML.NET bridge can score them too
+
+Units and labels from the file are added to the sensor definition, without overwriting anything an admin has set.
+
+**Modbus** (`"modbus": [...]`)
+- **Connection:** `url` is `tcp://host:502`, `rtu:///dev/ttyUSB0` (with `baud`, `parity`, `stopBits`), or `rtuovertcp://gateway:4001`.
+- **Units:** one connection can serve many `units` (slave ids), each becoming one sensor. That covers an RS-485 bus of meters, or a gateway with many drops.
+- **Registers:** `table` is `holding`, `input`, `coil` or `discrete`. `address` is the **0-based protocol address**, so holding register 40001 is address 0.
+- **Types:** `type` is `int16`, `uint16`, `int32`, `uint32`, `float32`, `int64`, `uint64` or `float64`. `order` is `ABCD` (default), `CDAB` (word-swapped, common on Modicon PLCs and energy meters), `BADC` or `DCBA`. `bit: n` reads one bit of a status word.
+- **Scaling:** `scale` and `offset` give engineering units, e.g. `int16 × 0.1`.
+- **Efficiency:**
+  - Registers are grouped into the fewest reads: up to 125 registers per request, bridging gaps of up to `maxGap` (default 8).
+  - If a PLC rejects a span because it covers unmapped addresses, the connector reads those registers singly from then on and logs it once.
+  - Each poll is one round trip per block, not one per tag.
+
+**OPC UA** (`"opcua": [...]`)
+- **Subscriptions:** monitored items, so the server pushes changes; there's no polling.
+- **Deadband:** a `deadband` (absolute) is sent to the server, so suppressed changes never cross the network.
+- **Heartbeat:** every `heartbeat` (default 60 s) the connector *reads* all nodes. Unchanged tags never look stale, and the read corrects servers that implement deadband against the previous sample rather than the last report. The test server does exactly that, and without the read a slowly drifting value froze.
+- **Sample mode:** `sample: true` reads every `interval` instead, giving evenly spaced samples for unbiased averages.
+- **Quality:** values with bad or uncertain status are dropped rather than recorded.
+- **Security:** `securityPolicy` is `None` or `Basic256Sha256` (`Sign` / `SignAndEncrypt`), with optional `username`/`password`.
+  - For secure policies a client certificate is generated next to the credentials file (`data/opcua-<name>.crt`). Trust it once on the PLC; S7-1500 and most servers list rejected certificates for approval.
+  - Or set `certFile`/`keyFile`.
+
+**Report-by-exception (Modbus).** By default every poll is stored. Setting `onChange: true` or a `deadband` on a field stores it only when it changes, plus once per `heartbeat` (default 60 s).
+- This greatly reduces rows for slow tags such as setpoints, states and energy counters.
+- The trade-off: averages become sample-weighted, so busy periods weigh more. Leave it off for process values you will average.
+
+**Reliability.**
+- An unreachable device is retried with backoff (1 s up to 30 s) and logged once per outage, then once on recovery. The hub's `stale` detector raises an anomaly if a PLC stays silent.
+- `GET /api/connectors` reports each connector: connected, last error, reads, values published and suppressed.
+
+**Tested here:**
+- **Modbus**, against an independent implementation (pymodbus 3.6) acting as a PLC:
+  - a sparse map that rejects gapped reads
+  - two units on one connection, CDAB floats, scaled int16, a status bit, coils and input registers
+  - the PLC being killed and restarted
+- **OPC UA**, against asyncua 2.0:
+  - unsecured, and `Basic256Sha256`/`SignAndEncrypt` with the generated client certificate
+  - absolute deadband, heartbeat reads and sample mode
+- **Resources:** five connectors (two Modbus units at 2 Hz, four OPC UA sessions) ran in **24 MB RSS at 1.1% CPU**.
+- **CI:** the automated tests cover decoding for every type and byte order, block planning, the gap fallback, report-by-exception and reconnection.
+
+**Not tested here:**
+- Modbus RTU on a real serial port (no hardware in this environment).
+- An OPC UA server that *enforces* client-certificate trust: asyncua accepts any client certificate, so the approval step on a real PLC is unverified.
+
 ## API
 
 | Method | Path | |
@@ -145,6 +198,7 @@ Every reading, whatever transport it came in on, is also published on `iot/{sens
 | GET | `/api/anomalies?sensor=&from=&to=&limit=&active=1` | anomaly episodes, newest first |
 | GET / PUT | `/api/dashboard` | layout JSON (opaque to the server) |
 | GET | `/api/stream[?sensors=a,b]` | SSE: readings as `data: {"s","t","v"}`; anomalies as `event: anomaly` |
+| GET | `/api/connectors` | PLC connector status |
 | GET | `/api/health` | heap, stream and DB writer counters, active anomalies |
 
 `from`/`to` accept unix ms, RFC 3339, `now`, or a duration before now: `-15m`, `-24h`, `-7d`. Defaults: the last hour (7 days for anomalies). Each analytics result includes `source` (`db` or `memory`), so you can tell whether it came from the database or the in-memory buffer.

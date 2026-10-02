@@ -26,6 +26,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/api"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/broker"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
@@ -86,6 +87,7 @@ func main() {
 	anomalyPersist := flag.Int("anomaly-persist", envInt("IOTHUB_ANOMALY_PERSIST", 2), "consecutive outliers before a spike opens")
 	anomalyWarmup := flag.Int("anomaly-warmup", envInt("IOTHUB_ANOMALY_WARMUP", 30), "samples before spike detection starts")
 	staleMin := flag.Duration("stale-min", envDur("IOTHUB_STALE_MIN", time.Minute), "minimum silence before a sensor is stale (0 disables)")
+	connectorsFile := flag.String("connectors", env("IOTHUB_CONNECTORS", ""), "Modbus/OPC UA connectors config (JSON); empty disables")
 	debug := flag.Bool("debug", env("IOTHUB_DEBUG", "") == "true", "debug logging")
 	flag.Parse()
 
@@ -198,6 +200,42 @@ func main() {
 		log.Info("mqtt listening", "tcp", *mqttAddr, "tls", mqttsAddr, "ws", *mqttWS, "topics", *prefix+"/{sensor}[/{field}]")
 	}
 
+	if *connectorsFile != "" {
+		cc, err := connect.Load(*connectorsFile)
+		if err != nil {
+			log.Error("connectors", "err", err)
+			os.Exit(1)
+		}
+		for i := range cc.OPCUA {
+			cc.OPCUA[i].CertDir = filepath.Dir(*authFile)
+		}
+		clog := log.With("component", "connect")
+		conns := connect.Start(ctx, cc, connect.Target{
+			Ingest: func(sensor string, ts int64, values map[string]any) {
+				r, err := pipe.HandleValues(sensor, ts, values)
+				if err != nil {
+					clog.Debug("ingest rejected", "sensor", sensor, "err", err)
+					return
+				}
+				if srv.OnIngest != nil {
+					srv.OnIngest(r) // PLC data appears on MQTT like any other reading
+				}
+			},
+			Define: func(sensor string, fields map[string]connect.FieldInfo) {
+				defineFields(st, sensor, fields, clog)
+			},
+			Logf: func(f string, a ...any) { clog.Warn(fmt.Sprintf(f, a...)) },
+		})
+		srv.Connectors = func() []connect.Status {
+			out := make([]connect.Status, len(conns))
+			for i, c := range conns {
+				out[i] = c.Status()
+			}
+			return out
+		}
+		log.Info("connectors started", "modbus", len(cc.Modbus), "opcua", len(cc.OPCUA))
+	}
+
 	// Started only after the pipeline is fully wired (OnEvent above).
 	if det := pipe.Detector; det != nil {
 		go func() {
@@ -250,6 +288,28 @@ func main() {
 	stopWriter()
 	if writer != nil {
 		<-writer.Done() // final flush before the deferred db.Close
+	}
+}
+
+// defineFields adds units/labels declared by a connector to the sensor
+// definition, without overwriting anything an admin has set.
+func defineFields(st *store.Store, sensor string, fields map[string]connect.FieldInfo, log *slog.Logger) {
+	def := store.Sensor{ID: sensor, Name: sensor, Kind: "plc", Fields: map[string]store.Field{}}
+	if cur, err := st.Get(sensor); err == nil {
+		def = cur.Sensor
+	}
+	for name, fi := range fields {
+		f := def.Fields[name]
+		if f.Unit == "" {
+			f.Unit = fi.Unit
+		}
+		if f.Label == "" {
+			f.Label = fi.Label
+		}
+		def.Fields[name] = f
+	}
+	if err := st.Upsert(def); err != nil {
+		log.Warn("define sensor", "sensor", sensor, "err", err)
 	}
 }
 

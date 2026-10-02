@@ -32,6 +32,7 @@ import (
 	"github.com/williamtatendajose/prediction/iot-hub/internal/analytics"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/anomaly"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/auth"
+	"github.com/williamtatendajose/prediction/iot-hub/internal/connect"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/ingest"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/store"
 	"github.com/williamtatendajose/prediction/iot-hub/internal/stream"
@@ -60,6 +61,7 @@ type Server struct {
 	SecureCookies bool        // set when serving TLS
 	TLS           bool        // adds HSTS
 	OnRevoke      func(id string)
+	Connectors    func() []connect.Status // optional
 	started       time.Time
 }
 
@@ -87,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/dashboard", read(s.getDashboard))
 	mux.HandleFunc("PUT /api/dashboard", s.require(auth.Manage, s.putDashboard))
 	mux.HandleFunc("GET /api/stream", read(s.stream))
+	mux.HandleFunc("GET /api/connectors", read(s.connectors))
 	mux.HandleFunc("GET /api/devices", s.require(auth.Manage, s.listDevices))
 	mux.HandleFunc("POST /api/devices", s.require(auth.Manage, s.addDevice))
 	mux.HandleFunc("DELETE /api/devices/{id}", s.require(auth.Manage, s.deleteDevice))
@@ -96,6 +99,14 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /", http.FileServerFS(s.Web))
 	}
 	return secureHeaders(mux, s.TLS)
+}
+
+func (s *Server) connectors(w http.ResponseWriter, _ *http.Request) {
+	if s.Connectors == nil {
+		writeJSON(w, http.StatusOK, []connect.Status{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Connectors())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

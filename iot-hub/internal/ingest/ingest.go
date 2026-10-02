@@ -35,6 +35,12 @@ func (p *Pipeline) Handle(sensor, field string, payload []byte) (store.Reading, 
 	if err != nil {
 		return store.Reading{}, err
 	}
+	return p.HandleValues(sensor, ts, values)
+}
+
+// HandleValues ingests already-decoded values (used by PLC connectors).
+// ts <= 0 means now.
+func (p *Pipeline) HandleValues(sensor string, ts int64, values map[string]any) (store.Reading, error) {
 	r, err := p.Store.Ingest(sensor, ts, values)
 	if err != nil {
 		return r, err
