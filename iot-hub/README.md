@@ -19,6 +19,14 @@ Adding a sensor takes no setup: publish data and it appears. Adding a tile type 
                                                                                     or Postgres ─► analytics API ─┘
 ```
 
+## Try it
+
+```bash
+./scripts/demo.sh          # needs Go and Python 3; then open http://localhost:8080
+```
+
+It starts a multi-tenant hub with simulated sensors, devices that answer commands (one stays offline, one goes overdue), and people for each role. It then prints a sign-in token for each role: platform operator, admin, operator and viewer. Data goes to `demo-data/` and is wiped on each start.
+
 ## Run
 
 ```bash
