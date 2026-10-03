@@ -47,11 +47,13 @@ async function list(el, ctx, seg) {
     const rows = src.sort((a, b) => a.id.localeCompare(b.id)).map((d) => {
       const [label, tone] = status(d, tw[d.id]);
       return h('tr', { class: 'link', onclick: (ev) => { if (!ev.target.closest('a,button')) location.hash = '#/devices/' + enc(d.id); } },
-        h('td', {}, h('div', { class: 'primary-cell' }, h('a', { href: '#/devices/' + enc(d.id), text: d.id }), h('small', { text: d.note || ROLE_INFO[d.role] || '' }))),
+        h('td', {}, h('div', { class: 'primary-cell' }, h('a', { href: '#/devices/' + enc(d.id), text: d.id }),
+          h('small', { text: d.email || d.note || ROLE_INFO[d.role] || '' }))),
         h('td', {}, h('span', { class: 'chip', text: d.role })),
         h('td', {}, badge(label, tone), seg === 'things' && mqttChip(tw[d.id])),
         seg === 'things' && h('td', {}, (d.sensors || []).map((p) => h('span', { class: 'chip mono', text: p }))),
-        h('td', {}, d.keys && h('span', { class: 'chip', text: 'keys / SAS' }), d.token && h('span', { class: 'chip', text: 'token' })),
+        h('td', {}, d.password && h('span', { class: 'chip', text: 'password' }),
+          d.keys && h('span', { class: 'chip', text: 'keys / SAS' }), d.token && h('span', { class: 'chip', text: 'token' })),
         h('td', { class: 'n' }, seg === 'things' ? [tw[d.id]?.lastDataTime ? ago(tw[d.id].lastDataTime) : 'never',
           tw[d.id]?.expectedIntervalSec ? h('div', { class: 'hint', text: 'every ' + every(tw[d.id].expectedIntervalSec) }) : null] : d.expires ? when(d.expires) : 'never'));
     });
@@ -86,24 +88,62 @@ async function addIdentity(defRole) {
   const expires = h('input', { type: 'date' });
   const note = h('input', { placeholder: isThing ? 'Roof tank, line 3…' : 'Name, team…' });
   const roleField = field('Role', role); roleField.append(roleHint);
+  // People sign in with an email and password; a token is the alternative
+  // for an unattended script running as a person.
+  const how = h('select', {}, opt('password', 'Email and password'), opt('token', 'Access token'));
+  const email = h('input', { type: 'email', placeholder: 'ana@plant.co', spellcheck: 'false', autocapitalize: 'none' });
+  const pass = h('input', { type: 'password', autocomplete: 'new-password' });
+  const signIn = h('div', { class: 'form-grid' }, field('Email', email), field('Password', pass, { hint: `At least ${MIN_PASSWORD} characters` }));
+  const syncHow = () => { signIn.hidden = how.value !== 'password'; };
+  how.onchange = syncHow; syncHow();
   const r = await modal(isThing ? 'Add device' : 'Add user', h('div', { class: 'stack' },
     h('div', { class: 'form-grid' }, field(isThing ? 'Device id' : 'User id', id), roleField),
     isThing && field('Sensors it may send for', sensors, { hint: 'Comma-separated ids or patterns. It can only touch these sensors.' }),
-    h('div', { class: 'form-grid' }, isThing && field('Credential', auth), field('Expires (optional)', expires)),
+    h('div', { class: 'form-grid' }, isThing ? field('Credential', auth) : field('Signs in with', how), field('Expires (optional)', expires)),
+    !isThing && signIn,
     field('Note', note)), {
     wide: true,
     actions: [['Cancel'], ['Create', async () => {
-      const body = { id: id.value.trim(), role: role.value, auth: isThing ? auth.value : 'token', note: note.value.trim() || undefined,
+      const usePassword = !isThing && how.value === 'password';
+      const body = { id: id.value.trim(), role: role.value, note: note.value.trim() || undefined,
+        auth: isThing ? auth.value : usePassword ? 'password' : 'token',
         sensors: isThing ? sensors.value.split(',').map((x) => x.trim()).filter(Boolean) : [] };
       if (!body.id) throw new Error('Give it an id.');
       if (isThing && !body.sensors.length) throw new Error('List the sensors it may send for (use * for all).');
+      if (usePassword) {
+        if (!email.value.trim()) throw new Error('Give them an email address to sign in with.');
+        if (pass.value.length < MIN_PASSWORD) throw new Error(`The password must be at least ${MIN_PASSWORD} characters.`);
+        body.email = email.value.trim();
+        body.password = pass.value;
+      }
       if (expires.value) body.expires = new Date(expires.value + 'T23:59:59').getTime();
       return post('/api/devices', body);
     }, 'primary']],
   });
   if (!r?.id) return;
-  await showSecrets(`Credentials for ${r.id}`, r);
+  // A password user has no secret to show: they already know their password.
+  if (r.token || r.primaryKey) await showSecrets(`Credentials for ${r.id}`, r);
+  else toast(`${r.id} can sign in with ${email.value.trim()}`);
   location.hash = '#/devices/' + enc(r.id);
+}
+
+// Mirrors auth.MinPassword.
+const MIN_PASSWORD = 10;
+
+// setPassword: an admin gives a person a new password (or their first).
+async function setPasswordFor(d, reload) {
+  const email = h('input', { type: 'email', value: d.email || '', placeholder: 'ana@plant.co', spellcheck: 'false', autocapitalize: 'none' });
+  const pass = h('input', { type: 'password', autocomplete: 'new-password' });
+  const ok = await modal(`Set a password for ${d.id}`, h('div', { class: 'stack' },
+    h('p', { class: 'modal-text', text: 'They sign in with this email address and password. Any sessions they already have are ended.' }),
+    field('Email', email), field('New password', pass, { hint: `At least ${MIN_PASSWORD} characters` })), {
+    actions: [['Cancel'], ['Set password', () => {
+      if (!email.value.trim()) throw new Error('An email address is needed to sign in.');
+      if (pass.value.length < MIN_PASSWORD) throw new Error(`The password must be at least ${MIN_PASSWORD} characters.`);
+      return put(`/api/devices/${enc(d.id)}/password`, { email: email.value.trim(), password: pass.value });
+    }, 'primary']],
+  });
+  if (ok) { toast(`${d.id} can sign in with ${email.value.trim()}`); reload(); }
 }
 
 async function detail(el, ctx, id, tab) {
@@ -157,9 +197,12 @@ async function detail(el, ctx, id, tab) {
       thing && h('dt', { text: 'Last activity' }), thing && h('dd', { text: twin?.lastActivityTime ? ago(twin.lastActivityTime) : '—' }))),
     card('Credentials', { sub: locked() ? 'Issued by the platform operator.' : 'Rotate one key while the device keeps using the other; tokens are replaced at once.' },
       h('dl', { class: 'dl' },
+        !thing && h('dt', { text: 'Signs in with' }),
+        !thing && h('dd', {}, d.email ? [h('span', { class: 'mono', text: d.email }), ' ', badge('Password set', 'good')] : badge('No password', 'neutral')),
         h('dt', { text: 'Keys' }), h('dd', {}, d.keys ? badge('Primary and secondary', 'good') : badge('None', 'neutral')),
         h('dt', { text: 'Token' }), h('dd', {}, d.token ? badge('Set', 'good') : badge('None', 'neutral'))),
       h('div', { class: 'row section-gap' },
+        !thing && act(d.password ? 'Set a new password' : 'Set a password', () => setPasswordFor(d, reload)),
         d.keys && act('Show keys', async () => showSecrets('Keys for ' + d.id, await api(p + '/keys'))),
         d.keys && act('SAS token (24 h)', async () => showSecrets('SAS token for ' + d.id, await post(p + '/sas', { ttl: '24h' }), 'Valid for 24 hours. Devices usually sign their own from a key.')),
         act(d.keys ? 'Rotate primary key' : 'Add keys', async () => {

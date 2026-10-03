@@ -146,33 +146,62 @@ func secureHeaders(next http.Handler, tls bool) http.Handler {
 	})
 }
 
-type loginReq struct {
-	Token string `json:"token"`
+// LoginReq is a sign-in: an email and password, or an access token.
+type LoginReq struct {
+	Token    string `json:"token"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
-// login validates a token and stores it in an HttpOnly cookie, so the
-// dashboard (including EventSource, which cannot send headers) is
-// authenticated without exposing the token to page scripts.
+// login takes either an email and password (people) or an access token
+// (devices, services, and anyone pasting a token), and stores the resulting
+// session in an HttpOnly cookie, so the dashboard (including EventSource,
+// which cannot send headers) is authenticated without exposing anything to
+// page scripts.
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	var req loginReq
+	var req LoginReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	id, ok := s.Auth.Authenticate(req.Token)
+	id, cookie, ok := SignIn(s.Auth, req)
 	if !ok || !s.Auth.Enabled() {
-		writeErr(w, http.StatusUnauthorized, errors.New("invalid token"))
+		writeErr(w, http.StatusUnauthorized, errors.New("wrong email, password or token"))
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: req.Token, Path: "/", HttpOnly: true,
+		Name: cookieName, Value: cookie, Path: "/", HttpOnly: true,
 		Secure: s.SecureCookies, SameSite: http.SameSiteStrictMode,
 		Expires: time.Now().Add(30 * 24 * time.Hour),
 	})
 	writeJSON(w, http.StatusOK, id)
 }
 
-func (s *Server) logout(w http.ResponseWriter, _ *http.Request) {
+// SignIn resolves a login request and returns the value for the cookie: a
+// fresh session token for a password sign-in, or the token itself.
+func SignIn(store *auth.Store, req LoginReq) (*auth.Identity, string, bool) {
+	if req.Email != "" || req.Password != "" {
+		id, ok := store.AuthenticatePassword(req.Email, req.Password)
+		if !ok {
+			return nil, "", false
+		}
+		ses, err := store.StartSession(id, 0)
+		if err != nil {
+			return nil, "", false
+		}
+		return id, ses, true
+	}
+	id, ok := store.Authenticate(req.Token)
+	if !ok {
+		return nil, "", false
+	}
+	return id, req.Token, true
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(cookieName); err == nil {
+		s.Auth.EndSession(c.Value) // a password session is gone server-side too
+	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true,
 		Secure: s.SecureCookies, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
@@ -185,7 +214,11 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"authEnabled": true, "publicRead": s.PublicRead})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"authEnabled": s.Auth.Enabled(), "publicRead": s.PublicRead, "identity": id})
+	out := map[string]any{"authEnabled": s.Auth.Enabled(), "publicRead": s.PublicRead, "identity": id}
+	if e := s.Auth.EmailOf(id.ID); e != "" { // they signed in with a password and can change it
+		out["email"] = e
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // canIssue reports whether the caller may create or change credentials.
@@ -270,6 +303,52 @@ func (s *Server) addDevice(w http.ResponseWriter, r *http.Request) {
 		out["connectionString"] = s.connectionString(r, req.ID, sec.PrimaryKey)
 	}
 	writeJSON(w, http.StatusCreated, out)
+}
+
+// setPassword: PUT /api/devices/{id}/password {email, password} gives a
+// person a new sign-in password. Admins only, as it grants access.
+func (s *Server) setPassword(w http.ResponseWriter, r *http.Request) {
+	if !s.canIssue(w, r) {
+		return
+	}
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.Auth.SetPassword(id, req.Email, req.Password); err != nil {
+		authErr(w, err)
+		return
+	}
+	s.audit(r, "device.password", id, "set by an administrator") // never the password
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// changeOwnPassword: PUT /api/me/password {currentPassword, newPassword}.
+func (s *Server) changeOwnPassword(w http.ResponseWriter, r *http.Request) {
+	me, _ := r.Context().Value(identityKey{}).(*auth.Identity)
+	if me == nil {
+		writeErr(w, http.StatusUnauthorized, errors.New("sign in first"))
+		return
+	}
+	var req struct {
+		Current string `json:"currentPassword"`
+		New     string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.Auth.ChangePassword(me.ID, req.Current, req.New); err != nil {
+		authErr(w, err)
+		return
+	}
+	s.audit(r, "me.password", me.ID, "changed their own password")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // updateDevice: PATCH /api/devices/{id} {sensors, note, disabled, expires}

@@ -177,6 +177,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/devices/{id}", s.require(auth.Manage, s.deleteDevice))
 	mux.HandleFunc("PATCH /api/devices/{id}", s.require(auth.Manage, s.updateDevice))
 	mux.HandleFunc("POST /api/devices/{id}/rotate", s.require(auth.Manage, s.rotateDevice))
+	mux.HandleFunc("PUT /api/devices/{id}/password", s.require(auth.Manage, s.setPassword))
+	mux.HandleFunc("PUT /api/me/password", s.requireAny(s.changeOwnPassword))
 	mux.HandleFunc("GET /api/devices/{id}/keys", s.require(auth.Manage, s.deviceKeys))
 	mux.HandleFunc("POST /api/devices/{id}/sas", s.require(auth.Manage, s.deviceSAS))
 	if s.Web != nil {

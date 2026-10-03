@@ -2,7 +2,7 @@
 // and the alarm bell. Pages live in pages/*.js and are loaded on first visit.
 import {
   $, h, icon, api, session, role, isSuper, canManage, canOperate, multiTenant, hasTenant, tenantLabel, safeGet, safeSet,
-  whenSignedOut, Unauthorized, live, connectLive, disconnectLive, empty, linkButton, toast,
+  whenSignedOut, Unauthorized, live, connectLive, disconnectLive, empty, linkButton, toast, modal, field,
 } from './core.js';
 
 // ---- routes ------------------------------------------------------------------
@@ -159,25 +159,49 @@ live.on('anomaly', (a) => { if (a.end || a.shelved) active.delete(a.id); else ac
 live.on('alarms', loadActive);
 
 // ---- sign in -------------------------------------------------------------------
+// People sign in with an email and password; a token is the fallback, and
+// the choice is remembered so operators don't re-pick it every time.
+let tokenMode = safeGet('iothub.signin') === 'token';
+function setSigninMode(useToken) {
+  tokenMode = useToken;
+  safeSet('iothub.signin', useToken ? 'token' : 'password');
+  $('signin-password').hidden = useToken;
+  $('signin-tokenbox').hidden = !useToken;
+  $('signin-mode').textContent = useToken ? 'Use an email and password instead' : 'Use an access token instead';
+  $(useToken ? 'signin-token' : 'signin-email').focus();
+}
+$('signin-mode').onclick = () => { $('signin-err').textContent = ''; setSigninMode(!tokenMode); };
+
 function showSignin(msg) {
   disconnectLive();
   $('app').hidden = true;
   $('signin').hidden = false;
   $('signin-err').textContent = msg || '';
   $('signin-public').hidden = !session.me.publicRead || !!session.me.identity;
-  $('signin-token').focus();
+  setSigninMode(tokenMode);
 }
 whenSignedOut(() => showSignin(session.me.identity ? 'Your session ended. Sign in again.' : ''));
 $('signin-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
+  const body = tokenMode
+    ? { token: $('signin-token').value.trim() }
+    : { email: $('signin-email').value.trim(), password: $('signin-pass').value };
+  if (tokenMode ? !body.token : !(body.email && body.password)) {
+    $('signin-err').textContent = tokenMode ? 'Enter your access token.' : 'Enter your email and password.';
+    return;
+  }
   const res = await fetch('/api/login', {
     method: 'POST', credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'iothub' },
-    body: JSON.stringify({ token: $('signin-token').value.trim() }),
+    body: JSON.stringify(body),
   }).catch(() => null);
   if (!res) { $('signin-err').textContent = 'The hub did not answer. Check the connection and try again.'; return; }
-  if (!res.ok) { $('signin-err').textContent = 'That token was not accepted.'; return; }
-  $('signin-token').value = '';
+  if (!res.ok) {
+    $('signin-err').textContent = tokenMode ? 'That token was not accepted.' : 'Wrong email or password.';
+    $('signin-pass').value = '';
+    return;
+  }
+  $('signin-token').value = ''; $('signin-pass').value = '';
   booted = false;
   boot();
 });
@@ -188,6 +212,23 @@ $('logout').onclick = async () => {
   showSignin('You are signed out.');
 };
 $('login').onclick = () => showSignin();
+// Changing your own password needs the current one, and signs out the
+// other places you are signed in.
+$('passwd').onclick = async () => {
+  const cur = h('input', { type: 'password', autocomplete: 'current-password' });
+  const next = h('input', { type: 'password', autocomplete: 'new-password' });
+  const again = h('input', { type: 'password', autocomplete: 'new-password' });
+  const ok = await modal('Change your password', h('div', { class: 'stack' },
+    h('p', { class: 'modal-text', text: `Signed in as ${session.me.email}. You stay signed in here; anywhere else is signed out.` }),
+    field('Current password', cur), field('New password', next, { hint: 'At least 10 characters' }), field('New password again', again)), {
+    actions: [['Cancel'], ['Change password', async () => {
+      if (next.value !== again.value) throw new Error('The two new passwords are different.');
+      if (next.value.length < 10) throw new Error('The new password must be at least 10 characters.');
+      await api('/api/me/password', { method: 'PUT', body: JSON.stringify({ currentPassword: cur.value, newPassword: next.value }) });
+    }, 'primary']],
+  });
+  if (ok) toast('Password changed');
+};
 
 const ROLE_NAMES = { superadmin: 'Platform operator', admin: 'Administrator', operator: 'Operator', viewer: 'Viewer' };
 function renderUser() {
@@ -204,6 +245,7 @@ function renderUser() {
   }
   $('logout').hidden = !me.authEnabled || !id;
   $('login').hidden = !me.authEnabled || !!id;
+  $('passwd').hidden = !me.email; // only people who signed in with one
 }
 
 // ---- tenant switcher (multi-tenant superadmin) ---------------------------------

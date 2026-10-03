@@ -145,12 +145,15 @@ type Keys struct {
 
 type record struct {
 	Identity
-	Hash     string `json:"hash,omitempty"` // hex SHA-256 of the token
-	Keys     *Keys  `json:"keys,omitempty"`
-	Disabled bool   `json:"disabled,omitempty"`
-	Expires  int64  `json:"expires,omitempty"` // token expiry, unix ms; 0 = never
-	Created  int64  `json:"created"`
-	Note     string `json:"note,omitempty"`
+	Hash string `json:"hash,omitempty"` // hex SHA-256 of the token
+	Keys *Keys  `json:"keys,omitempty"`
+	// People sign in with these; devices and services never have them.
+	Email    string    `json:"email,omitempty"` // normalised (lowercase)
+	Pass     *Password `json:"pass,omitempty"`
+	Disabled bool      `json:"disabled,omitempty"`
+	Expires  int64     `json:"expires,omitempty"` // token expiry, unix ms; 0 = never
+	Created  int64     `json:"created"`
+	Note     string    `json:"note,omitempty"`
 }
 
 func (r *record) key() string { return r.Tenant + "\x00" + r.ID }
@@ -167,7 +170,9 @@ type core struct {
 	enabled bool
 	byHash  map[string]*record
 	byKey   map[string]*record // tenant\x00id
-	now     func() time.Time
+	byEmail  map[string]*record  // normalised email; unique across tenants
+	sessions map[string]*session // sha-256 of a session token (session.go)
+	now      func() time.Time
 }
 
 // Store is a view of the credential database for one tenant, or for all
@@ -180,7 +185,8 @@ type Store struct {
 // New opens the credential database (not yet loaded) and returns the
 // default tenant's view. superToken is the superadmin token (-token).
 func New(path, superToken string) *Store {
-	c := &core{path: path, byHash: map[string]*record{}, byKey: map[string]*record{}, now: time.Now}
+	c := &core{path: path, byHash: map[string]*record{}, byKey: map[string]*record{},
+		byEmail: map[string]*record{}, now: time.Now}
 	if superToken != "" {
 		h := sha256.Sum256([]byte(superToken))
 		c.superHash = h[:]
@@ -247,6 +253,9 @@ func (s *Store) Authenticate(token string) (*Identity, bool) {
 	if strings.HasPrefix(token, SASPrefix) {
 		return s.authSAS(token)
 	}
+	if IsSession(token) {
+		return s.authSession(token)
+	}
 	h := sha256.Sum256([]byte(token))
 	if s.c.superHash != nil && subtle.ConstantTimeCompare(h[:], s.c.superHash) == 1 {
 		return &Identity{ID: "admin", Role: Superadmin}, true
@@ -266,6 +275,46 @@ func (s *Store) Authenticate(token string) (*Identity, bool) {
 }
 
 func (s *Store) visible(tenant string) bool { return s.tenant == "" || s.tenant == tenant }
+
+// AuthenticatePassword resolves an email address and password. It is
+// deliberately indistinguishable from the outside whether the address is
+// unknown or the password is wrong, and an unknown address still costs a
+// password hash so the two take the same time.
+func (s *Store) AuthenticatePassword(email, password string) (*Identity, bool) {
+	if !s.Enabled() {
+		return Anonymous, true
+	}
+	e, err := NormalEmail(email)
+	if err != nil {
+		e = "" // still fall through to the dummy verify below
+	}
+	s.c.mu.RLock()
+	r := s.c.byEmail[e]
+	var (
+		id    Identity
+		pass  *Password
+		usable bool
+	)
+	if r != nil {
+		id, pass = r.Identity, r.Pass
+		usable = !r.Disabled && (r.Expires == 0 || s.c.now().UnixMilli() < r.Expires)
+	}
+	s.c.mu.RUnlock()
+	if pass == nil {
+		dummyVerify(password)
+		return nil, false
+	}
+	if !pass.verify(password) || !usable || !s.visible(id.Tenant) {
+		return nil, false
+	}
+	return &id, true
+}
+
+// dummyVerify burns the same work as a real check, so an unknown address
+// cannot be told from a wrong password by timing.
+var dummyPassword, _ = NewPassword(strings.Repeat("x", MinPassword))
+
+func dummyVerify(pw string) { dummyPassword.verify(pw) }
 
 // ResourceURI is what a SAS token for a device is scoped to.
 func ResourceURI(tenant, id string) string { return tenant + "/devices/" + id }
@@ -386,9 +435,13 @@ type Spec struct {
 	Role    Role     `json:"role"`
 	Sensors []string `json:"sensors,omitempty"`
 	Note    string   `json:"note,omitempty"`
-	// Auth: "token" (default), "keys" (SAS) or "both".
+	// Auth: "token" (default), "keys" (SAS), "both", or "password" for a
+	// person who signs in with Email and Password and gets no token.
 	Auth    string `json:"auth,omitempty"`
 	Expires int64  `json:"expires,omitempty"` // token expiry, unix ms
+	// People only: an email address and password to sign in with.
+	Email    string `json:"email,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 // Secrets are shown once, when created or rotated.
@@ -438,11 +491,25 @@ func (s *Store) Create(sp Spec) (Secrets, error) {
 	r := &record{Identity: Identity{Tenant: s.tenant, ID: sp.ID, Role: sp.Role, Sensors: sp.Sensors},
 		Created: s.c.now().UnixMilli(), Note: sp.Note, Expires: sp.Expires}
 	switch sp.Auth {
-	case "", "token", "both", "keys":
+	case "", "token", "both", "keys", "password":
 	default:
-		return sec, fmt.Errorf("%w: auth must be token, keys or both", ErrInvalid)
+		return sec, fmt.Errorf("%w: auth must be token, keys, both or password", ErrInvalid)
 	}
-	if sp.Auth != "keys" {
+	if sp.Email != "" || sp.Password != "" || sp.Auth == "password" {
+		if !CanSignIn(sp.Role) {
+			return sec, fmt.Errorf("%w: only people (admin, operator, viewer) sign in with a password; %s uses a token or keys", ErrInvalid, sp.Role)
+		}
+		email, err := NormalEmail(sp.Email)
+		if err != nil {
+			return sec, err
+		}
+		pass, err := NewPassword(sp.Password)
+		if err != nil {
+			return sec, err
+		}
+		r.Email, r.Pass = email, pass
+	}
+	if sp.Auth != "keys" && sp.Auth != "password" {
 		tok, err := newToken()
 		if err != nil {
 			return sec, err
@@ -462,6 +529,14 @@ func (s *Store) Create(sp Spec) (Secrets, error) {
 	if _, ok := c.byKey[r.key()]; ok {
 		c.mu.Unlock()
 		return Secrets{}, ErrExists
+	}
+	// Email identifies an account at sign-in, before any tenant is known, so
+	// it has to be unique across every tenant.
+	if r.Email != "" {
+		if _, taken := c.byEmail[r.Email]; taken {
+			c.mu.Unlock()
+			return Secrets{}, fmt.Errorf("%w: %s already signs in here", ErrExists, r.Email)
+		}
 	}
 	c.put(r)
 	wasEnabled := c.enabled
@@ -500,12 +575,18 @@ func (c *core) put(r *record) {
 	if r.Hash != "" {
 		c.byHash[r.Hash] = r
 	}
+	if r.Email != "" {
+		c.byEmail[r.Email] = r
+	}
 }
 
 func (c *core) drop(r *record) {
 	delete(c.byKey, r.key())
 	if r.Hash != "" && c.byHash[r.Hash] == r {
 		delete(c.byHash, r.Hash)
+	}
+	if r.Email != "" && c.byEmail[r.Email] == r {
+		delete(c.byEmail, r.Email)
 	}
 }
 
@@ -515,6 +596,7 @@ func (s *Store) Remove(id string) error {
 	r, ok := c.byKey[s.tenant+"\x00"+id]
 	if ok {
 		c.drop(r)
+		c.endSessionsLocked(s.tenant, id)
 	}
 	c.mu.Unlock()
 	if !ok {
@@ -534,6 +616,7 @@ func (s *Store) RemoveTenant(tenant string) ([]string, error) {
 			ids = append(ids, r.ID)
 		}
 	}
+	c.endSessionsLocked(tenant, "")
 	c.mu.Unlock()
 	sort.Strings(ids)
 	return ids, c.save()
@@ -573,8 +656,46 @@ func (s *Store) Update(id string, u Update) error {
 		return err
 	}
 	*r = next
+	// Disabling or expiring someone must also end the sessions they are
+	// already signed in with.
+	if next.Disabled || (next.Expires != 0 && c.now().UnixMilli() >= next.Expires) {
+		c.endSessionsLocked(s.tenant, id)
+	}
 	c.mu.Unlock()
 	return c.save()
+}
+
+// ChangePassword lets a person replace their own password, proving the
+// current one first.
+func (s *Store) ChangePassword(id, current, next string) error {
+	c := s.c
+	c.mu.RLock()
+	r, ok := c.byKey[s.tenant+"\x00"+id]
+	var pass *Password
+	if ok {
+		pass = r.Pass
+	}
+	c.mu.RUnlock()
+	if !ok {
+		return ErrNotFound
+	}
+	if pass == nil {
+		return fmt.Errorf("%w: %s has no password to change", ErrInvalid, id)
+	}
+	if !pass.verify(current) {
+		return fmt.Errorf("%w: the current password is wrong", ErrInvalid)
+	}
+	return s.SetPassword(id, "", next)
+}
+
+// EmailOf returns an identity's sign-in address, if it has one.
+func (s *Store) EmailOf(id string) string {
+	s.c.mu.RLock()
+	defer s.c.mu.RUnlock()
+	if r, ok := s.c.byKey[s.tenant+"\x00"+id]; ok {
+		return r.Email
+	}
+	return ""
 }
 
 // Rotate replaces one secret: "token", "primary" or "secondary". The old
@@ -665,14 +786,18 @@ func (s *Store) KeysOf(id string) (Secrets, error) {
 // Credential is a stored identity as exported in a config backup: hashes
 // and (encrypted, with a master key) keys, never tokens, so a restore keeps
 // existing tokens working.
+// It carries the email and the password verifier (never a password), so
+// restoring a backup leaves people able to sign in.
 type Credential struct {
 	Identity
-	Hash     string `json:"hash,omitempty"`
-	Keys     *Keys  `json:"keys,omitempty"`
-	Disabled bool   `json:"disabled,omitempty"`
-	Expires  int64  `json:"expires,omitempty"`
-	Created  int64  `json:"created"`
-	Note     string `json:"note,omitempty"`
+	Hash     string    `json:"hash,omitempty"`
+	Keys     *Keys     `json:"keys,omitempty"`
+	Email    string    `json:"email,omitempty"`
+	Pass     *Password `json:"pass,omitempty"`
+	Disabled bool      `json:"disabled,omitempty"`
+	Expires  int64     `json:"expires,omitempty"`
+	Created  int64     `json:"created"`
+	Note     string    `json:"note,omitempty"`
 }
 
 // Persistent reports whether credentials are saved to a file.
@@ -812,8 +937,10 @@ type DeviceInfo struct {
 	Note     string `json:"note,omitempty"`
 	Disabled bool   `json:"disabled,omitempty"`
 	Expires  int64  `json:"expires,omitempty"`
-	Token    bool   `json:"token"` // has a token
-	Keys     bool   `json:"keys"`  // has SAS keys
+	Token    bool   `json:"token"`           // has a token
+	Keys     bool   `json:"keys"`            // has SAS keys
+	Email    string `json:"email,omitempty"` // signs in with this address
+	Password bool   `json:"password"`        // has a password set
 }
 
 func (s *Store) List() []DeviceInfo {
@@ -821,9 +948,63 @@ func (s *Store) List() []DeviceInfo {
 	out := make([]DeviceInfo, len(recs))
 	for i, r := range recs {
 		out[i] = DeviceInfo{Identity: r.Identity, Created: r.Created, Note: r.Note, Disabled: r.Disabled,
-			Expires: r.Expires, Token: r.Hash != "", Keys: r.Keys != nil}
+			Expires: r.Expires, Token: r.Hash != "", Keys: r.Keys != nil,
+			Email: r.Email, Password: r.Pass != nil}
 	}
 	return out
+}
+
+// SetPassword sets or replaces a person's password, and optionally their
+// email address (empty keeps the current one). Sessions already signed in
+// are unaffected; the caller drops them if it wants to.
+func (s *Store) SetPassword(id, email, password string) error {
+	c := s.c
+	c.mu.Lock()
+	r, ok := c.byKey[s.tenant+"\x00"+id]
+	if !ok {
+		c.mu.Unlock()
+		return ErrNotFound
+	}
+	if !CanSignIn(r.Role) {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: %s signs in with a token or keys, not a password", ErrInvalid, r.Role)
+	}
+	next := *r
+	c.mu.Unlock() // hashing is deliberately slow: don't hold the lock for it
+
+	if email != "" {
+		e, err := NormalEmail(email)
+		if err != nil {
+			return err
+		}
+		next.Email = e
+	}
+	if next.Email == "" {
+		return fmt.Errorf("%w: an email address is needed to sign in", ErrInvalid)
+	}
+	pass, err := NewPassword(password)
+	if err != nil {
+		return err
+	}
+	next.Pass = pass
+
+	c.mu.Lock()
+	cur, ok := c.byKey[s.tenant+"\x00"+id]
+	if !ok { // removed while we hashed
+		c.mu.Unlock()
+		return ErrNotFound
+	}
+	if other, taken := c.byEmail[next.Email]; taken && other != cur {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: %s already signs in here", ErrExists, next.Email)
+	}
+	c.drop(cur)
+	*cur = next
+	c.put(cur)
+	// A new password signs out everywhere else, as people expect.
+	c.endSessionsLocked(s.tenant, id)
+	c.mu.Unlock()
+	return c.save()
 }
 
 // Exists reports whether an identity exists in this tenant.
@@ -884,6 +1065,14 @@ func (s *Store) Load() error {
 				}
 			}
 			migrate = true
+		}
+		// Two accounts on one address would make sign-in ambiguous, so refuse
+		// to start rather than pick one.
+		if r.Email != "" {
+			if other, dup := c.byEmail[r.Email]; dup {
+				c.mu.Unlock()
+				return fmt.Errorf("%s: %s is the sign-in address of both %s and %s", c.path, r.Email, other.ID, r.ID)
+			}
 		}
 		c.put(r)
 	}

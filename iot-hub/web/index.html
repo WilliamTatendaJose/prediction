@@ -16,16 +16,28 @@
   <script type="module" src="app.js"></script>
 </head>
 <body>
-  <!-- Sign-in: shown instead of the app when the hub needs a token. -->
+  <!-- Sign-in: shown instead of the app when the hub needs credentials.
+       People use an email and password; a token is the fallback for
+       platform operators and anyone handed one. -->
   <div id="signin" class="signin" hidden>
     <form id="signin-form" class="signin-card">
       <div class="brand big"><img src="icon.svg" alt="" width="36" height="36"><span>IoT Hub</span></div>
       <h1>Sign in</h1>
-      <p class="muted">Use the access token your administrator gave you. Platform operators use the superadmin token.</p>
-      <label class="field"><span class="field-label">Access token</span>
-        <input id="signin-token" type="password" autocomplete="current-password" required spellcheck="false"></label>
+      <div id="signin-password">
+        <p class="muted">Use the email address and password your administrator set up for you.</p>
+        <label class="field"><span class="field-label">Email</span>
+          <input id="signin-email" type="email" autocomplete="username" spellcheck="false" autocapitalize="none"></label>
+        <label class="field"><span class="field-label">Password</span>
+          <input id="signin-pass" type="password" autocomplete="current-password"></label>
+      </div>
+      <div id="signin-tokenbox" hidden>
+        <p class="muted">Paste the access token you were given. Platform operators use the superadmin token.</p>
+        <label class="field"><span class="field-label">Access token</span>
+          <input id="signin-token" type="password" autocomplete="one-time-code" spellcheck="false"></label>
+      </div>
       <p id="signin-err" class="err" role="alert"></p>
       <button class="btn primary block" type="submit">Sign in</button>
+      <button id="signin-mode" class="btn ghost block" type="button">Use an access token instead</button>
       <button id="signin-public" class="btn ghost block" type="button" hidden>Continue without signing in</button>
     </form>
   </div>
@@ -46,6 +58,7 @@
         <div class="foot-actions">
           <button id="theme" class="btn ghost icon" type="button" title="Switch light / dark" aria-label="Switch light or dark theme"></button>
           <button id="install" class="btn ghost" type="button" hidden>Install app</button>
+          <button id="passwd" class="btn ghost" type="button" hidden>Change password</button>
           <button id="logout" class="btn ghost" type="button" hidden>Sign out</button>
           <button id="login" class="btn ghost" type="button" hidden>Sign in</button>
         </div>

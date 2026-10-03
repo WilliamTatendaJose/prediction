@@ -168,16 +168,14 @@ func (g *Gateway) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (g *Gateway) login(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token string `json:"token"`
-	}
+	var req api.LoginReq
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	id, ok := g.Creds.Authenticate(req.Token)
+	id, cookie, ok := api.SignIn(g.Creds, req)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, errors.New("invalid token"))
+		writeErr(w, http.StatusUnauthorized, errors.New("wrong email, password or token"))
 		return
 	}
 	if id.Role != auth.Superadmin {
@@ -187,14 +185,17 @@ func (g *Gateway) login(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: api.CookieName, Value: req.Token, Path: "/", HttpOnly: true,
+		Name: api.CookieName, Value: cookie, Path: "/", HttpOnly: true,
 		Secure: g.SecureCookies, SameSite: http.SameSiteStrictMode,
 		Expires: time.Now().Add(30 * 24 * time.Hour),
 	})
 	writeJSON(w, http.StatusOK, id)
 }
 
-func (g *Gateway) logout(w http.ResponseWriter, _ *http.Request) {
+func (g *Gateway) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(api.CookieName); err == nil {
+		g.Creds.EndSession(c.Value)
+	}
 	http.SetCookie(w, &http.Cookie{Name: api.CookieName, Value: "", Path: "/", HttpOnly: true,
 		Secure: g.SecureCookies, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
@@ -224,6 +225,11 @@ func (g *Gateway) me(w http.ResponseWriter, r *http.Request) {
 		out["deviceSelfService"] = in.DeviceSelfService
 	}
 	out["grafana"] = g.Platform.Grafana != nil
+	if id.Tenant != "" {
+		if e := g.Creds.Tenant(id.Tenant).EmailOf(id.ID); e != "" {
+			out["email"] = e // signed in with a password, so can change it
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
