@@ -180,9 +180,12 @@ func TestCommandBatch(t *testing.T) {
 	if code, _, _ := call(t, "POST", s.url+"/api/commands/close/run", op, `{"devices":["valve-1"],"retry":{"attempts":3,"every":"1m"}}`); code != 400 {
 		t.Errorf("retries on a message command accepted: %d", code)
 	}
-	code, rb, raw := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"10m"}}`)
-	if code != 202 {
-		t.Fatalf("retry batch %d %s", code, raw)
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"1m","backoff":20}}`); code != 400 {
+		t.Errorf("backoff 20 accepted: %d", code)
+	}
+	code, rb, raw := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"10m","backoff":2,"maxEvery":"30m"}}`)
+	if r, _ := rb["retry"].(map[string]any); code != 202 || r["backoff"] != 2.0 || r["maxEvery"] != "30m" {
+		t.Fatalf("backoff policy not kept: %d %s", code, raw)
 	}
 	time.Sleep(300 * time.Millisecond)
 	_, rb, raw = call(t, "GET", s.url+"/api/commands/batches/"+rb["id"].(string), op, "")

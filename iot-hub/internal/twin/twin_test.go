@@ -596,3 +596,80 @@ func must(b Batch, err error) Batch {
 	}
 	return b
 }
+
+func TestRetryBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		p    RetryPolicy
+		want []time.Duration
+	}{
+		{RetryPolicy{Attempts: 4, Every: "1m"}, []time.Duration{time.Minute, time.Minute, time.Minute, time.Minute}},
+		{RetryPolicy{Attempts: 4, Every: "1m", Backoff: 2}, []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute}},
+		{RetryPolicy{Attempts: 4, Every: "1m", Backoff: 3, MaxEvery: "10m"}, []time.Duration{time.Minute, 3 * time.Minute, 9 * time.Minute, 10 * time.Minute}},
+		{RetryPolicy{Attempts: 4, Every: "1h", Backoff: 10}, []time.Duration{time.Hour, 10 * time.Hour, 24 * time.Hour, 24 * time.Hour}}, // default cap
+		{RetryPolicy{Attempts: 3, Every: "10s", Backoff: 1.5}, []time.Duration{10 * time.Second, 15 * time.Second, 22500 * time.Millisecond}},
+	} {
+		if err := tc.p.validate(); err != nil {
+			t.Fatalf("%+v: %v", tc.p, err)
+		}
+		for i, w := range tc.want {
+			if got := tc.p.Wait(i + 1); got != w {
+				t.Errorf("%+v retry %d: %v, want %v", tc.p, i+1, got, w)
+			}
+		}
+	}
+	if w := (&RetryPolicy{Attempts: 10, Every: "1m", Backoff: 10}).Wait(400); w != 24*time.Hour {
+		t.Errorf("overflow not capped: %v", w)
+	}
+	for _, bad := range []RetryPolicy{
+		{Attempts: 2, Every: "1m", Backoff: 0.5},
+		{Attempts: 2, Every: "1m", Backoff: 11},
+		{Attempts: 2, Every: "5m", Backoff: 2, MaxEvery: "1m"}, // cap under the first wait
+		{Attempts: 2, Every: "5m", Backoff: 2, MaxEvery: "48h"},
+		{Attempts: 2, Every: "5m", Backoff: 2, MaxEvery: "soon"},
+	} {
+		if bad.validate() == nil {
+			t.Errorf("accepted %+v", bad)
+		}
+	}
+
+	// In a batch: the second wait is twice the first.
+	s, _ := newSvc(t, "")
+	now := time.UnixMilli(1_000_000_000_000)
+	var mu sync.Mutex
+	s.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "1s"})
+	b := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 3, Every: "1m", Backoff: 2}))
+	wait := func() Batch {
+		for i := 0; i < 200; i++ {
+			x, _ := s.GetBatch(b.ID)
+			if x.NextRetry != 0 || x.Finished != 0 {
+				return x
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("round never ended")
+		return Batch{}
+	}
+	t0 := s.now().UnixMilli()
+	if x := wait(); x.NextRetry-t0 != time.Minute.Milliseconds() {
+		t.Fatalf("first wait %d ms", x.NextRetry-t0)
+	}
+	advance(time.Minute)
+	s.Tick()
+	t1 := s.now().UnixMilli()
+	if x := wait(); x.Round != 2 || x.NextRetry-t1 != (2*time.Minute).Milliseconds() {
+		t.Fatalf("second wait %d ms (round %d)", x.NextRetry-t1, x.Round)
+	}
+	advance(time.Minute) // only half of the 2 min
+	s.Tick()
+	if x, _ := s.GetBatch(b.ID); x.Round != 2 {
+		t.Fatal("retried before the backed-off wait")
+	}
+	advance(time.Minute)
+	s.Tick()
+	t2 := s.now().UnixMilli()
+	if x := wait(); x.Round != 3 || x.NextRetry-t2 != (4*time.Minute).Milliseconds() {
+		t.Fatalf("third wait %d ms (round %d)", x.NextRetry-t2, x.Round)
+	}
+}

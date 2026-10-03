@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,10 +105,17 @@ func (s *Service) RunBatch(name, by string, devices []string, skip map[string]st
 
 // RetryPolicy: automatic retries of a batch's devices that failed in a way
 // a later attempt may fix (AutoRetry).
+//
+// The wait before retry n (n = 1, 2, …) is Every × Backoff^(n-1), capped at
+// MaxEvery: every 1m with backoff 2 waits 1m, 2m, 4m, 8m …
 type RetryPolicy struct {
-	Attempts int    `json:"attempts"` // extra attempts after the first: 1-10 (0 = none)
-	Every    string `json:"every"`    // wait between rounds: 10s to 24h
+	Attempts int     `json:"attempts"`           // extra attempts after the first: 1-10 (0 = none)
+	Every    string  `json:"every"`              // first wait: 10s to 24h
+	Backoff  float64 `json:"backoff,omitempty"`  // multiplier per retry: 1-10; 0 or 1 = fixed interval
+	MaxEvery string  `json:"maxEvery,omitempty"` // longest single wait (default 24h)
 }
+
+const maxWait = 24 * time.Hour
 
 func (p *RetryPolicy) validate() error {
 	if p == nil || p.Attempts == 0 {
@@ -116,13 +124,38 @@ func (p *RetryPolicy) validate() error {
 	if p.Attempts < 0 || p.Attempts > 10 {
 		return invalid("retry attempts: 1 to 10 (0 for none)")
 	}
-	if d, err := time.ParseDuration(p.Every); err != nil || d < 10*time.Second || d > 24*time.Hour {
+	d, err := time.ParseDuration(p.Every)
+	if err != nil || d < 10*time.Second || d > maxWait {
 		return invalid("retry every: 10s to 24h")
+	}
+	if p.Backoff != 0 && (p.Backoff < 1 || p.Backoff > 10) {
+		return invalid("retry backoff: a multiplier from 1 (fixed) to 10")
+	}
+	if p.MaxEvery != "" {
+		m, err := time.ParseDuration(p.MaxEvery)
+		if err != nil || m < d || m > maxWait {
+			return invalid("retry maxEvery: from the first wait up to 24h")
+		}
 	}
 	return nil
 }
 
-func (p *RetryPolicy) every() time.Duration { d, _ := time.ParseDuration(p.Every); return d }
+// Wait is how long to wait before retry n (1-based).
+func (p *RetryPolicy) Wait(n int) time.Duration {
+	d, _ := time.ParseDuration(p.Every)
+	limit := maxWait
+	if p.MaxEvery != "" {
+		limit, _ = time.ParseDuration(p.MaxEvery)
+	}
+	w := float64(d)
+	if p.Backoff > 1 {
+		w *= math.Pow(p.Backoff, float64(n-1)) // +Inf for huge n: capped below
+	}
+	if w > float64(limit) || math.IsInf(w, 0) {
+		return limit
+	}
+	return time.Duration(w)
+}
 
 // AutoRetry: failures a later attempt may fix by itself. A device that
 // refused the command is not retried automatically (Resend is still there).
@@ -286,7 +319,8 @@ func (s *Service) afterRoundLocked(b *Batch, now int64) {
 	}
 	if again {
 		if b.NextRetry == 0 {
-			b.NextRetry = now + b.Retry.every().Milliseconds()
+			// The round that just ran was retry Round-1; the next is Round.
+			b.NextRetry = now + b.Retry.Wait(b.Round).Milliseconds()
 		}
 		return
 	}

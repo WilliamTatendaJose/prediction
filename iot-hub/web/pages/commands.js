@@ -143,18 +143,50 @@ export async function render(el, ctx) {
 // the batch on its own page.
 // Retry controls: {el, read() → {attempts, every}}; attempts 0 = off.
 const EVERY = [['30s', '30 seconds'], ['1m', '1 minute'], ['5m', '5 minutes'], ['15m', '15 minutes'], ['1h', '1 hour']];
+// Go-style durations, as the server reads them (10s, 5m, 1h30m).
+const dur = (t) => { let ms = 0; for (const [, n, u] of String(t).matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/g)) ms += n * { ms: 1, s: 1e3, m: 6e4, h: 36e5 }[u]; return ms; };
+const fmtDur = (ms) => (ms >= 36e5 ? `${+(ms / 36e5).toFixed(1)} h` : ms >= 6e4 ? `${+(ms / 6e4).toFixed(1)} min` : `${Math.round(ms / 1e3)} s`);
+// The wait before retry n, as twin.RetryPolicy.Wait: every × backoff^(n-1), capped.
+export function retryWait(p, n) {
+  const cap = p.maxEvery ? dur(p.maxEvery) : 24 * 36e5;
+  return Math.min(dur(p.every) * Math.pow(p.backoff > 1 ? p.backoff : 1, n - 1), cap);
+}
+const retryText = (p) => `every ${p.every}${p.backoff > 1 ? ` ×${p.backoff}` : ''}${p.maxEvery ? ` (max ${p.maxEvery})` : ''}`;
+
+// Retry controls: {el, read() → policy}; attempts 0 = off.
 function retryControls(p) {
   const on = h('input', { type: 'checkbox', checked: !!p?.attempts });
   const attempts = h('select', { 'aria-label': 'Retry attempts' }, [1, 2, 3, 5, 10].map((n) => opt(String(n), `${n} more time${n === 1 ? '' : 's'}`, n === (p?.attempts || 3))));
-  const every = h('select', { 'aria-label': 'Retry every' }, EVERY.map(([v, t]) => opt(v, 'every ' + t, v === (p?.every || '5m'))));
-  if (p?.every && !EVERY.some(([v]) => v === p.every)) every.append(opt(p.every, 'every ' + p.every, true));
-  const more = h('div', { class: 'row' }, attempts, every);
-  const sync = () => { more.hidden = !on.checked; };
-  on.onchange = sync; sync();
+  const every = h('select', { 'aria-label': 'First wait' }, EVERY.map(([v, t]) => opt(v, 'first after ' + t, v === (p?.every || '5m'))));
+  if (p?.every && !EVERY.some(([v]) => v === p.every)) every.append(opt(p.every, 'first after ' + p.every, true));
+  const backoff = h('select', { 'aria-label': 'Backoff' }, [[1, 'same wait each time'], [2, 'doubling the wait'], [3, 'tripling the wait']].map(([v, t]) => opt(String(v), t, v === (p?.backoff || 1))));
+  if (p?.backoff > 1 && ![2, 3].includes(p.backoff)) backoff.append(opt(String(p.backoff), `×${p.backoff} each time`, true));
+  const cap = h('select', { 'aria-label': 'Longest wait' }, [['', 'no longer than 24 h'], ['5m', 'no longer than 5 min'], ['15m', 'no longer than 15 min'], ['1h', 'no longer than 1 h'], ['6h', 'no longer than 6 h']]
+    .map(([v, t]) => opt(v, t, v === (p?.maxEvery || ''))));
+  if (p?.maxEvery && !['5m', '15m', '1h', '6h'].includes(p.maxEvery)) cap.append(opt(p.maxEvery, 'no longer than ' + p.maxEvery, true));
+  const preview = h('span', { class: 'hint' });
+  const read = () => {
+    if (!on.checked) return { attempts: 0 };
+    const r = { attempts: Number(attempts.value), every: every.value };
+    if (Number(backoff.value) > 1) { r.backoff = Number(backoff.value); if (cap.value) r.maxEvery = cap.value; }
+    return r;
+  };
+  const more = h('div', { class: 'stack', style: 'gap:6px' }, h('div', { class: 'row' }, attempts, every, backoff, cap), preview);
+  const sync = () => {
+    more.hidden = !on.checked;
+    cap.hidden = Number(backoff.value) <= 1;
+    const r = read();
+    if (!r.attempts) return;
+    const waits = Array.from({ length: r.attempts }, (_, i) => retryWait(r, i + 1));
+    const total = waits.reduce((a, b) => a + b, 0);
+    preview.textContent = `Waits ${waits.map(fmtDur).join(', ')} between tries; the last retry comes about ${fmtDur(total)} after the first try (plus each round's own time).`;
+  };
+  for (const x of [on, attempts, every, backoff, cap]) x.onchange = sync;
+  sync();
   return {
     el: h('div', { class: 'stack', style: 'gap:6px' }, field('Retry devices that are offline or don\'t answer', on, { cls: 'check' }), more,
       h('span', { class: 'hint', text: 'Only offline, no answer, errors and restarts are retried; a device that refuses is not.' })),
-    read: () => (on.checked ? { attempts: Number(attempts.value), every: every.value } : { attempts: 0 }),
+    read,
   };
 }
 
@@ -226,7 +258,7 @@ async function batchView(el, ctx, id) {
         }) : null,
       sub: h('span', { class: 'page-sub' }, b.cancelled ? badge('Retries cancelled', 'neutral') : b.finished ? (b.interrupted ? badge('Interrupted by a restart', 'warning') : badge('Finished', 'good'))
           : b.nextRetry ? badge(`Retrying at ${new Date(b.nextRetry).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`, 'info') : badge('Running', 'info'),
-        b.retry && h('span', { class: 'chip', text: `round ${b.round} of ${b.retry.attempts + 1} · every ${b.retry.every}` }),
+        b.retry && h('span', { class: 'chip', text: `round ${b.round} of ${b.retry.attempts + 1} · ${retryText(b.retry)}` }),
         h('span', { text: `sent by ${b.by} ${ago(b.at)}` }), b.params && Object.keys(b.params).length ? h('span', { class: 'chip mono', text: JSON.stringify(b.params) }) : null,
         b.retryOf ? h('span', {}, 'resend of ', link(b.retryOf, 'an earlier batch')) : null,
         b.retries?.length ? h('span', {}, 'resent: ', b.retries.map((x, i) => [i ? ', ' : '', link(x, `#${i + 1}`)])) : null),

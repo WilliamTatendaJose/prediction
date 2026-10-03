@@ -1082,16 +1082,18 @@ curl https://hub:8443/api/commands -H "$OP"                    # catalog, device
     - the result is a new batch, linked both ways (`retryOf`, `retries`), run with the resender's own permissions and audited (`command.resend`);
     - 409 while the batch still runs or when nothing failed; an app may resend only its own batches.
   - **Automatic retries** (direct methods). A command can carry a default `"retry":{"attempts":3,"every":"5m"}`, and a batch request can set its own (`"retry":{"attempts":0}` turns it off).
+    - **Backoff:** `"backoff":2` multiplies the wait each time (every 1m: 1, 2, 4, 8 min …), up to `"maxEvery"` (default 24 h). 1 or omitted keeps a fixed interval. The dialog previews the whole schedule before sending, and its arithmetic matches the server's on the test cases. There is no random jitter: retries already go out as one round per batch, 16 devices at a time.
     - **What is retried:** devices that were offline, didn't answer, hit an error or were interrupted by a restart. They are tried again each interval, up to the extra attempts, in the same batch; each attempt is in the device's history.
     - **What is not:** a device that refused the command (status ≥ 400). Messages aren't retried here either: the queue already redelivers them.
     - **Batch state while waiting:** the batch stays open (`nextRetry`, `round`; devices show `retrying` and their attempts), and a manual resend waits until it finishes.
     - **Timing:** rounds start on the twin service's 5 s tick, so the interval is honoured to within about 5 s.
     - **Restarts:** waiting retries are saved and carry on after a restart; a round cut short counts as an attempt and is retried.
     - **Cancel:** `POST /api/commands/batches/{id}/cancel` (**Cancel retries**) stops what is pending. Calls in flight finish, and cancelled devices can still be resent by hand.
-    - **Limits:** 1–10 extra attempts; 10 s to 24 h between rounds.
+    - **Limits:** 1–10 extra attempts; the first wait 10 s to 24 h; backoff ×1 to ×10; no single wait longer than 24 h.
     - **Tested:**
       - a unit test with a controlled clock: retry timing, a device recovering in round 2, the last round giving up (3 runs in its history), refusals not retried, cancel, attempts 0, and restarts both while waiting and mid-round;
       - a gateway test of the API, policy validation, cancel permissions and resend-after-cancel;
+      - backoff: the schedule (doubling, a cap, the 24 h ceiling, fractional multipliers, overflow) and validation in a unit test; real rounds under a controlled clock waiting 1, 2 then 4 min. Computing every wait as the first fails that test;
       - in the browser, with 2 retries every 10 s: pump-2 came online between rounds and succeeded on attempt 2; cancelling stopped pump-3's last retry.
   - **Limits.** At most 1000 devices per batch; the last 20 batches are kept.
   - **Restarts.** Batches are saved in `batches.json` next to the twins, in the same save as the device histories, so the two always agree. Saves happen at most once a second while a batch runs, and at shutdown. A batch the hub stopped in the middle of comes back finished and marked **interrupted**. Its devices that hadn't answered say so: their command may or may not have reached them, and nothing is resent by itself. A unit test covers both a finished batch and one cut short.
