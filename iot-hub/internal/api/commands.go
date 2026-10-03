@@ -257,22 +257,7 @@ func (s *Server) runBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, errors.New("no command "+name))
 		return
 	}
-	allowed := map[string]bool{}
-	for _, d := range s.commandDevices(id) {
-		allowed[d] = true
-	}
-	var run []string
-	skip := map[string]string{}
-	for _, d := range req.Devices {
-		switch {
-		case !allowed[d]:
-			skip[d] = "not a device you may command"
-		case !mayRun(id, *c, d):
-			skip[d] = "only admins may run this command"
-		default:
-			run = append(run, d)
-		}
-	}
+	run, skip := s.sortDevices(id, *c, req.Devices)
 	b, err := s.Twins.RunBatch(name, id.ID, run, skip, req.Params)
 	if err != nil {
 		storeErr(w, err)
@@ -299,4 +284,75 @@ func (s *Server) getBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, b)
+}
+
+// sortDevices splits devices into those the caller may run c on and the
+// rest, with the reason.
+func (s *Server) sortDevices(id *auth.Identity, c twin.Command, devices []string) ([]string, map[string]string) {
+	allowed := map[string]bool{}
+	for _, d := range s.commandDevices(id) {
+		allowed[d] = true
+	}
+	var run []string
+	skip := map[string]string{}
+	for _, d := range devices {
+		switch {
+		case !allowed[d]:
+			skip[d] = "not a device you may command"
+		case !mayRun(id, c, d):
+			skip[d] = "only admins may run this command"
+		default:
+			run = append(run, d)
+		}
+	}
+	return run, skip
+}
+
+// resendBatch: POST /api/commands/batches/{batch}/resend sends the same
+// command and parameters again to the devices that failed (offline, no
+// answer, refused, interrupted, undelivered message) → 202, a new batch.
+func (s *Server) resendBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.twinsOn(w) {
+		return
+	}
+	id := caller(r)
+	if !id.Can(auth.Operate, "") && !id.Can(auth.Manage, "") && id.Role != auth.Service {
+		writeErr(w, http.StatusForbidden, errors.New("commands are for operators and admins"))
+		return
+	}
+	of, failed, err := s.Twins.Failed(r.PathValue("batch"))
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	if id.Role == auth.Service && of.By != id.ID {
+		writeErr(w, http.StatusForbidden, errors.New("an app may only resend its own batches"))
+		return
+	}
+	if of.Finished == 0 {
+		writeErr(w, http.StatusConflict, errors.New("the batch is still running"))
+		return
+	}
+	if len(failed) == 0 {
+		writeErr(w, http.StatusConflict, errors.New("no device in this batch failed"))
+		return
+	}
+	var c *twin.Command
+	for _, x := range s.Twins.Commands() {
+		if x.Name == of.Command {
+			c = &x
+		}
+	}
+	if c == nil {
+		writeErr(w, http.StatusNotFound, errors.New("command "+of.Command+" no longer exists"))
+		return
+	}
+	run, skip := s.sortDevices(id, *c, failed)
+	b, err := s.Twins.Resend(of, id.ID, run, skip)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	s.audit(r, "command.resend", of.Command, fmt.Sprintf("batch %s → %s, %d devices", of.ID, b.ID, len(run)))
+	writeJSON(w, http.StatusAccepted, b)
 }

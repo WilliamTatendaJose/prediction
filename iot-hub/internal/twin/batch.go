@@ -45,15 +45,20 @@ type Batch struct {
 	Finished int64          `json:"finished,omitempty"`
 	// Interrupted: the hub stopped while it ran; devices that had not
 	// answered are marked interrupted.
-	Interrupted bool           `json:"interrupted,omitempty"`
-	Counts      map[string]int `json:"counts"`
-	Results     []BatchResult  `json:"results"`
+	Interrupted bool `json:"interrupted,omitempty"`
+	// Resends: RetryOf is the batch this one resent to the failed devices
+	// of; Retries are the batches that resent this one.
+	RetryOf string         `json:"retryOf,omitempty"`
+	Retries []string       `json:"retries,omitempty"`
+	Counts  map[string]int `json:"counts"`
+	Results []BatchResult  `json:"results"`
 }
 
 // batchLocked copies b with messages' current statuses (s.mu held).
 func (s *Service) batchLocked(b *Batch) Batch {
 	c := *b
 	c.Results = append([]BatchResult(nil), b.Results...)
+	c.Retries = append([]string(nil), b.Retries...)
 	c.Counts = map[string]int{}
 	for i, r := range c.Results {
 		if r.Message != "" {
@@ -77,6 +82,42 @@ func (s *Service) batchLocked(b *Batch) Batch {
 // the caller asked for but may not command, with the reason; they are
 // reported, not run. Parameters are checked before anything is sent.
 func (s *Service) RunBatch(name, by string, devices []string, skip map[string]string, params map[string]any) (Batch, error) {
+	return s.runBatch(name, by, devices, skip, params, "")
+}
+
+// Retryable: a device whose result is a definite failure. Successes,
+// work still in flight, skips (the command can't run there) and messages
+// whose fate is unknown are not resent.
+func Retryable(status string) bool {
+	switch status {
+	case "offline", "timeout", "failed", "error", "interrupted", "rejected", "deadlettered", "expired":
+		return true
+	}
+	return false
+}
+
+// Failed returns batch id (current statuses) and its devices to resend.
+func (s *Service) Failed(id string) (Batch, []string, error) {
+	b, err := s.GetBatch(id)
+	if err != nil {
+		return b, nil, err
+	}
+	var out []string
+	for _, r := range b.Results {
+		if Retryable(r.Status) {
+			out = append(out, r.Device)
+		}
+	}
+	return b, out, nil
+}
+
+// Resend starts a new batch of the same command and parameters on devices
+// (the caller has picked the failed ones it may command), linked both ways.
+func (s *Service) Resend(of Batch, by string, devices []string, skip map[string]string) (Batch, error) {
+	return s.runBatch(of.Command, by, devices, skip, of.Params, of.ID)
+}
+
+func (s *Service) runBatch(name, by string, devices []string, skip map[string]string, params map[string]any, retryOf string) (Batch, error) {
 	c, err := s.command(name)
 	if err != nil {
 		return Batch{}, err
@@ -88,7 +129,7 @@ func (s *Service) RunBatch(name, by string, devices []string, skip map[string]st
 		return Batch{}, invalid("at most %d devices per batch", MaxBatchDevices)
 	}
 	b := &Batch{ID: newID(), Command: c.Name, Label: c.Label, Kind: c.Kind, By: by, At: s.now().UnixMilli(), Params: params,
-		Counts: map[string]int{}}
+		Counts: map[string]int{}, RetryOf: retryOf}
 	var run []int // indexes into Results to send
 	seen := map[string]bool{}
 	for _, d := range devices {
@@ -121,6 +162,11 @@ func (s *Service) RunBatch(name, by string, devices []string, skip map[string]st
 		}
 	}
 	s.mu.Lock()
+	for _, o := range s.batches {
+		if o.ID == retryOf {
+			o.Retries = append(o.Retries, b.ID)
+		}
+	}
 	s.batches = append(s.batches, b)
 	if len(s.batches) > keepBatches {
 		s.batches = s.batches[len(s.batches)-keepBatches:]

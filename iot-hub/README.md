@@ -1076,6 +1076,11 @@ curl https://hub:8443/api/commands -H "$OP"                    # catalog, device
   - **Checked before sending.** Parameters are validated once, before anything is sent. A batch with nothing to run is refused with 400.
   - **Results follow the queue.** Message results move on with the queue (queued → completed …).
   - **Records.** Every device's run is also in its own history, tagged with the batch id, and the batch is audited (`command.batch`).
+  - **Resend to failed.** `POST /api/commands/batches/{id}/resend` (the **Resend to N failed** button) sends the same command and parameters again to the devices with a definite failure:
+    - which: offline, no answer, device refused, error, interrupted by a restart, or a message rejected, undeliverable or expired;
+    - not resent: devices that succeeded, are still in flight, were skipped, or whose message fate is unknown;
+    - the result is a new batch, linked both ways (`retryOf`, `retries`), run with the resender's own permissions and audited (`command.resend`);
+    - 409 while the batch still runs or when nothing failed; an app may resend only its own batches.
   - **Limits.** At most 1000 devices per batch; the last 20 batches are kept.
   - **Restarts.** Batches are saved in `batches.json` next to the twins, in the same save as the device histories, so the two always agree. Saves happen at most once a second while a batch runs, and at shutdown. A batch the hub stopped in the middle of comes back finished and marked **interrupted**. Its devices that hadn't answered say so: their command may or may not have reached them, and nothing is resent by itself. A unit test covers both a finished batch and one cut short.
   - **In the app:** tick devices on the Commands page (search, then "select all shown"), pick a command (the list says when it applies to only some), confirm, and follow the batch live on its own page. Recent batches are on the History tab.

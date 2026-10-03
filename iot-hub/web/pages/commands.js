@@ -170,15 +170,40 @@ function countBadges(counts) {
   return Object.entries(counts || {}).sort().map(([k, n]) => [runBadge({ status: k === 'skipped' ? 'untracked' : k }, `${n} ${RUN_LABEL[k] || k}`), ' ']);
 }
 
+// Definite failures, resent by "Resend to failed" (twin.Retryable).
+const RETRYABLE = new Set(['offline', 'timeout', 'failed', 'error', 'interrupted', 'rejected', 'deadlettered', 'expired']);
+
+async function resend(b) {
+  const failed = b.results.filter((r) => RETRYABLE.has(r.status));
+  const ok = await confirmDialog(`Resend ${b.label || b.command} to ${failed.length} device${failed.length === 1 ? '' : 's'}?`, '', {
+    ok: `Resend to ${failed.length}`,
+    details: h('div', { class: 'stack' },
+      h('p', { class: 'modal-text', text: 'The same command and parameters go again to the devices that failed. Devices that succeeded, are still waiting, or were skipped are left alone.' }),
+      b.params && Object.keys(b.params).length ? h('p', {}, 'Parameters: ', h('span', { class: 'chip mono', text: JSON.stringify(b.params) })) : null,
+      h('ul', { class: 'plan' }, failed.slice(0, 15).map((r) => h('li', {}, h('b', { text: r.device }), ' — ', RUN_LABEL[r.status] || r.status)),
+        failed.length > 15 ? h('li', { text: `and ${failed.length - 15} more` }) : null)),
+  });
+  if (!ok) return;
+  try {
+    const nb = await api(`/api/commands/batches/${enc(b.id)}/resend`, { method: 'POST' });
+    location.hash = '#/commands/batch/' + enc(nb.id);
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
 async function batchView(el, ctx, id) {
   ctx.crumbs([['Batch']]);
   const head = h('div'), body = h('div');
   el.append(head, body);
   const draw = (b) => {
+    const failed = b.results.filter((r) => RETRYABLE.has(r.status)).length;
+    const link = (x, text) => h('a', { href: '#/commands/batch/' + enc(x), text });
     head.replaceChildren(pageHeader(`${b.label || b.command} on ${b.total} device${b.total === 1 ? '' : 's'}`, {
       back: ['#/commands/history', 'Commands'],
+      actions: b.finished && failed ? button(`Resend to ${failed} failed`, () => resend(b), { kind: 'primary' }) : null,
       sub: h('span', { class: 'page-sub' }, b.interrupted ? badge('Interrupted by a restart', 'warning') : b.finished ? badge('Finished', 'good') : badge('Running', 'info'),
-        h('span', { text: `sent by ${b.by} ${ago(b.at)}` }), b.params && Object.keys(b.params).length ? h('span', { class: 'chip mono', text: JSON.stringify(b.params) }) : null),
+        h('span', { text: `sent by ${b.by} ${ago(b.at)}` }), b.params && Object.keys(b.params).length ? h('span', { class: 'chip mono', text: JSON.stringify(b.params) }) : null,
+        b.retryOf ? h('span', {}, 'resend of ', link(b.retryOf, 'an earlier batch')) : null,
+        b.retries?.length ? h('span', {}, 'resent: ', b.retries.map((x, i) => [i ? ', ' : '', link(x, `#${i + 1}`)])) : null),
     }));
     const rank = { pending: 0, error: 1, failed: 2, offline: 3, timeout: 4, skipped: 6 };
     const rows = [...b.results].sort((x, y) => (rank[x.status] ?? 5) - (rank[y.status] ?? 5) || x.device.localeCompare(y.device));

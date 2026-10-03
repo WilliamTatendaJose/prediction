@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -431,6 +432,13 @@ func TestBatchesPersist(t *testing.T) {
 	}
 	if !b.Interrupted || b.Finished == 0 || b.Done != b.Total || st["p-1"] != "interrupted" || st["p-2"] != "offline" {
 		t.Errorf("interrupted batch after restart %+v", b)
+	}
+	// Interrupted and offline devices are the ones to resend.
+	if _, f, _ := r.Failed(running.ID); fmt.Sprint(f) != "[p-1 p-2]" {
+		t.Errorf("to resend after restart: %v", f)
+	}
+	if _, f, _ := r.Failed(done.ID); len(f) != 0 {
+		t.Errorf("queued messages and skips offered for resend: %v", f)
 	}
 	// Message results still follow the queue after the restart.
 	ms, _ := r.Messages("v-1")

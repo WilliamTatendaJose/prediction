@@ -16,7 +16,7 @@ func TestCommandBatch(t *testing.T) {
 	op := issue(t, s, "acme", `{"id":"shift","role":"operator"}`)
 	view := issue(t, s, "acme", `{"id":"screen","role":"viewer"}`)
 	tok := issue(t, s, "acme", `{"id":"pump-1","role":"device","sensors":["pump-1"]}`)
-	issue(t, s, "acme", `{"id":"pump-2","role":"device","sensors":["pump-2"]}`) // never connects
+	tok2 := issue(t, s, "acme", `{"id":"pump-2","role":"device","sensors":["pump-2"]}`) // offline until the resend
 	valveTok := issue(t, s, "acme", `{"id":"valve-1","role":"device","sensors":["valve-1"]}`)
 	issue(t, s, "acme", `{"id":"valve-2","role":"device","sensors":["valve-2"]}`)
 	call(t, "PUT", s.url+"/api/commands/reboot", adm, `{"devices":["pump-*"],"kind":"method","timeout":"2s",
@@ -82,6 +82,49 @@ func TestCommandBatch(t *testing.T) {
 		t.Errorf("recent batches %s", raw)
 	}
 
+	// Resend to the failed: only pump-2 (offline) goes again, with the same
+	// parameters; this time it is connected and answers.
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/batches/"+id+"/resend", view, ""); code != 403 {
+		t.Errorf("viewer resent: %d", code)
+	}
+	dev2, err := mqttConnect(t, s, "acme/pump-2", tok2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev2.Disconnect(10)
+	box2 := &inbox{}
+	subscribe(t, dev2, "acme/devices/pump-2/#", box2.handler)
+	go func() {
+		m := box2.wait(t, "acme/devices/pump-2/methods/reboot/")
+		dev2.Publish("acme/devices/pump-2/methods/res/200/"+m.Topic()[strings.LastIndex(m.Topic(), "/")+1:], 0, false, `{"got":`+string(m.Payload())+`}`).Wait()
+	}()
+	code, m2, raw := call(t, "POST", s.url+"/api/commands/batches/"+id+"/resend", op, "")
+	if code != 202 || m2["total"].(float64) != 1 || m2["retryOf"] != id || !strings.Contains(raw, `"device":"pump-2"`) {
+		t.Fatalf("resend %d %s", code, raw)
+	}
+	rid := m2["id"].(string)
+	for i := 0; i < 50; i++ {
+		if _, m2, raw = call(t, "GET", s.url+"/api/commands/batches/"+rid, op, ""); m2["finished"] != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if c := m2["counts"].(map[string]any); c["ok"] != 1.0 || m2["by"] != "shift" {
+		t.Errorf("resent batch %s", raw)
+	}
+	_, _, raw = call(t, "GET", s.url+"/api/devices/pump-2/commands", op, "")
+	if !strings.Contains(raw, `"batch":"`+rid+`"`) || !strings.Contains(raw, `"payload":{"delay":1}`) {
+		t.Errorf("pump-2 history after resend %s", raw)
+	}
+	_, orig, _ := call(t, "GET", s.url+"/api/commands/batches/"+id, op, "")
+	if fmt.Sprint(orig["retries"]) != "["+rid+"]" {
+		t.Errorf("original batch doesn't link its resend: %v", orig["retries"])
+	}
+	// The resend has nothing left that failed.
+	if code, _, raw := call(t, "POST", s.url+"/api/commands/batches/"+rid+"/resend", op, ""); code != 409 {
+		t.Errorf("resend of a batch with no failures: %d %s", code, raw)
+	}
+
 	// A message batch: queued for every valve.
 	code, m, raw = call(t, "POST", s.url+"/api/commands/close/run", op, `{"devices":["valve-1","valve-2"]}`)
 	if code != 202 {
@@ -91,6 +134,10 @@ func TestCommandBatch(t *testing.T) {
 	_, b, raw = call(t, "GET", s.url+"/api/commands/batches/"+m["id"].(string), op, "")
 	if c := b["counts"].(map[string]any); c["queued"] != 2.0 {
 		t.Errorf("message batch %s", raw)
+	}
+	// Queued messages haven't failed: nothing to resend.
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/batches/"+m["id"].(string)+"/resend", op, ""); code != 409 {
+		t.Errorf("resend of queued messages: %d", code)
 	}
 	// valve-1 picks its message up over HTTP and completes it: the batch
 	// follows the queue.
