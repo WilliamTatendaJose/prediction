@@ -1,0 +1,365 @@
+{
+  "uid": "iothub-overview",
+  "title": "IoT Hub — overview",
+  "tags": [
+    "iothub"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "sensor",
+        "label": "Sensor",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "iothub-pg"
+        },
+        "query": "SELECT DISTINCT sensor FROM series ORDER BY 1",
+        "definition": "SELECT DISTINCT sensor FROM series ORDER BY 1",
+        "refresh": 1,
+        "sort": 1
+      },
+      {
+        "name": "field",
+        "label": "Field",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "iothub-pg"
+        },
+        "query": "SELECT field FROM series WHERE sensor = '$sensor' ORDER BY 1",
+        "definition": "SELECT field FROM series WHERE sensor = '$sensor' ORDER BY 1",
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Anomalies",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "iothub-pg"
+        },
+        "enable": true,
+        "iconColor": "red",
+        "target": {
+          "refId": "Anno",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT to_timestamp(start_ts / 1000.0) AS time,\n       to_timestamp(COALESCE(end_ts, $__unixEpochTo()::bigint * 1000) / 1000.0) AS timeend,\n       kind || ': ' || message AS text, kind AS tags\nFROM anomalies\nWHERE sensor = '$sensor' AND (field = '$field' OR field = '')\n  AND start_ts < $__unixEpochTo()::bigint * 1000 AND COALESCE(end_ts, $__unixEpochTo()::bigint * 1000) >= $__unixEpochFrom()::bigint * 1000"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active anomalies",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "iothub-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "iothub-pg"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COUNT(*) AS \"active anomalies\" FROM anomalies WHERE end_ts IS NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "$sensor · $field — summary for the range",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "iothub-pg"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 20,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "iothub-pg"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH s AS (SELECT id FROM series WHERE sensor = '$sensor' AND field = '$field')\nSELECT SUM(r.sum) / NULLIF(SUM(r.n), 0) AS \"mean\",\n       MIN(r.min) AS \"min\", MAX(r.max) AS \"max\",\n       SQRT(GREATEST(0, SUM(r.sumsq) / NULLIF(SUM(r.n), 0) - POWER(SUM(r.sum) / NULLIF(SUM(r.n), 0), 2))) AS \"std dev\",\n       SUM(r.n) AS \"samples\"\nFROM rollup_1m r, s\nWHERE r.series = s.id AND r.minute >= $__unixEpochFrom()::bigint * 1000 AND r.minute < $__unixEpochTo()::bigint * 1000"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "samples"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "$sensor · $field (1-minute rollups: average with min–max band)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "iothub-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "iothub-pg"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH s AS (SELECT id FROM series WHERE sensor = '$sensor' AND field = '$field'),\n     b AS (SELECT GREATEST(1, $__interval_ms / 60000)::bigint * 60000 AS ms)\nSELECT to_timestamp(((r.minute / b.ms) * b.ms) / 1000.0) AS time,\n       SUM(r.sum) / SUM(r.n) AS \"average\",\n       MIN(r.min) AS \"minimum\",\n       MAX(r.max) AS \"maximum\"\nFROM rollup_1m r, s, b\nWHERE r.series = s.id AND r.minute >= $__unixEpochFrom()::bigint * 1000 - 60000 AND r.minute < $__unixEpochTo()::bigint * 1000\nGROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "maximum"
+            },
+            "properties": [
+              {
+                "id": "custom.fillBelowTo",
+                "value": "minimum"
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 15
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": false,
+                  "viz": false
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "minimum"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 0
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": false,
+                  "viz": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Anomalies by sensor",
+      "type": "barchart",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "iothub-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 8,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "iothub-pg"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT sensor, COUNT(*) AS \"anomalies\"\nFROM anomalies\nWHERE start_ts >= $__unixEpochFrom()::bigint * 1000 AND start_ts < $__unixEpochTo()::bigint * 1000\nGROUP BY sensor ORDER BY 2 DESC LIMIT 20"
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "auto",
+        "legend": {
+          "showLegend": false
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Anomaly log",
+      "type": "table",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "iothub-pg"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 14,
+        "w": 16,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "iothub-pg"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT to_timestamp(start_ts / 1000.0) AS \"started\",\n       CASE WHEN end_ts IS NULL THEN 'active'\n            ELSE ((end_ts - start_ts) / 1000) || ' s' END AS \"duration\",\n       sensor, NULLIF(field, '') AS field, kind, message\nFROM anomalies\nWHERE start_ts >= $__unixEpochFrom()::bigint * 1000 AND start_ts < $__unixEpochTo()::bigint * 1000\nORDER BY start_ts DESC LIMIT 500"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "$sensor — state changes (text fields)",
+      "type": "table",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "iothub-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "iothub-pg"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT to_timestamp(r.ts / 1000.0) AS \"time\", s.field, r.text AS \"value\"\nFROM readings r JOIN series s ON s.id = r.series\nWHERE s.sensor = '$sensor' AND r.text IS NOT NULL AND r.ts >= $__unixEpochFrom()::bigint * 1000 AND r.ts < $__unixEpochTo()::bigint * 1000\nORDER BY r.ts DESC LIMIT 500"
+        }
+      ]
+    }
+  ]
+}

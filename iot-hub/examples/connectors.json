@@ -1,0 +1,57 @@
+{
+  "modbus": [
+    {
+      "name": "line3-plc",
+      "url": "tcp://192.168.1.20:502",
+      "interval": "1s",
+      "units": [
+        {
+          "unitId": 1,
+          "sensor": "line3",
+          "registers": [
+            { "field": "melt_temp", "table": "holding", "address": 0, "type": "int16", "scale": 0.1, "unit": "°C" },
+            { "field": "pressure", "table": "holding", "address": 1, "type": "float32", "unit": "bar" },
+            { "field": "fault", "table": "holding", "address": 10, "bit": 3, "onChange": true },
+            { "field": "running", "table": "coil", "address": 0, "onChange": true },
+            { "field": "cycles", "table": "input", "address": 5, "type": "uint32" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rs485-meters",
+      "url": "rtu:///dev/ttyUSB0",
+      "baud": 9600, "parity": "even", "stopBits": 1,
+      "interval": "5s",
+      "units": [
+        {
+          "unitId": 2,
+          "sensor": "meter-main",
+          "registers": [
+            { "field": "voltage", "table": "input", "address": 0, "type": "float32", "order": "CDAB", "unit": "V", "deadband": 0.5 },
+            { "field": "current", "table": "input", "address": 6, "type": "float32", "order": "CDAB", "unit": "A" },
+            { "field": "energy", "table": "input", "address": 342, "type": "float32", "order": "CDAB", "unit": "kWh" }
+          ]
+        }
+      ]
+    }
+  ],
+  "opcua": [
+    {
+      "name": "press1",
+      "endpoint": "opc.tcp://192.168.1.30:4840",
+      "sensor": "press1",
+      "interval": "1s",
+      "heartbeat": "60s",
+      "securityPolicy": "Basic256Sha256",
+      "securityMode": "SignAndEncrypt",
+      "username": "iothub",
+      "password": "change-me",
+      "nodes": [
+        { "field": "barrel_temp", "nodeId": "ns=3;s=\"DB_Press\".\"BarrelTemp\"", "unit": "°C", "deadband": 0.2 },
+        { "field": "running", "nodeId": "ns=3;s=\"DB_Press\".\"Running\"" },
+        { "field": "mode", "nodeId": "ns=3;s=\"DB_Press\".\"Mode\"" }
+      ]
+    }
+  ]
+}

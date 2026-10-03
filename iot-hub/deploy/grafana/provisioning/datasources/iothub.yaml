@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: IoT Hub
+    uid: iothub-pg
+    type: grafana-postgresql-datasource
+    url: postgres:5432
+    user: grafana_ro
+    secureJsonData:
+      password: ${GRAFANA_DB_PASSWORD}
+    jsonData:
+      database: iothub
+      sslmode: disable          # same Docker network; use require/verify-full across hosts
+      postgresVersion: 1600
+      maxOpenConns: 4
+    editable: false

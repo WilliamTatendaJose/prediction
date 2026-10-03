@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>IoT Hub</title>
+  <meta name="description" content="Live sensors, alarms, devices and analytics">
+  <meta name="theme-color" content="#2a78d6">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="IoT Hub">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <!-- Sign-in: shown instead of the app when the hub needs a token. -->
+  <div id="signin" class="signin" hidden>
+    <form id="signin-form" class="signin-card">
+      <div class="brand big"><img src="icon.svg" alt="" width="36" height="36"><span>IoT Hub</span></div>
+      <h1>Sign in</h1>
+      <p class="muted">Use the access token your administrator gave you. Platform operators use the superadmin token.</p>
+      <label class="field"><span class="field-label">Access token</span>
+        <input id="signin-token" type="password" autocomplete="current-password" required spellcheck="false"></label>
+      <p id="signin-err" class="err" role="alert"></p>
+      <button class="btn primary block" type="submit">Sign in</button>
+      <button id="signin-public" class="btn ghost block" type="button" hidden>Continue without signing in</button>
+    </form>
+  </div>
+
+  <div id="app" class="shell" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="Main">
+      <div class="sidebar-top">
+        <a class="brand" href="#/overview"><img src="icon.svg" alt="" width="28" height="28"><span>IoT Hub</span></a>
+        <button id="nav-close" class="btn ghost icon mobile-only" type="button" aria-label="Close menu"></button>
+      </div>
+      <div id="workspace" class="workspace" hidden>
+        <label for="tenant" class="workspace-label">Tenant</label>
+        <select id="tenant"></select>
+      </div>
+      <nav id="nav" class="nav"></nav>
+      <div class="sidebar-foot">
+        <div id="user" class="user"></div>
+        <div class="foot-actions">
+          <button id="theme" class="btn ghost icon" type="button" title="Switch light / dark" aria-label="Switch light or dark theme"></button>
+          <button id="install" class="btn ghost" type="button" hidden>Install app</button>
+          <button id="logout" class="btn ghost" type="button" hidden>Sign out</button>
+          <button id="login" class="btn ghost" type="button" hidden>Sign in</button>
+        </div>
+      </div>
+    </aside>
+    <div id="scrim" class="scrim" hidden></div>
+    <div class="main">
+      <header class="topbar">
+        <button id="nav-open" class="btn ghost icon mobile-only" type="button" aria-label="Open menu"></button>
+        <div id="crumbs" class="crumbs"></div>
+        <div class="topbar-right">
+          <a id="bell" class="bell" href="#/alarms" hidden></a>
+          <span id="conn" class="conn" data-state="idle">Connecting…</span>
+        </div>
+      </header>
+      <div id="banner" class="banner" role="status" hidden></div>
+      <main id="page" class="page" tabindex="-1"></main>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

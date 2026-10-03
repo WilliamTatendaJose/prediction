@@ -1,0 +1,759 @@
+package twin
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	mrand "math/rand/v2"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeDevice records what the hub sends and can answer like a device.
+type fakeDevice struct {
+	mu        sync.Mutex
+	listening bool
+	sent      []string // sub + " " + payload
+	onMethod  func(sub string, payload []byte)
+}
+
+func (d *fakeDevice) transport() Transport {
+	return Transport{
+		Listening: func(id, sub string) bool { d.mu.Lock(); defer d.mu.Unlock(); return d.listening && id == "pump-1" },
+		Connected: func(id string) bool { d.mu.Lock(); defer d.mu.Unlock(); return d.listening && id == "pump-1" },
+		Send: func(id, sub string, p []byte) int {
+			d.mu.Lock()
+			if !d.listening || id != "pump-1" {
+				d.mu.Unlock()
+				return 0
+			}
+			d.sent = append(d.sent, sub+" "+string(p))
+			f := d.onMethod
+			d.mu.Unlock()
+			if f != nil && strings.HasPrefix(sub, "methods/") {
+				go f(sub, p)
+			}
+			return 1
+		},
+	}
+}
+
+func (d *fakeDevice) got() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.sent...)
+}
+
+func newSvc(t *testing.T, path string) (*Service, *fakeDevice) {
+	s := New(path, func(id string) bool { return id == "pump-1" || id == "pump-2" })
+	d := &fakeDevice{}
+	s.SetTransport(d.transport())
+	return s, d
+}
+
+func TestTwinPatchesAndVersions(t *testing.T) {
+	s, d := newSvc(t, "")
+	d.listening = true
+	if _, err := s.Get("ghost"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown device: %v", err)
+	}
+	v, _ := s.Get("pump-1")
+	etag := v.ETag
+	v, err := s.Update("pump-1", etag, []byte(`{"tags":{"site":"plant1","line":3},"properties":{"desired":{"interval":10,"thresholds":{"high":90,"low":10}}}}`))
+	if err != nil || v.Properties.Desired["$version"] != int64(1) || v.Tags["site"] != "plant1" {
+		t.Fatalf("%+v %v", v, err)
+	}
+	// A stale etag is refused; nothing changes.
+	if _, err := s.Update("pump-1", etag, []byte(`{"tags":{"site":"x"}}`)); !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("stale etag: %v", err)
+	}
+	// Merge patch: null deletes, nested objects merge.
+	v, _ = s.Update("pump-1", v.ETag, []byte(`{"properties":{"desired":{"interval":null,"thresholds":{"high":95}}}}`))
+	th := v.Properties.Desired["thresholds"].(map[string]any)
+	if _, ok := v.Properties.Desired["interval"]; ok || th["high"] != 95.0 || th["low"] != 10.0 || v.Properties.Desired["$version"] != int64(2) {
+		t.Fatalf("merge: %+v", v.Properties.Desired)
+	}
+	// The device was sent each desired patch, nulls included.
+	sent := d.got()
+	if len(sent) != 2 || !strings.Contains(sent[1], `"interval":null`) || !strings.Contains(sent[1], `"$version":2`) || !strings.HasPrefix(sent[1], "twin/desired ") {
+		t.Fatalf("pushed %v", sent)
+	}
+	// Tags-only changes are not pushed (tags are cloud-only).
+	s.Update("pump-1", "", []byte(`{"tags":{"owner":"maint"}}`))
+	if len(d.got()) != 2 {
+		t.Fatal("tags pushed to the device")
+	}
+	// The device reports; it sees desired and reported, not tags.
+	if ver, err := s.Report("pump-1", []byte(`{"firmware":"1.4.2","interval":10}`)); err != nil || ver != 1 {
+		t.Fatalf("report %v %v", ver, err)
+	}
+	dv := s.DeviceView("pump-1")
+	if _, ok := dv["tags"]; ok || dv["reported"].(map[string]any)["firmware"] != "1.4.2" {
+		t.Fatalf("device view %v", dv)
+	}
+	v, _ = s.Get("pump-1")
+	if v.Version != 5 || v.ConnectionState != "Connected" {
+		t.Fatalf("version %d state %s", v.Version, v.ConnectionState)
+	}
+	// Validation.
+	for name, body := range map[string]string{
+		"reserved key":  `{"properties":{"desired":{"$version":5}}}`,
+		"dotted key":    `{"tags":{"a.b":1}}`,
+		"too deep":      `{"tags":{"a":{"b":{"c":{"d":{"e":{"f":1}}}}}}}`,
+		"unknown field": `{"properties":{"reported":{"x":1}}}`,
+		"object array":  `{"tags":{"a":[{"b":1}]}}`,
+		"too big":       `{"properties":{"desired":{"blob":"` + strings.Repeat("x", MaxDesired) + `"}}}`,
+	} {
+		if _, err := s.Update("pump-1", "", []byte(body)); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if _, err := s.Report("pump-1", []byte(`[1,2]`)); err == nil {
+		t.Error("non-object reported accepted")
+	}
+}
+
+func TestQueryAndBulkUpdate(t *testing.T) {
+	s, d := newSvc(t, "")
+	d.listening = true
+	s.Update("pump-1", "", []byte(`{"tags":{"site":"plant1"}}`))
+	s.Update("pump-2", "", []byte(`{"tags":{"site":"plant2"}}`))
+	s.Report("pump-1", []byte(`{"firmware":"1.4"}`))
+	ids := []string{"pump-1", "pump-2"}
+	f, _ := ParseFilters([]string{"tags.site=plant1", "properties.reported.firmware=1.4"})
+	if got := s.Query(ids, f); len(got) != 1 || got[0].DeviceID != "pump-1" {
+		t.Fatalf("query %v", got)
+	}
+	f, _ = ParseFilters([]string{"connectionState=Disconnected"})
+	if got := s.Query(ids, f); len(got) != 1 || got[0].DeviceID != "pump-2" {
+		t.Fatalf("connection state query %v", got)
+	}
+	f, _ = ParseFilters([]string{"tags.site=plant2"})
+	changed, err := s.UpdateMany(ids, f, []byte(`{"properties":{"desired":{"interval":30}}}`))
+	if err != nil || len(changed) != 1 || changed[0] != "pump-2" {
+		t.Fatalf("bulk %v %v", changed, err)
+	}
+	if v, _ := s.Get("pump-1"); v.Properties.Desired["interval"] != nil {
+		t.Fatal("bulk update touched a non-matching twin")
+	}
+}
+
+func TestDirectMethods(t *testing.T) {
+	s, d := newSvc(t, "")
+	ctx := context.Background()
+	if _, err := s.Invoke(ctx, "pump-1", "reboot", nil, time.Second); !errors.Is(err, ErrOffline) {
+		t.Fatalf("offline: %v", err)
+	}
+	d.listening = true
+	d.onMethod = func(sub string, p []byte) {
+		parts := strings.Split(sub, "/") // methods/{name}/{rid}
+		rid := parts[2]
+		// Another device answering is ignored.
+		s.HandleMQTT("pump-2", "methods/res/200/"+rid, []byte(`{"hijacked":true}`))
+		if parts[1] == "slow" {
+			return
+		}
+		if parts[1] == "text" {
+			s.HandleMQTT("pump-1", "methods/res/200/"+rid, []byte(`done`))
+			return
+		}
+		s.HandleMQTT("pump-1", "methods/res/202/"+rid, []byte(`{"rebooting_in":`+string(p)+`}`))
+	}
+	r, err := s.Invoke(ctx, "pump-1", "reboot", json.RawMessage(`5`), time.Second)
+	if err != nil || r.Status != 202 || string(r.Payload) != `{"rebooting_in":5}` {
+		t.Fatalf("invoke %+v %v", r, err)
+	}
+	r, err = s.Invoke(ctx, "pump-1", "text", nil, time.Second)
+	if err != nil || string(r.Payload) != `"done"` {
+		t.Fatalf("non-JSON answer %+v %v", r, err)
+	}
+	start := time.Now()
+	if _, err := s.Invoke(ctx, "pump-1", "slow", nil, 200*time.Millisecond); !errors.Is(err, ErrTimeout) || time.Since(start) > time.Second {
+		t.Fatalf("timeout: %v", err)
+	}
+	if _, err := s.Invoke(ctx, "pump-1", "bad/name", nil, time.Second); err == nil {
+		t.Fatal("bad method name accepted")
+	}
+	if _, err := s.Invoke(ctx, "pump-1", "x", json.RawMessage(`{not json`), time.Second); err == nil {
+		t.Fatal("bad payload accepted")
+	}
+	if len(s.pending) != 0 {
+		t.Fatal("pending calls leak")
+	}
+}
+
+func TestCloudToDeviceMessages(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "twins.json")
+	s, d := newSvc(t, p)
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+
+	// Offline: queued.
+	m1, err := s.Send("pump-1", json.RawMessage(`{"cmd":"close-valve"}`), 0)
+	if err != nil || m1.Status != "queued" || len(d.got()) != 0 {
+		t.Fatalf("queued: %+v %v", m1, err)
+	}
+	m2, _ := s.Send("pump-1", json.RawMessage(`plain text`), 2*time.Minute)
+	// The device subscribes: both delivered, in order.
+	d.listening = true
+	s.Listening("pump-1")
+	got := d.got()
+	if len(got) != 2 || got[0] != "messages/"+m1.ID+` {"cmd":"close-valve"}` || got[1] != "messages/"+m2.ID+` "plain text"` {
+		t.Fatalf("delivered %v", got)
+	}
+	// It completes the first; the second is not settled and its lock runs
+	// out: it is delivered again.
+	s.HandleMQTT("pump-1", "messages/complete/"+m1.ID, nil)
+	now = now.Add(30 * time.Second)
+	s.Tick()
+	if len(d.got()) != 2 {
+		t.Fatal("redelivered while still locked")
+	}
+	now = now.Add(31 * time.Second)
+	s.Tick()
+	if got := d.got(); len(got) != 3 || !strings.HasPrefix(got[2], "messages/"+m2.ID) {
+		t.Fatalf("redelivery %v", got)
+	}
+	// Expiry (m2 has a 2-minute TTL).
+	now = now.Add(time.Minute)
+	s.Tick()
+	ms, _ := s.Messages("pump-1")
+	st := map[string]string{}
+	for _, m := range ms {
+		st[m.ID] = m.Status
+	}
+	if st[m1.ID] != "completed" || st[m2.ID] != "expired" {
+		t.Fatalf("statuses %v", st)
+	}
+
+	// Never completed: dead-lettered after MaxDeliveries.
+	m3, _ := s.Send("pump-1", json.RawMessage(`1`), 2*time.Hour)
+	for i := 0; i < MaxDeliveries+1; i++ {
+		now = now.Add(LockTime + time.Second)
+		s.Tick()
+	}
+	ms, _ = s.Messages("pump-1")
+	if ms[0].ID != m3.ID || ms[0].Status != "deadlettered" || ms[0].Deliveries != MaxDeliveries {
+		t.Fatalf("dead letter %+v", ms[0])
+	}
+
+	// HTTP devices poll: receive locks it, complete settles it.
+	d.listening = false
+	m4, _ := s.Send("pump-1", json.RawMessage(`{"cmd":"x"}`), 0)
+	r, _ := s.Receive("pump-1")
+	if r == nil || r.ID != m4.ID {
+		t.Fatalf("receive %+v", r)
+	}
+	if r2, _ := s.Receive("pump-1"); r2 != nil {
+		t.Fatal("locked message handed out twice")
+	}
+	if err := s.Settle("pump-1", m4.ID, "complete"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Settle("pump-1", m4.ID, "complete"); err == nil {
+		t.Fatal("settled twice")
+	}
+
+	// The queue is bounded.
+	for i := 0; i < MaxQueued; i++ {
+		if _, err := s.Send("pump-1", json.RawMessage(`1`), 0); err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+	}
+	if _, err := s.Send("pump-1", json.RawMessage(`1`), 0); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("queue full: %v", err)
+	}
+	if _, err := s.Send("pump-1", json.RawMessage(`1`), 72*time.Hour); err == nil {
+		t.Fatal("ttl over 48h accepted")
+	}
+
+	// Saved and reloaded; a delivery lock does not survive a restart.
+	s.Update("pump-1", "", []byte(`{"tags":{"site":"plant1"}}`))
+	d.listening = true
+	s.Listening("pump-1") // some now delivered (locked)
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	s2, _ := newSvc(t, p)
+	if err := s2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := s2.Get("pump-1")
+	ms, _ = s2.Messages("pump-1")
+	delivered := 0
+	for _, m := range ms {
+		if m.Status == "delivered" {
+			delivered++
+		}
+	}
+	if v.Tags["site"] != "plant1" || delivered != 0 || len(ms) == 0 {
+		t.Fatalf("reload: tags %v delivered %d of %d", v.Tags, delivered, len(ms))
+	}
+}
+
+// Last data: recorded per reading, saved at most once a minute, survives a
+// restart, and never invents a twin for an unknown identity.
+func TestLastData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s := New(path, func(id string) bool { return id == "pump-1" })
+	now := time.UnixMilli(1_000_000_000_000)
+	s.now = func() time.Time { return now }
+	pending := func() bool {
+		select {
+		case <-s.dirty:
+			return true
+		default:
+			return false
+		}
+	}
+	s.Data("ghost")
+	if _, err := s.Get("ghost"); err == nil || len(s.devs) != 0 {
+		t.Fatal("data from an unknown identity created a twin")
+	}
+	s.Data("pump-1")
+	if !pending() {
+		t.Fatal("first data did not ask for a save")
+	}
+	now = now.Add(30 * time.Second)
+	s.Data("pump-1")
+	if pending() {
+		t.Error("saved again within a minute")
+	}
+	v, _ := s.Get("pump-1")
+	if v.LastData != now.UnixMilli() || v.LastActivity != now.UnixMilli() {
+		t.Errorf("view %d/%d, want %d", v.LastData, v.LastActivity, now.UnixMilli())
+	}
+	now = now.Add(31 * time.Second)
+	s.Data("pump-1")
+	if !pending() {
+		t.Error("no save after a minute")
+	}
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(path, nil)
+	if err := r.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := r.Get("pump-1"); v.LastData != now.UnixMilli() {
+		t.Errorf("after restart %d, want %d", v.LastData, now.UnixMilli())
+	}
+	var nilSvc *Service
+	nilSvc.Data("pump-1") // a runtime without twins: no panic
+}
+
+// The catalog and each device's command history survive a restart.
+func TestCommandsPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s := New(path, func(id string) bool { return id == "valve-1" })
+	if _, err := s.SetCommand(Command{Name: "close", Kind: "message", Payload: json.RawMessage(`{"cmd":"close"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.RunCommand(context.Background(), "valve-1", "close", "ana", nil)
+	if err != nil || run.Status != "queued" {
+		t.Fatalf("run %+v %v", run, err)
+	}
+	if _, err := s.RunCommand(context.Background(), "ghost", "close", "ana", nil); err == nil {
+		t.Error("ran on an unknown device")
+	}
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(path, func(string) bool { return true })
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if cs := r.Commands(); len(cs) != 1 || cs[0].Role != "operator" {
+		t.Errorf("catalog after restart %+v", cs)
+	}
+	if h := r.Runs("valve-1"); len(h) != 1 || h[0].By != "ana" || h[0].Status != "queued" {
+		t.Errorf("history after restart %+v", h)
+	}
+}
+
+// Batch summaries survive a restart; one cut short comes back finished,
+// with the devices that hadn't answered marked interrupted.
+func TestBatchesPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s := New(path, func(id string) bool { return id != "ghost" })
+	// p-1 listens but never answers: its call is still waiting at "shutdown".
+	s.SetTransport(Transport{
+		Listening: func(id, sub string) bool { return id == "p-1" },
+		Connected: func(id string) bool { return id == "p-1" },
+		Send:      func(id, sub string, b []byte) int { return 1 },
+	})
+	if _, err := s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "5s"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetCommand(Command{Name: "close", Kind: "message"}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.RunBatch("close", "ana", []string{"v-1", "v-2", "ghost"}, map[string]string{"ops": "not a device you may command"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.RunBatch("reboot", "ana", []string{"p-1", "p-2"}, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) { // p-2 is offline at once; p-1 waits
+		if b, _ := s.GetBatch(running.ID); b.Done == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if b, _ := s.GetBatch(done.ID); b.Finished == 0 {
+		t.Fatal("message batch should be finished")
+	}
+	if err := s.save(); err != nil { // the hub stops now
+		t.Fatal(err)
+	}
+
+	r := New(path, func(string) bool { return true })
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	list := r.Batches()
+	if len(list) != 2 || list[0].ID != running.ID || list[1].ID != done.ID {
+		t.Fatalf("batches after restart %+v", list)
+	}
+	d, err := r.GetBatch(done.ID)
+	if err != nil || d.Interrupted || d.Counts["queued"] != 2 || d.Counts["skipped"] != 2 || d.By != "ana" {
+		t.Errorf("finished batch after restart %+v %v", d, err)
+	}
+	b, _ := r.GetBatch(running.ID)
+	st := map[string]string{}
+	for _, x := range b.Results {
+		st[x.Device] = x.Status
+	}
+	if !b.Interrupted || b.Finished == 0 || b.Done != b.Total || st["p-1"] != "interrupted" || st["p-2"] != "offline" {
+		t.Errorf("interrupted batch after restart %+v", b)
+	}
+	// Interrupted and offline devices are the ones to resend.
+	if _, f, _ := r.Failed(running.ID); fmt.Sprint(f) != "[p-1 p-2]" {
+		t.Errorf("to resend after restart: %v", f)
+	}
+	if _, f, _ := r.Failed(done.ID); len(f) != 0 {
+		t.Errorf("queued messages and skips offered for resend: %v", f)
+	}
+	// Message results still follow the queue after the restart.
+	ms, _ := r.Messages("v-1")
+	if len(ms) != 1 || ms[0].Status != "queued" {
+		t.Fatalf("v-1 queue %+v", ms)
+	}
+}
+
+// Automatic retries: offline devices are tried again each interval until
+// they answer or the attempts run out; refusals are not retried; cancel
+// stops what is pending; a restart carries on.
+func TestBatchRetries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s, d := newSvc(t, path)
+	now := time.UnixMilli(1_000_000_000_000)
+	var mu sync.Mutex
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(dt time.Duration) { mu.Lock(); now = now.Add(dt); mu.Unlock() }
+	s.now = clock
+	d.onMethod = func(sub string, p []byte) {
+		s.HandleMQTT("pump-1", "methods/res/200/"+strings.Split(sub, "/")[2], []byte(`{"ok":true}`))
+	}
+	if _, err := s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "1s", Retry: &RetryPolicy{Attempts: 2, Every: "1m"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetCommand(Command{Name: "close", Kind: "message", Retry: &RetryPolicy{Attempts: 2, Every: "1m"}}); err == nil {
+		t.Error("retries accepted on a message command")
+	}
+	if _, err := s.RunBatch("reboot", "ana", []string{"pump-1"}, nil, nil, &RetryPolicy{Attempts: 1, Every: "1s"}); err == nil {
+		t.Error("retry interval under 10s accepted")
+	}
+	settled := func(id string) Batch {
+		t.Helper()
+		for i := 0; i < 200; i++ {
+			b, _ := s.GetBatch(id)
+			s.mu.Lock()
+			busy := false
+			for _, x := range s.batches {
+				busy = busy || x.ID == id && x.running
+			}
+			s.mu.Unlock()
+			if !busy {
+				return b
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("round never ended")
+		return Batch{}
+	}
+	status := func(b Batch) map[string]string {
+		m := map[string]string{}
+		for _, r := range b.Results {
+			m[r.Device] = fmt.Sprintf("%s/%d", r.Status, r.Attempts)
+		}
+		return m
+	}
+
+	// Round 1: both offline (the command's default policy: 2 more attempts).
+	b, err := s.RunBatch("reboot", "ana", []string{"pump-1", "pump-2"}, nil, nil, nil)
+	if err != nil || b.Retry == nil || b.Retry.Attempts != 2 {
+		t.Fatalf("start %+v %v", b, err)
+	}
+	b = settled(b.ID)
+	if st := status(b); st["pump-1"] != "retrying/1" || st["pump-2"] != "retrying/1" || b.Finished != 0 || b.NextRetry != clock().Add(time.Minute).UnixMilli() {
+		t.Fatalf("after round 1: %v next %d finished %d", st, b.NextRetry, b.Finished)
+	}
+	s.Tick() // not due yet
+	if b, _ = s.GetBatch(b.ID); b.Round != 1 {
+		t.Fatal("retried before the interval")
+	}
+	// Round 2: pump-1 is back and answers; pump-2 is still offline.
+	d.mu.Lock()
+	d.listening = true
+	d.mu.Unlock()
+	advance(time.Minute)
+	s.Tick()
+	b = settled(b.ID)
+	if st := status(b); b.Round != 2 || st["pump-1"] != "ok/2" || st["pump-2"] != "retrying/2" || b.Done != 1 {
+		t.Fatalf("after round 2: %v round %d done %d", st, b.Round, b.Done)
+	}
+	// A restart while waiting: the batch carries on.
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := newSvc(t, path)
+	r.now = clock
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if rb, _ := r.GetBatch(b.ID); rb.Finished != 0 || status(rb)["pump-2"] != "retrying/2" || rb.NextRetry != b.NextRetry {
+		t.Fatalf("after restart %+v", rb)
+	}
+	// Round 3 (the last): pump-2 still offline → finished, offline/3.
+	advance(time.Minute)
+	s.Tick()
+	b = settled(b.ID)
+	if st := status(b); st["pump-2"] != "offline/3" || b.Finished == 0 || b.Round != 3 {
+		t.Fatalf("after the last round: %v finished %d", st, b.Finished)
+	}
+	runs := 0
+	for _, x := range s.Runs("pump-2") {
+		if x.Batch == b.ID {
+			runs++
+		}
+	}
+	if runs != 3 {
+		t.Errorf("pump-2 history has %d runs of the batch, want 3", runs)
+	}
+
+	// Refusals are final; cancel stops waiting retries.
+	d.onMethod = func(sub string, p []byte) {
+		s.HandleMQTT("pump-1", "methods/res/500/"+strings.Split(sub, "/")[2], []byte(`{"busy":true}`))
+	}
+	c := settled(must(s.RunBatch("reboot", "ana", []string{"pump-1", "pump-2"}, nil, nil, nil)).ID)
+	if st := status(c); st["pump-1"] != "failed/1" || st["pump-2"] != "retrying/1" {
+		t.Fatalf("refusal retried? %v", st)
+	}
+	c, err = s.CancelBatch(c.ID)
+	if st := status(c); err != nil || st["pump-2"] != "cancelled/1" || c.Finished == 0 || !c.Cancelled {
+		t.Fatalf("cancel %v %+v %v", st, c, err)
+	}
+	if _, err := s.CancelBatch(c.ID); err == nil {
+		t.Error("cancelled a finished batch")
+	}
+	// A restart in the middle of a round: the device being waited on is
+	// interrupted, and with attempts left it is retried after the interval.
+	d.onMethod = func(string, []byte) {} // listens, never answers
+	m := must(s.RunBatch("reboot", "ana", []string{"pump-1"}, nil, nil, nil))
+	time.Sleep(100 * time.Millisecond)
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := newSvc(t, path)
+	r2.now = clock
+	if err := r2.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	mb, _ := r2.GetBatch(m.ID)
+	if st := status(mb); st["pump-1"] != "retrying/1" || !mb.Interrupted || mb.Finished != 0 || mb.NextRetry != clock().Add(time.Minute).UnixMilli() ||
+		!strings.Contains(mb.Results[0].Error, "interrupted") {
+		t.Errorf("restart mid-round: %v %+v", st, mb)
+	}
+	settled(m.ID)
+
+	// Attempts 0 turns the command's default off.
+	n := settled(must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{})).ID)
+	if n.Retry != nil || n.Finished == 0 || status(n)["pump-2"] != "offline/1" {
+		t.Errorf("no-retry batch %+v", n)
+	}
+}
+
+func must(b Batch, err error) Batch {
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func TestRetryBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		p    RetryPolicy
+		want []time.Duration
+	}{
+		{RetryPolicy{Attempts: 4, Every: "1m"}, []time.Duration{time.Minute, time.Minute, time.Minute, time.Minute}},
+		{RetryPolicy{Attempts: 4, Every: "1m", Backoff: 2}, []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute}},
+		{RetryPolicy{Attempts: 4, Every: "1m", Backoff: 3, MaxEvery: "10m"}, []time.Duration{time.Minute, 3 * time.Minute, 9 * time.Minute, 10 * time.Minute}},
+		{RetryPolicy{Attempts: 4, Every: "1h", Backoff: 10}, []time.Duration{time.Hour, 10 * time.Hour, 24 * time.Hour, 24 * time.Hour}}, // default cap
+		{RetryPolicy{Attempts: 3, Every: "10s", Backoff: 1.5}, []time.Duration{10 * time.Second, 15 * time.Second, 22500 * time.Millisecond}},
+	} {
+		if err := tc.p.validate(); err != nil {
+			t.Fatalf("%+v: %v", tc.p, err)
+		}
+		for i, w := range tc.want {
+			if got := tc.p.Wait(i + 1); got != w {
+				t.Errorf("%+v retry %d: %v, want %v", tc.p, i+1, got, w)
+			}
+		}
+	}
+	if w := (&RetryPolicy{Attempts: 10, Every: "1m", Backoff: 10}).Wait(400); w != 24*time.Hour {
+		t.Errorf("overflow not capped: %v", w)
+	}
+	for _, bad := range []RetryPolicy{
+		{Attempts: 2, Every: "1m", Backoff: 0.5},
+		{Attempts: 2, Every: "1m", Backoff: 11},
+		{Attempts: 2, Every: "5m", Backoff: 2, MaxEvery: "1m"}, // cap under the first wait
+		{Attempts: 2, Every: "5m", Backoff: 2, MaxEvery: "48h"},
+		{Attempts: 2, Every: "5m", Backoff: 2, MaxEvery: "soon"},
+	} {
+		if bad.validate() == nil {
+			t.Errorf("accepted %+v", bad)
+		}
+	}
+
+	// In a batch: the second wait is twice the first.
+	s, _ := newSvc(t, "")
+	now := time.UnixMilli(1_000_000_000_000)
+	var mu sync.Mutex
+	s.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "1s"})
+	b := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 3, Every: "1m", Backoff: 2}))
+	wait := func() Batch {
+		for i := 0; i < 200; i++ {
+			x, _ := s.GetBatch(b.ID)
+			if x.NextRetry != 0 || x.Finished != 0 {
+				return x
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("round never ended")
+		return Batch{}
+	}
+	t0 := s.now().UnixMilli()
+	if x := wait(); x.NextRetry-t0 != time.Minute.Milliseconds() {
+		t.Fatalf("first wait %d ms", x.NextRetry-t0)
+	}
+	advance(time.Minute)
+	s.Tick()
+	t1 := s.now().UnixMilli()
+	if x := wait(); x.Round != 2 || x.NextRetry-t1 != (2*time.Minute).Milliseconds() {
+		t.Fatalf("second wait %d ms (round %d)", x.NextRetry-t1, x.Round)
+	}
+	advance(time.Minute) // only half of the 2 min
+	s.Tick()
+	if x, _ := s.GetBatch(b.ID); x.Round != 2 {
+		t.Fatal("retried before the backed-off wait")
+	}
+	advance(time.Minute)
+	s.Tick()
+	t2 := s.now().UnixMilli()
+	if x := wait(); x.Round != 3 || x.NextRetry-t2 != (4*time.Minute).Milliseconds() {
+		t.Fatalf("third wait %d ms (round %d)", x.NextRetry-t2, x.Round)
+	}
+}
+
+func TestRetryJitter(t *testing.T) {
+	p := RetryPolicy{Attempts: 3, Every: "1m", Jitter: 0.2}
+	if err := p.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for u, want := range map[float64]time.Duration{0: 48 * time.Second, 0.5: time.Minute, 0.75: 66 * time.Second} {
+		if got := p.Jittered(1, u); got != want {
+			t.Errorf("u=%v: %v, want %v", u, got, want)
+		}
+	}
+	// The longest wait still holds: 10m capped, +20% would be 12m.
+	c := RetryPolicy{Attempts: 3, Every: "5m", Backoff: 2, MaxEvery: "10m", Jitter: 0.2}
+	if got := c.Jittered(3, 0.99); got != 10*time.Minute {
+		t.Errorf("cap with jitter: %v", got)
+	}
+	if got := c.Jittered(3, 0); got != 8*time.Minute {
+		t.Errorf("capped wait jittered down: %v, want 8m", got)
+	}
+	for _, j := range []float64{-0.1, 0.6} {
+		if (&RetryPolicy{Attempts: 1, Every: "1m", Jitter: j}).validate() == nil {
+			t.Errorf("jitter %v accepted", j)
+		}
+	}
+	// With the real source: always within ±20%, centred, and actually spread.
+	s, _ := newSvc(t, "")
+	lo, hi, sum := time.Hour, time.Duration(0), time.Duration(0)
+	const n = 5000
+	for i := 0; i < n; i++ {
+		w := p.Jittered(1, s.rand())
+		lo, hi, sum = min(lo, w), max(hi, w), sum+w
+	}
+	if lo < 48*time.Second || hi > 72*time.Second {
+		t.Errorf("out of ±20%%: %v..%v", lo, hi)
+	}
+	if lo > 50*time.Second || hi < 70*time.Second {
+		t.Errorf("not spread: %v..%v", lo, hi)
+	}
+	if mean := sum / n; mean < 59*time.Second || mean > 61*time.Second {
+		t.Errorf("not centred: mean %v", mean)
+	}
+
+	// In a batch: the jittered wait is what gets scheduled …
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s, _ = newSvc(t, path)
+	now := time.UnixMilli(1_000_000_000_000)
+	s.now = func() time.Time { return now }
+	s.rand = func() float64 { return 0 }
+	s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "1s"})
+	b := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 2, Every: "1m", Jitter: 0.2}))
+	nextOf := func(id string) int64 {
+		for i := 0; i < 200; i++ {
+			if x, _ := s.GetBatch(id); x.NextRetry != 0 {
+				return x.NextRetry
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("no retry scheduled")
+		return 0
+	}
+	if got := nextOf(b.ID) - now.UnixMilli(); got != 48_000 {
+		t.Errorf("scheduled %d ms, want 48000 (−20%%)", got)
+	}
+	// … two batches started together don't retry in lockstep …
+	s.rand = mrand.Float64
+	b1 := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 2, Every: "10m", Jitter: 0.5}))
+	b2 := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 2, Every: "10m", Jitter: 0.5}))
+	if nextOf(b1.ID) == nextOf(b2.ID) {
+		t.Error("two batches retry at the same millisecond")
+	}
+	// … and a restart keeps the chosen time (no re-roll).
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := newSvc(t, path)
+	r.now = s.now
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if x, _ := r.GetBatch(b1.ID); x.NextRetry != nextOf(b1.ID) {
+		t.Errorf("restart changed the retry time: %d vs %d", x.NextRetry, nextOf(b1.ID))
+	}
+}
