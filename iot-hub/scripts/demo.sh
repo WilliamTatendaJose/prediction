@@ -9,8 +9,10 @@ rm -rf "$D" && mkdir -p "$D/bin"
 for c in iothub simulate devicesim; do go build -o "$D/bin/$c" ./cmd/$c; done
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null' EXIT
+# -auth-file too: it defaults to ./data/devices.json, so without it the demo
+# leaves credentials outside demo-data and a re-run fails with 409 Conflict.
 "$D/bin/iothub" -tenancy multi -token platform-demo-token -data "$D/iothub.json" -db "sqlite:$D/readings.db" \
-  -backup-dir "$D/backups" -http 127.0.0.1:8080 -mqtt 127.0.0.1:1883 > "$D/hub.log" 2>&1 & pids+=($!)
+  -auth-file "$D/devices.json" -backup-dir "$D/backups" -http 127.0.0.1:8080 -mqtt 127.0.0.1:1883 > "$D/hub.log" 2>&1 & pids+=($!)
 for _ in $(seq 50); do curl -sf 127.0.0.1:8080/api/health >/dev/null && break; sleep 0.2; done
 python3 scripts/demo_seed.py "$D/creds.json"
 cred() { python3 -c "import json,sys;print(json.load(open('$D/creds.json'))[sys.argv[1]])" "$1"; }
