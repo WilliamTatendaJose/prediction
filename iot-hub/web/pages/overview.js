@@ -2,7 +2,7 @@
 // needs attention, how much of the plan is used.
 import {
   h, api, icon, pageHeader, card, badge, empty, table, meter, linkButton, live, canManage, multiTenant,
-  tenantLabel, ago, num, plural, enc,
+  tenantLabel, ago, num, plural, enc, alarmHref,
 } from '../core.js';
 
 // Freshness of a sensor, always shown as a label next to its dot.
@@ -103,7 +103,7 @@ export async function render(el, ctx) {
     const items = open.slice(0, 6).map((a) => h('li', { class: 'alarm-row' },
       a.ack ? badge('Acknowledged', 'warning') : badge('Active', 'critical'),
       h('div', {},
-        h('div', { class: 'what' }, h('a', { href: '#/sensors/' + enc(a.sensor), text: byId.get(a.sensor)?.name || a.sensor }), a.field ? ` · ${a.field}` : '', h('span', { class: 'chip', text: a.kind })),
+        h('div', { class: 'what' }, h('a', { href: alarmHref(a), text: byId.get(a.sensor)?.name || a.sensor }), a.field ? ` · ${a.field}` : '', h('span', { class: 'chip', text: a.kind })),
         h('div', { class: 'msg', text: a.message })),
       h('div', { class: 'side', text: 'since ' + ago(a.start) })));
     alarmsCard.replaceChildren(card('Active alarms', {

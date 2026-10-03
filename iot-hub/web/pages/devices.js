@@ -191,7 +191,7 @@ async function expectedDialog(id, cur, reload) {
   const sync = () => { customField.hidden = sel.value !== 'custom'; };
   sel.onchange = sync; sync();
   const ok = await modal('How often does ' + id + ' send data?', h('div', { class: 'stack' },
-    h('p', { class: 'modal-text', text: 'The device shows as Overdue once twice this interval passes without data (at least the interval plus 30 seconds).' }),
+    h('p', { class: 'modal-text', text: 'Once twice this interval passes without data (at least the interval plus 30 seconds), the device shows as Overdue and raises an alarm, which notifies and escalates like any other. Data clears it.' }),
     field('Expected interval', sel), customField), {
     actions: [['Cancel'], ['Save', () => put(`/api/devices/${enc(id)}/expected-interval`, { interval: sel.value === 'custom' ? custom.value.trim() : sel.value }), 'primary']],
   });

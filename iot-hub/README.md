@@ -1045,6 +1045,13 @@ curl https://hub:8443/api/devices/pump-1/messages -H "$A"            # queued / 
 
 **Expected interval.** Set how often each device should send (`PUT /api/devices/{id}/expected-interval {"interval":"5m"}`, `""` clears; 1 s to 7 days; admins). The twin shows it as `expectedIntervalSec`, and the app marks the device **Overdue** once twice the interval has passed without data (at least interval + 30 s, for jitter). Without one, the default scale above applies.
 
+**Overdue alarm.** An overdue device also raises an alarm of kind `overdue`, with the device id as its subject. It is an ordinary alarm: it shows on the Alarms page and in the bell, can be acknowledged, shelved and annotated, notifies the targets (`overdue` is a notify kind; an empty kinds list means all) and escalates. Data from the device clears it at once; removing the interval, disabling or deleting the device clears it on the next check (every 10 s).
+- **No storm after downtime.** Silence is counted from the later of the last data and the hub's start, so a restart doesn't find every device overdue at once. Like other alarms, one open at shutdown is closed then, and raised again if the device is still late.
+- **Never sent, never alarmed.** A device that has never sent data raises nothing; it shows as Never sent data.
+- **Tested:**
+  - a unit test with a controlled clock: the limit, raising once, clearing on data, the start grace (removing it fails the test), and clearing when the interval is removed or the device disabled;
+  - against the built binary: an alarm opened about 31–40 s after the hub started, for a device last heard of 39 minutes earlier. A webhook target received it; an operator acknowledged it in the browser; a reading cleared it immediately and the webhook received the resolution.
+
 ### Commands
 
 Named commands defined once per tenant and offered on every device whose id matches, so operators send "Reboot" or "Close valve" instead of writing JSON:

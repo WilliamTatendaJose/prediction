@@ -289,5 +289,9 @@ export function connectLive() {
 export function disconnectLive() { es?.close(); es = null; live.state = 'idle'; live.emit('state', 'idle'); }
 
 // ---- alarm verdicts (shared by the alarms page and tiles) ---------------------
+// Where an alarm's subject lives: a device for "overdue" alarms (admins
+// see its page, operators its commands), else the sensor.
+export const alarmHref = (a) => (a.kind === 'overdue' ? (canManage() ? '#/devices/' + enc(a.sensor) : '#/commands') : '#/sensors/' + enc(a.sensor));
+
 export const VERDICTS = [['confirmed', 'Confirmed problem'], ['false_alarm', 'False alarm'], ['expected', 'Expected (maintenance, changeover)']];
 export const verdictLabel = Object.fromEntries(VERDICTS.map(([k, v]) => [k, v.split(' (')[0]]));

@@ -149,6 +149,10 @@ type Service struct {
 	now     func() time.Time
 	flushed int64 // when Data last asked for a save (ms)
 
+	// OnData, if set, is told about every accepted reading (after Data
+	// records it): the overdue check clears its alarm at once.
+	OnData func(id string)
+
 	cmds    map[string]Command // the command catalog (commands.go)
 	cmdSave sync.Mutex
 }
@@ -546,6 +550,9 @@ func (s *Service) Data(id string) {
 	s.mu.Unlock()
 	if save {
 		s.markDirty()
+	}
+	if s.OnData != nil {
+		s.OnData(id)
 	}
 }
 

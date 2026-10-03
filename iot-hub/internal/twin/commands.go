@@ -514,3 +514,24 @@ func (s *Service) SetExpected(id string, d time.Duration) error {
 	s.markDirty()
 	return nil
 }
+
+// Watch is what the overdue check needs about one device.
+type Watch struct {
+	ID          string
+	LastData    int64 // ms; 0 = never sent
+	ExpectedSec int64
+}
+
+// Watched lists the devices with an expected interval.
+func (s *Service) Watched() []Watch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Watch
+	for id, r := range s.devs {
+		if r.ExpectedSec > 0 {
+			out = append(out, Watch{ID: id, LastData: r.LastData, ExpectedSec: r.ExpectedSec})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}

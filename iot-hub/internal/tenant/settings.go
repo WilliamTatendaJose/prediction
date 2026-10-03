@@ -114,8 +114,8 @@ func (s Settings) compile() (map[string]*notify.Target, *time.Location, error) {
 		return nil, nil, invalid("escalation repeatMin must be 0 or 5..1440")
 	}
 	for _, k := range s.Notify.Kinds {
-		if k != "range" && k != "spike" && k != "stale" && k != "rule" {
-			return nil, nil, invalid("notify kind %q: range, spike, stale or rule", k)
+		if k != "range" && k != "spike" && k != "stale" && k != "rule" && k != "overdue" {
+			return nil, nil, invalid("notify kind %q: range, spike, stale, rule or overdue", k)
 		}
 	}
 	if s.Notify.CooldownMin < 0 || s.Notify.PerMinute < 0 {

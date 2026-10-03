@@ -311,6 +311,31 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 	}
 	r.API.Twins = r.Twins
 	r.goRun(func() { r.Twins.Run(ctx, func(f string, a ...any) { log.Error(fmt.Sprintf(f, a...)) }) })
+	// Devices that missed their expected interval raise an "overdue" alarm.
+	if det := r.Detector; det != nil {
+		od := newOverdue(r.Twins, det, r.Pipe.Emit, func() map[string]bool {
+			out := map[string]bool{}
+			for _, d := range o.Creds.List() {
+				if d.Disabled || d.Expires > 0 && d.Expires < time.Now().UnixMilli() {
+					out[d.ID] = true
+				}
+			}
+			return out
+		}, time.Now().UnixMilli())
+		r.Twins.OnData = od.data
+		r.goRun(func() {
+			t := time.NewTicker(10 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-t.C:
+					od.check(now.UnixMilli())
+				}
+			}
+		})
+	}
 	r.goRun(func() { r.Jobs.Run(ctx) })
 	r.goRun(func() { r.sendHooks(ctx, hooks) })
 	if o.BackupDir != "" {

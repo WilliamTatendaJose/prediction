@@ -49,7 +49,7 @@ export async function render(el, ctx) {
   };
   const nTargets = picks(st.notify.targets);
   const kinds = h('div', { class: 'checks' });
-  for (const [k, l] of [['range', 'Range limits'], ['spike', 'Spikes'], ['stale', 'Stale data'], ['rule', 'Rules and jobs']]) {
+  for (const [k, l] of [['range', 'Range limits'], ['spike', 'Spikes'], ['stale', 'Stale data'], ['rule', 'Rules and jobs'], ['overdue', 'Overdue devices']]) {
     kinds.append(h('label', {}, h('input', { type: 'checkbox', value: k, checked: !st.notify.kinds.length || st.notify.kinds.includes(k) }), l));
   }
   const resolved = h('input', { type: 'checkbox', checked: st.notify.resolved });
@@ -75,7 +75,7 @@ export async function render(el, ctx) {
     err.textContent = '';
     const allKinds = [...kinds.querySelectorAll('input:checked')].map((c) => c.value);
     const body = {
-      notify: { targets: nTargets.read(), kinds: allKinds.length === 4 ? [] : allKinds, resolved: resolved.checked, cooldownMin: Number(cooldown.value) || 0 },
+      notify: { targets: nTargets.read(), kinds: allKinds.length === kinds.querySelectorAll('input').length ? [] : allKinds, resolved: resolved.checked, cooldownMin: Number(cooldown.value) || 0 },
       escalation: { levels: [...levels.children].map((r) => r.read()), repeatMin: Number(repeat.value) || 0 },
       reports: { targets: rTargets.read() },
       shifts: shifts.value.split(',').map((x) => x.trim()).filter(Boolean),

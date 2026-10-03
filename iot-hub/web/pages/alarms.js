@@ -2,7 +2,7 @@
 // what is shelved.
 import {
   h, api, post, del, enc, pageHeader, card, badge, empty, tabs, modal, field, opt, button, icon, live, canOperate,
-  ago, duration, when, toast, VERDICTS, verdictLabel, plural,
+  ago, duration, when, toast, VERDICTS, verdictLabel, plural, alarmHref,
 } from '../core.js';
 
 export function alarmTone(a) {
@@ -70,7 +70,7 @@ export function alarmRow(a, refresh, { names = {} } = {}) {
   return h('li', { class: 'alarm-row' },
     badge(label, tone),
     h('div', {},
-      h('div', { class: 'what' }, h('a', { href: '#/sensors/' + enc(a.sensor), text: names[a.sensor] || a.sensor }), a.field ? ` · ${a.field}` : '', ' ', h('span', { class: 'chip', text: a.kind })),
+      h('div', { class: 'what' }, h('a', { href: alarmHref(a), text: names[a.sensor] || a.sensor }), a.field ? ` · ${a.field}` : '', ' ', h('span', { class: 'chip', text: a.kind })),
       h('div', { class: 'msg', text: a.message }),
       a.ack && h('div', { class: 'ackline' }, icon('check', 'ico'), ` ${a.ack.by}`, a.ack.verdict ? ` · ${verdictLabel[a.ack.verdict] || a.ack.verdict}` : '', a.ack.note ? ` · “${a.ack.note}”` : ''),
       acts),
@@ -93,7 +93,7 @@ export async function render(el, ctx) {
   const refresh = () => ctx.reload();
 
   const q = h('input', { type: 'search', placeholder: 'Filter by sensor, field or message', 'aria-label': 'Filter alarms' });
-  const kind = h('select', { 'aria-label': 'Kind' }, opt('', 'All kinds'), ['range', 'spike', 'stale', 'rule'].map((k) => opt(k)));
+  const kind = h('select', { 'aria-label': 'Kind' }, opt('', 'All kinds'), ['range', 'spike', 'stale', 'rule', 'overdue'].map((k) => opt(k)));
   const listBox = h('div');
 
   function rows(list) {
