@@ -3,3 +3,7 @@
 /simulate
 /deploy/.env
 demo-data/
+
+# The repo-root .gitignore (Visual Studio template) has Backup*/, which
+# matches internal/backup/ because git on Windows ignores case.
+!/internal/backup/
