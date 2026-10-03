@@ -914,6 +914,9 @@ func (s *Service) LoadAll() error {
 	if err := s.Load(); err != nil {
 		return err
 	}
+	if err := s.loadBatches(); err != nil {
+		return err
+	}
 	return s.loadCommands()
 }
 
@@ -921,8 +924,14 @@ func (s *Service) save() error {
 	if s.path == "" {
 		return nil
 	}
+	// One snapshot of both, so a device's history and its batch result
+	// never disagree after a crash.
 	s.mu.Lock()
 	b, err := json.Marshal(s.devs)
+	var bb []byte
+	if err == nil {
+		bb, err = json.Marshal(s.batches)
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return err
@@ -930,11 +939,18 @@ func (s *Service) save() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil { // desired properties can hold device configuration
+	if err := writeFile(s.batchPath(), bb); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	return writeFile(s.path, b) // desired properties can hold device configuration: 0600
+}
+
+func writeFile(path string, b []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Run saves changes (at most once a second) and ticks the message queue

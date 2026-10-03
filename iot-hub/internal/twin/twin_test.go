@@ -372,3 +372,69 @@ func TestCommandsPersist(t *testing.T) {
 		t.Errorf("history after restart %+v", h)
 	}
 }
+
+// Batch summaries survive a restart; one cut short comes back finished,
+// with the devices that hadn't answered marked interrupted.
+func TestBatchesPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s := New(path, func(id string) bool { return id != "ghost" })
+	// p-1 listens but never answers: its call is still waiting at "shutdown".
+	s.SetTransport(Transport{
+		Listening: func(id, sub string) bool { return id == "p-1" },
+		Connected: func(id string) bool { return id == "p-1" },
+		Send:      func(id, sub string, b []byte) int { return 1 },
+	})
+	if _, err := s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "5s"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetCommand(Command{Name: "close", Kind: "message"}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.RunBatch("close", "ana", []string{"v-1", "v-2", "ghost"}, map[string]string{"ops": "not a device you may command"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.RunBatch("reboot", "ana", []string{"p-1", "p-2"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) { // p-2 is offline at once; p-1 waits
+		if b, _ := s.GetBatch(running.ID); b.Done == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if b, _ := s.GetBatch(done.ID); b.Finished == 0 {
+		t.Fatal("message batch should be finished")
+	}
+	if err := s.save(); err != nil { // the hub stops now
+		t.Fatal(err)
+	}
+
+	r := New(path, func(string) bool { return true })
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	list := r.Batches()
+	if len(list) != 2 || list[0].ID != running.ID || list[1].ID != done.ID {
+		t.Fatalf("batches after restart %+v", list)
+	}
+	d, err := r.GetBatch(done.ID)
+	if err != nil || d.Interrupted || d.Counts["queued"] != 2 || d.Counts["skipped"] != 2 || d.By != "ana" {
+		t.Errorf("finished batch after restart %+v %v", d, err)
+	}
+	b, _ := r.GetBatch(running.ID)
+	st := map[string]string{}
+	for _, x := range b.Results {
+		st[x.Device] = x.Status
+	}
+	if !b.Interrupted || b.Finished == 0 || b.Done != b.Total || st["p-1"] != "interrupted" || st["p-2"] != "offline" {
+		t.Errorf("interrupted batch after restart %+v", b)
+	}
+	// Message results still follow the queue after the restart.
+	ms, _ := r.Messages("v-1")
+	if len(ms) != 1 || ms[0].Status != "queued" {
+		t.Fatalf("v-1 queue %+v", ms)
+	}
+}

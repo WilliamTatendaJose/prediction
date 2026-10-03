@@ -7,8 +7,8 @@ import {
 import { deviceFreshness } from './overview.js';
 
 const RUN_TONE = { ok: 'good', completed: 'good', queued: 'info', delivered: 'info', failed: 'critical', offline: 'warning',
-  timeout: 'warning', rejected: 'critical', deadlettered: 'critical', expired: 'warning', untracked: 'neutral' };
-const RUN_LABEL = { ok: 'Done', failed: 'Device refused', offline: 'Device offline', timeout: 'No answer', queued: 'Queued',
+  timeout: 'warning', interrupted: 'warning', rejected: 'critical', deadlettered: 'critical', expired: 'warning', untracked: 'neutral' };
+const RUN_LABEL = { ok: 'Done', failed: 'Device refused', offline: 'Device offline', timeout: 'No answer', interrupted: 'Interrupted', queued: 'Queued',
   delivered: 'Delivered', completed: 'Completed', rejected: 'Rejected', deadlettered: 'Undeliverable', expired: 'Expired', untracked: 'Sent' };
 export const runBadge = (r, text) => badge(text || RUN_LABEL[r.status] || r.status, RUN_TONE[r.status] || 'neutral');
 
@@ -88,7 +88,7 @@ export async function render(el, ctx) {
     tab, (k) => { location.hash = '#/commands/' + k; }));
 
   if (tab === 'history') {
-    if (data.batches.length) el.append(card('Sent to many devices', { sub: 'The last 20 batches since the hub started.' }, batchTable(data.batches)));
+    if (data.batches.length) el.append(card('Sent to many devices', { sub: 'The last 20 batches.' }, batchTable(data.batches)));
     el.append(card(data.batches.length ? 'Every command' : null, {}, historyTable(data.history, { showDevice: true })));
     return;
   }
@@ -162,7 +162,7 @@ function batchTable(batches) {
     h('td', { title: when(b.at), text: ago(b.at) }),
     h('td', {}, h('a', { href: '#/commands/batch/' + enc(b.id), text: b.label || b.command })),
     h('td', { text: b.by }),
-    h('td', { text: b.finished ? `done, ${b.total} devices` : `${b.done} of ${b.total}` }),
+    h('td', { text: b.interrupted ? `interrupted, ${b.total} devices` : b.finished ? `done, ${b.total} devices` : `${b.done} of ${b.total}` }),
     h('td', {}, countBadges(b.counts)))));
 }
 
@@ -177,7 +177,7 @@ async function batchView(el, ctx, id) {
   const draw = (b) => {
     head.replaceChildren(pageHeader(`${b.label || b.command} on ${b.total} device${b.total === 1 ? '' : 's'}`, {
       back: ['#/commands/history', 'Commands'],
-      sub: h('span', { class: 'page-sub' }, b.finished ? badge('Finished', 'good') : badge('Running', 'info'),
+      sub: h('span', { class: 'page-sub' }, b.interrupted ? badge('Interrupted by a restart', 'warning') : b.finished ? badge('Finished', 'good') : badge('Running', 'info'),
         h('span', { text: `sent by ${b.by} ${ago(b.at)}` }), b.params && Object.keys(b.params).length ? h('span', { class: 'chip mono', text: JSON.stringify(b.params) }) : null),
     }));
     const rank = { pending: 0, error: 1, failed: 2, offline: 3, timeout: 4, skipped: 6 };

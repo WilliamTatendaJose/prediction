@@ -2,7 +2,11 @@ package twin
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -39,8 +43,11 @@ type Batch struct {
 	Total    int            `json:"total"`
 	Done     int            `json:"done"`
 	Finished int64          `json:"finished,omitempty"`
-	Counts   map[string]int `json:"counts"`
-	Results  []BatchResult  `json:"results"`
+	// Interrupted: the hub stopped while it ran; devices that had not
+	// answered are marked interrupted.
+	Interrupted bool           `json:"interrupted,omitempty"`
+	Counts      map[string]int `json:"counts"`
+	Results     []BatchResult  `json:"results"`
 }
 
 // batchLocked copies b with messages' current statuses (s.mu held).
@@ -120,6 +127,7 @@ func (s *Service) RunBatch(name, by string, devices []string, skip map[string]st
 	}
 	out := s.batchLocked(b)
 	s.mu.Unlock()
+	s.markDirty()
 
 	go func() {
 		sem := make(chan struct{}, batchWorkers)
@@ -139,12 +147,14 @@ func (s *Service) RunBatch(name, by string, devices []string, skip map[string]st
 				b.Results[i] = res
 				b.Done++
 				s.mu.Unlock()
+				s.markDirty()
 			}(i)
 		}
 		wg.Wait()
 		s.mu.Lock()
 		b.Finished = s.now().UnixMilli()
 		s.mu.Unlock()
+		s.markDirty()
 	}()
 	return out, nil
 }
@@ -172,4 +182,47 @@ func (s *Service) Batches() []Batch {
 		out = append(out, c)
 	}
 	return out
+}
+
+func (s *Service) batchPath() string { return filepath.Join(filepath.Dir(s.path), "batches.json") }
+
+// loadBatches reads the saved batches. One the hub stopped in the middle of
+// is finished now: devices still waiting are marked interrupted (their
+// command may or may not have reached them; their history says what was
+// recorded).
+func (s *Service) loadBatches() error {
+	if s.path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(s.batchPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var list []*Batch
+	if err := json.Unmarshal(b, &list); err != nil {
+		return fmt.Errorf("parse %s: %w", s.batchPath(), err)
+	}
+	now := s.now().UnixMilli()
+	for _, x := range list {
+		if x.Finished != 0 {
+			continue
+		}
+		for i, r := range x.Results {
+			if r.Status == "pending" {
+				x.Results[i].Status, x.Results[i].Error = "interrupted", "the hub stopped before this device answered"
+				x.Done++
+			}
+		}
+		x.Finished, x.Interrupted = now, true
+	}
+	if len(list) > keepBatches {
+		list = list[len(list)-keepBatches:]
+	}
+	s.mu.Lock()
+	s.batches = list
+	s.mu.Unlock()
+	return nil
 }
