@@ -3,6 +3,13 @@
 // rendered as text (textContent), never as HTML.
 
 export const $ = (id) => document.getElementById(id);
+
+// Conditional children (cond && node, x ? node : null) are skipped, as in
+// h(): the DOM's own append/replaceChildren would print "null"/"false".
+for (const name of ['append', 'replaceChildren']) {
+  const orig = Element.prototype[name];
+  Element.prototype[name] = function (...kids) { return orig.apply(this, kids.filter((k) => k != null && k !== false)); };
+}
 export const enc = encodeURIComponent;
 
 // h('div', {class, text, onclick, ...attrs}, ...children)
