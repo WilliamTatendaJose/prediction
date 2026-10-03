@@ -254,15 +254,30 @@ registerTile('line', {
       .then((evs) => { marks = evs.filter((e) => !e.field || fields.includes(e.field)); ctx.invalidate(); })
       .catch(() => {});
 
-    async function loadHistory() {
-      const from = Date.now() - span;
+    // Scrolling: drag sideways to move through time, wheel to zoom. While
+    // view is set the chart shows that window instead of following now;
+    // "Live" (or a double-click) goes back to following.
+    let view = null;         // { t0, t1 } once the user has scrolled
+    let loadSeq = 0;         // only the newest window's data is kept
+    const MIN_SPAN = 60e3, MAX_SPAN = 400 * 24 * 3600e3;
+
+    async function loadWindow(from, to) {
+      const seq = ++loadSeq;
+      const q = to ? `&to=${Math.round(to)}` : '';
       const res = await Promise.all(fields.map((f) =>
-        ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/series?field=${encodeURIComponent(f)}&from=${from}`).catch(() => null)));
-      if (!alive) return;
+        ctx.api(`/api/sensors/${encodeURIComponent(cfg.sensor)}/series?field=${encodeURIComponent(f)}&from=${Math.round(from)}${q}`).catch(() => null)));
+      if (!alive || seq !== loadSeq) return 60e3;
       series = res.map((r) => { const s = new Series(Math.max(1, r?.t.length || 0)); if (r) s.load({ t: r.t, v: r.avg }); return s; });
       bands = res.map((r) => r && { min: Float32Array.from(r.min), max: Float32Array.from(r.max) });
-      const bucket = res.find(Boolean)?.bucket || 60e3;
-      await loadMarks(from);
+      await loadMarks(Math.round(from));
+      ctx.invalidate();
+      return res.find(Boolean)?.bucket || 60e3;
+    }
+
+    async function loadHistory() {
+      if (view) return; // a scrolled chart is not following now
+      const bucket = await loadWindow(Date.now() - span);
+      if (!alive || view) return;
       timer = setTimeout(loadHistory, Math.max(15e3, bucket)); // no point refreshing faster than a bucket fills
     }
     if (span) loadHistory();
@@ -271,15 +286,104 @@ registerTile('line', {
       loadMarks(Date.now() - 3600e3);
     }
 
+    // The window currently drawn, whether following or scrolled.
+    function windowNow(e) {
+      if (view) return view;
+      if (span) { const t1 = Date.now(); return { t0: t1 - span, t1 }; }
+      return { t0: e.t0, t1: e.t1 };
+    }
+    // Freeze the window the user can see, so panning starts where they are.
+    function startView() {
+      if (view) return;
+      const w0 = windowNow(extent(series, o));
+      let { t0, t1 } = w0;
+      if (!(t1 > t0)) { t1 = Date.now(); t0 = t1 - (span || 3600e3); }
+      view = { t0, t1 };
+      clearTimeout(timer); timer = null;
+    }
+    function backToLive() {
+      if (!view) return;
+      view = null;
+      clearTimeout(timer); timer = null;
+      live.hidden = true;
+      if (span) loadHistory();
+      else { fields.forEach((f, k) => ctx.history(f, cap).then((h) => { series[k] = new Series(cap); series[k].load(h); ctx.invalidate(); })); }
+      ctx.invalidate();
+    }
+    // There is nothing to see after now, so scrolling stops there.
+    function clampView() {
+      if (!view) return;
+      const now = Date.now(), width = view.t1 - view.t0;
+      if (view.t1 > now) view = { t0: now - width, t1: now };
+    }
+    let reload = null;
+    const reloadSoon = () => { clearTimeout(reload); reload = setTimeout(() => { if (view) loadWindow(view.t0, view.t1); }, 180); };
+
+    const live = document.createElement('button');
+    live.className = 'chart-live'; live.type = 'button'; live.textContent = 'Live'; live.hidden = true;
+    live.title = 'Back to the latest data';
+    live.onclick = (ev) => { ev.stopPropagation(); backToLive(); };
+    wrap.append(live);
+
     let hoverX = null;
     const pad = { l: 36, r: 6, t: 6, b: 16 };
-    wrap.addEventListener('pointermove', (ev) => { hoverX = ev.offsetX; ctx.invalidate(); });
+    const plotW = () => Math.max(1, wrap.clientWidth - pad.l - pad.r);
+
+    let drag = null;
+    wrap.addEventListener('pointerdown', (ev) => {
+      // Not on the Live button: capturing the pointer here would swallow its
+      // click, leaving the chart stuck in the scrolled window.
+      if (ev.button !== 0 || ev.target.closest('.chart-live')) return;
+      startView();
+      drag = { x: ev.clientX, t0: view.t0, t1: view.t1, moved: false };
+      wrap.setPointerCapture(ev.pointerId);
+    });
+    wrap.addEventListener('pointermove', (ev) => {
+      hoverX = ev.offsetX;
+      if (drag) {
+        const dx = ev.clientX - drag.x;
+        if (Math.abs(dx) > 2) drag.moved = true;
+        const perPx = (drag.t1 - drag.t0) / plotW();
+        view = { t0: drag.t0 - dx * perPx, t1: drag.t1 - dx * perPx };
+        clampView();
+        live.hidden = false;
+        wrap.classList.add('panning');
+        reloadSoon();
+      }
+      ctx.invalidate();
+    });
+    const endDrag = (ev) => {
+      if (!drag) return;
+      const moved = drag.moved;
+      drag = null;
+      wrap.classList.remove('panning');
+      try { wrap.releasePointerCapture(ev.pointerId); } catch { /* already released */ }
+      if (!moved) return; // a plain click inspects a point; it is not a scroll
+      if (view) loadWindow(view.t0, view.t1);
+    };
+    wrap.addEventListener('pointerup', endDrag);
+    wrap.addEventListener('pointercancel', endDrag);
     wrap.addEventListener('pointerleave', () => { hoverX = null; tip.style.display = 'none'; ctx.invalidate(); });
+    wrap.addEventListener('dblclick', backToLive);
+    wrap.addEventListener('wheel', (ev) => {
+      ev.preventDefault();
+      startView();
+      const at = view.t0 + ((ev.offsetX - pad.l) / plotW()) * (view.t1 - view.t0); // zoom about the cursor
+      const k = ev.deltaY > 0 ? 1.25 : 0.8;
+      let width = (view.t1 - view.t0) * k;
+      width = Math.min(MAX_SPAN, Math.max(MIN_SPAN, width));
+      const frac = Math.min(1, Math.max(0, (at - view.t0) / (view.t1 - view.t0)));
+      view = { t0: at - width * frac, t1: at + width * (1 - frac) };
+      clampView();
+      live.hidden = false;
+      reloadSoon();
+      ctx.invalidate();
+    }, { passive: false });
     const ro = new ResizeObserver(() => ctx.invalidate()); ro.observe(wrap);
 
     return {
       update(t, values) {
-        if (span) return; // historical view refreshes on its own schedule
+        if (span || view) return; // a ranged or scrolled chart reloads its own window
         fields.forEach((f, k) => { const v = values[f]; if (typeof v === 'number') series[k].push(t, v); else if (typeof v === 'boolean') series[k].push(t, +v); });
       },
       anomaly(ev) {
@@ -292,11 +396,12 @@ registerTile('line', {
         const w = W - pad.l - pad.r, h = H - pad.t - pad.b;
         if (w < 10 || h < 10 || series.every((s) => s.n === 0)) return;
         const e = extent(series, o);
-        if (span) {
-          e.t1 = Date.now(); e.t0 = e.t1 - span;
+        if (view) { e.t0 = view.t0; e.t1 = view.t1; }
+        else if (span) { e.t1 = Date.now(); e.t0 = e.t1 - span; }
+        if (span || view) {
           bands.forEach((b) => { if (!b) return; for (let i = 0; i < b.min.length; i++) { if (num(o.min) == null) e.lo = Math.min(e.lo, b.min[i]); if (num(o.max) == null) e.hi = Math.max(e.hi, b.max[i]); } });
         }
-        if (fc?.t?.length) { // make room for the forecast; the band may clip, the central line may not
+        if (fc?.t?.length && !view) { // make room for the forecast; the band may clip, the central line may not
           e.t1 = Math.max(e.t1, fc.t[fc.t.length - 1]);
           for (const v of fc.yhat) { if (num(o.min) == null) e.lo = Math.min(e.lo, v); if (num(o.max) == null) e.hi = Math.max(e.hi, v); }
         }
@@ -414,7 +519,7 @@ registerTile('line', {
         const left = x + 12 + tip.offsetWidth > W ? x - 12 - tip.offsetWidth : x + 12;
         tip.style.left = Math.max(0, left) + 'px'; tip.style.top = pad.t + 'px';
       },
-      destroy() { alive = false; clearTimeout(timer); clearTimeout(fcTimer); ro.disconnect(); },
+      destroy() { alive = false; clearTimeout(timer); clearTimeout(fcTimer); clearTimeout(reload); ro.disconnect(); },
     };
   },
 });

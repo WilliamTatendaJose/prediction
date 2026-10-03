@@ -12,7 +12,11 @@ def call(method, path, body=None, tok=SUP, tenant="acme"):
     except urllib.error.HTTPError as e:
         sys.exit(f"{method} {path}: {e.code} {e.read().decode()}")
 out = {}
-call("POST", "/api/admin/tenants", {"id": "acme", "name": "Acme Mining", "quota": {"messagesPerDay": 500000, "maxSensors": 200, "maxDevices": 100}})
+DEMO_EMAIL, DEMO_PASSWORD = "ana@plant.co", "demo plant password"
+# deviceSelfService: the tenant's own admins may add devices and users.
+# Without it only the platform operator can, and their Add buttons are hidden.
+call("POST", "/api/admin/tenants", {"id": "acme", "name": "Acme Mining", "deviceSelfService": True,
+    "quota": {"messagesPerDay": 500000, "maxSensors": 200, "maxDevices": 100}})
 call("POST", "/api/admin/tenants", {"id": "globex", "name": "Globex Foods"})
 for who, role in [("ops", "admin"), ("shift", "operator"), ("screen", "viewer")]:
     out[who] = call("POST", "/api/devices", {"id": who, "role": role, "auth": "token", "note": {"ops": "Plant manager", "shift": "Shift supervisor", "screen": "Control-room screen"}[who]})["token"]
@@ -20,6 +24,9 @@ out["gateway-1"] = call("POST", "/api/devices", {"id": "gateway-1", "role": "ser
 for d, pat, note in [("pump-1", "pump-1", "Borehole pump A"), ("pump-2", "pump-2", "Borehole pump B"), ("pump-3", "pump-3", "Spare pump (offline)"), ("valve-1", "valve-1", "Main supply valve")]:
     out[d] = call("POST", "/api/devices", {"id": d, "role": "device", "sensors": [pat], "auth": "keys", "note": note})["connectionString"]
 out["meter-9"] = call("POST", "/api/devices", {"id": "meter-9", "role": "device", "sensors": ["meter-9"], "auth": "token", "note": "Energy meter, substation"})["token"]
+# A person who signs in with an email and password, to try that path.
+call("POST", "/api/devices", {"id": "ana", "role": "admin", "auth": "password", "email": DEMO_EMAIL,
+    "password": DEMO_PASSWORD, "note": "Plant manager (email sign-in)"})
 call("PUT", "/api/sensors/env-1", {"name": "Boiler room", "kind": "environment", "location": "Plant A", "fields": {"temperature": {"unit": "°C", "min": 0, "max": 50, "detect": {"high": 24}}, "humidity": {"unit": "%", "min": 0, "max": 100}}})
 call("PUT", "/api/sensors/tank-1", {"name": "Raw water tank", "kind": "tank", "location": "Plant A", "fields": {"level": {"unit": "%", "min": 0, "max": 100, "detect": {"low": 10, "high": 95}}}})
 call("PUT", "/api/sensors/power-1", {"name": "Main feeder", "kind": "meter", "fields": {"voltage": {"unit": "V"}, "current": {"unit": "A"}, "power": {"unit": "W"}, "kw": {"label": "Power (kW)", "unit": "kW", "calc": {"formula": "voltage * current / 1000"}}}})

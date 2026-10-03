@@ -31,7 +31,7 @@ Adding a sensor takes no setup: publish data and it appears. Adding a tile type 
 
 Then open http://localhost:8080.
 
-It starts a multi-tenant hub with simulated sensors, devices that answer commands (one stays offline, one goes overdue), and people for each role. It then prints a sign-in token for each role: platform operator, admin, operator and viewer. Data goes to `demo-data/` and is wiped on each start.
+It starts a multi-tenant hub with simulated sensors, devices that answer commands (one stays offline, one goes overdue), and people for each role. It prints an email and password to sign in with (`ana@plant.co`), plus a token for each role: platform operator, admin, operator and viewer. The tenant's admins may add their own devices and users. Data goes to `demo-data/` and is wiped on each start.
 
 ## Run
 
@@ -116,6 +116,27 @@ curl -X POST https://hub:8443/api/devices -H "Authorization: Bearer $ADMIN" \
 curl https://hub:8443/api/devices -H "Authorization: Bearer $ADMIN"                 # list (no secrets)
 curl -X DELETE https://hub:8443/api/devices/env-node-1 -H "Authorization: Bearer $ADMIN"  # revoke
 ```
+
+### People sign in with an email and password
+
+Devices and services present tokens or SAS keys, which is all they can do. People get an address and a password instead:
+
+```bash
+curl -X POST https://hub:8443/api/devices -H "Authorization: Bearer $ADMIN" \
+     -d '{"id":"ana","role":"operator","auth":"password","email":"ana@plant.co","password":"a long passphrase"}'
+curl -X PUT https://hub:8443/api/devices/ana/password -H "Authorization: Bearer $ADMIN" \
+     -d '{"email":"ana@plant.co","password":"a new passphrase"}'          # admin resets it
+curl -X PUT https://hub:8443/api/me/password -b cookies.txt \
+     -d '{"currentPassword":"…","newPassword":"…"}'                        # change your own
+curl -X POST https://hub:8443/api/login -d '{"email":"ana@plant.co","password":"a long passphrase"}'
+```
+
+- **Storage.** PBKDF2-HMAC-SHA256, 600 000 iterations, a random salt per person, using `crypto/pbkdf2` from the standard library, so it adds no dependency. The password is never stored, and a config backup carries only the verifier.
+- **Addresses are unique across every tenant,** because an address identifies an account before any tenant is known. They are lowercased and trimmed, so `Ana@Plant.CO` and `ana@plant.co` are one account. A credentials file holding two accounts on one address refuses to load rather than guessing.
+- **An unknown address costs the same work as a wrong password,** so the two can't be told apart by timing.
+- **Sessions, not passwords, in the browser.** Signing in mints a session token, which is what the cookie holds. Sessions live in memory, so a hub restart signs people out; each use re-reads the account, so disabling, deleting, expiring or changing the password ends them at once, and signing out drops the session server-side.
+- **Minimum 10 characters,** with no composition rules: those mostly produce `Passw0rd!`.
+- **Not included:** no self-service sign-up, no password reset by email (the hub sends no mail of its own), and no multi-factor. An admin sets the first password and can reset it.
 
 - **Tokens.** Each is 256 bits of randomness, stored only as a SHA-256 hash.
 - **Revocation** takes effect immediately and also drops the device's live MQTT sessions.
@@ -1001,13 +1022,15 @@ The dashboard can be installed on phones, tablets and PCs: it opens in its own w
 |---|---|
 | `stat` | current value, threshold status, sparkline |
 | `meter` | value against a min–max range with warn/critical colouring |
-| `line` | up to 4 fields. **Live**, or a historical range (1 h – 30 d) drawn as bucket averages with a min–max band. Anomaly episodes appear as red markers, explained in the hover tooltip |
+| `line` | up to 4 fields. **Live**, or a historical range (1 h – 30 d) drawn as bucket averages with a min–max band. **Scrollable**: drag sideways through time, wheel to zoom. Anomaly episodes appear as red markers, explained in the hover tooltip |
 | `stats` | mean, min, max, std and sample count over 1 h – 30 d |
 | `anomalies` | anomaly log for one sensor or all, open episodes first, live |
 | `state` | text or on/off with a "normal" value |
 | `eta` | time until a forecast reaches a limit, with range and a reliability label |
 
 The bell in the top bar shows a live count of unacknowledged alarms. For `stat`/`meter` thresholds, set `warn` and `crit`; if `crit < warn`, low values are treated as bad. Fields in one `line` tile share a y-axis, so only group fields on the same scale.
+
+**Scrolling a chart.** Drag a `line` chart sideways to move through time and use the wheel to zoom, on a live chart as well as a ranged one. While scrolled it stops following now, keeps the window width as you pan, and fetches exactly that window (`/series?from=…&to=…`), so going back a week costs one request rather than loading a week up front. Scrolling stops at now, since there is nothing after it. **Live**, or a double-click, goes back to following. Verified in a browser from the requests the chart makes: panning right went back in time at a constant width, panning left hard stopped at now, the wheel narrowed 1440 → 590 minutes and widened again, and **Live** restored the original range.
 
 ### Adding a tile type
 

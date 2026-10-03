@@ -36,6 +36,8 @@ $data = 'demo-data'
 $bin = Join-Path $data 'bin'
 $base = "http://127.0.0.1:$HttpPort"
 $super = 'platform-demo-token'
+$DemoEmail = 'ana@plant.co'
+$DemoPassword = 'demo plant password'
 $procs = @()
 
 function Invoke-Api {
@@ -78,7 +80,10 @@ try {
 
   # ---- seed: tenants, people, devices, sensors, commands, dashboard ----
   $cred = @{}
-  Invoke-Api POST '/api/admin/tenants' @{ id = 'acme'; name = 'Acme Mining'; quota = @{ messagesPerDay = 500000; maxSensors = 200; maxDevices = 100 } } | Out-Null
+  # deviceSelfService: the tenant's own admins may add devices and users.
+  # Without it only the platform operator can, and their Add buttons are hidden.
+  Invoke-Api POST '/api/admin/tenants' @{ id = 'acme'; name = 'Acme Mining'; deviceSelfService = $true
+    quota = @{ messagesPerDay = 500000; maxSensors = 200; maxDevices = 100 } } | Out-Null
   Invoke-Api POST '/api/admin/tenants' @{ id = 'globex'; name = 'Globex Foods' } | Out-Null
 
   foreach ($p in @(@('ops', 'admin', 'Plant manager'), @('shift', 'operator', 'Shift supervisor'), @('screen', 'viewer', 'Control-room screen'))) {
@@ -89,6 +94,9 @@ try {
     $cred[$d[0]] = (Invoke-Api POST '/api/devices' @{ id = $d[0]; role = 'device'; sensors = @($d[0]); auth = 'keys'; note = $d[1] }).connectionString
   }
   $cred['meter-9'] = (Invoke-Api POST '/api/devices' @{ id = 'meter-9'; role = 'device'; sensors = @('meter-9'); auth = 'token'; note = 'Energy meter, substation' }).token
+  # A person who signs in with an email and password, to try that path.
+  Invoke-Api POST '/api/devices' @{ id = 'ana'; role = 'admin'; auth = 'password'; email = $DemoEmail
+    password = $DemoPassword; note = 'Plant manager (email sign-in)' } | Out-Null
 
   # [char]0xB0 for the degree sign: Windows PowerShell 5.1 reads a .ps1 without
   # a BOM as the system codepage, which would mangle a literal non-ASCII byte.
@@ -136,7 +144,10 @@ try {
   Write-Host ""
   Write-Host "  IoT Hub demo is running: $base" -ForegroundColor Green
   Write-Host ""
-  Write-Host "  Sign in with one of these tokens:"
+  Write-Host "  Sign in with an email and password:"
+  Write-Host "    Admin (Acme)        $DemoEmail / $DemoPassword"
+  Write-Host ""
+  Write-Host "  or with one of these tokens:"
   Write-Host "    Platform operator   $super"
   Write-Host "    Admin (Acme)        $($cred['ops'])"
   Write-Host "    Operator (Acme)     $($cred['shift'])"

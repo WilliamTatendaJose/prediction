@@ -427,3 +427,14 @@ canvas { display: block; width: 100%; height: 100%; }
 .bulkbar select { width: auto; max-width: 100%; }
 .tbl th.sel, .tbl td.sel { width: 28px; }
 .tbl tr.selected td { background: var(--accent-soft); }
+
+/* Scrollable charts: drag sideways through time, wheel to zoom. */
+.chart { cursor: grab; touch-action: pan-y; }
+.chart.panning { cursor: grabbing; }
+.chart-live {
+  position: absolute; top: 4px; right: 6px; z-index: 4;
+  font: inherit; font-size: 11px; line-height: 1; padding: 4px 9px;
+  background: var(--accent); color: #fff; border: 0; border-radius: 999px;
+  cursor: pointer; box-shadow: 0 1px 4px rgba(0, 0, 0, .25);
+}
+.chart-live:hover { filter: brightness(1.08); }

@@ -23,7 +23,10 @@ cat <<MSG
 
   IoT Hub demo is running: http://localhost:8080
 
-  Sign in with one of these tokens:
+  Sign in with an email and password:
+    Admin (Acme)        ana@plant.co / demo plant password
+
+  or with one of these tokens:
     Platform operator   platform-demo-token
     Admin (Acme)        $(cred ops)
     Operator (Acme)     $(cred shift)
