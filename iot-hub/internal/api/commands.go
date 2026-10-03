@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -69,7 +70,7 @@ func (s *Server) listCommands(w http.ResponseWriter, r *http.Request) {
 		devs = append(devs, d)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"commands": s.Twins.Commands(), "devices": devs, "history": s.Twins.RecentRuns(ids, 100),
+		"commands": s.Twins.Commands(), "devices": devs, "history": s.Twins.RecentRuns(ids, 100), "batches": s.Twins.Batches(),
 		"canEdit": id.Can(auth.Manage, ""),
 	})
 }
@@ -217,4 +218,85 @@ func (s *Server) setExpected(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "device.expected", dev, req.Interval)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// runBatch: POST /api/commands/{name}/run {"devices": [...], "params": {...}}
+// sends one command to many devices in the background → 202 with the batch;
+// poll GET /api/commands/batches/{id}. Devices the caller may not command
+// this way are reported as skipped.
+func (s *Server) runBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.twinsOn(w) {
+		return
+	}
+	id, name := caller(r), r.PathValue("name")
+	if !id.Can(auth.Operate, "") && !id.Can(auth.Manage, "") && id.Role != auth.Service {
+		writeErr(w, http.StatusForbidden, errors.New("commands are for operators and admins"))
+		return
+	}
+	var req struct {
+		Devices []string       `json:"devices"`
+		Params  map[string]any `json:"params"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, twin.MaxMessageBody+64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Devices) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("choose at least one device"))
+		return
+	}
+	var c *twin.Command
+	for _, x := range s.Twins.Commands() {
+		if x.Name == name {
+			c = &x
+		}
+	}
+	if c == nil {
+		writeErr(w, http.StatusNotFound, errors.New("no command "+name))
+		return
+	}
+	allowed := map[string]bool{}
+	for _, d := range s.commandDevices(id) {
+		allowed[d] = true
+	}
+	var run []string
+	skip := map[string]string{}
+	for _, d := range req.Devices {
+		switch {
+		case !allowed[d]:
+			skip[d] = "not a device you may command"
+		case !mayRun(id, *c, d):
+			skip[d] = "only admins may run this command"
+		default:
+			run = append(run, d)
+		}
+	}
+	b, err := s.Twins.RunBatch(name, id.ID, run, skip, req.Params)
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	s.audit(r, "command.batch", name, fmt.Sprintf("%d devices, %d skipped, batch %s", b.Total-b.Counts["skipped"], b.Counts["skipped"], b.ID))
+	writeJSON(w, http.StatusAccepted, b)
+}
+
+// getBatch: GET /api/commands/batches/{batch}
+func (s *Server) getBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.twinsOn(w) {
+		return
+	}
+	id := caller(r)
+	b, err := s.Twins.GetBatch(r.PathValue("batch"))
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	// People who may command see every batch; an app only its own.
+	if !id.Can(auth.Operate, "") && !id.Can(auth.Manage, "") && !(id.Role == auth.Service && b.By == id.ID) {
+		writeErr(w, http.StatusForbidden, errors.New("commands are for operators and admins"))
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
 }

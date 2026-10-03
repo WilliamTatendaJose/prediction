@@ -2,7 +2,7 @@
 // what was sent, and (admins) define the catalog.
 import {
   h, api, put, del, enc, pageHeader, card, badge, empty, table, tabs, field, opt, button, icon, modal, confirmDialog,
-  ago, when, toast,
+  ago, when, toast, meter,
 } from '../core.js';
 import { deviceFreshness } from './overview.js';
 
@@ -10,12 +10,13 @@ const RUN_TONE = { ok: 'good', completed: 'good', queued: 'info', delivered: 'in
   timeout: 'warning', rejected: 'critical', deadlettered: 'critical', expired: 'warning', untracked: 'neutral' };
 const RUN_LABEL = { ok: 'Done', failed: 'Device refused', offline: 'Device offline', timeout: 'No answer', queued: 'Queued',
   delivered: 'Delivered', completed: 'Completed', rejected: 'Rejected', deadlettered: 'Undeliverable', expired: 'Expired', untracked: 'Sent' };
-export const runBadge = (r) => badge(RUN_LABEL[r.status] || r.status, RUN_TONE[r.status] || 'neutral');
+export const runBadge = (r, text) => badge(text || RUN_LABEL[r.status] || r.status, RUN_TONE[r.status] || 'neutral');
 
 const cmdLabel = (c) => c.label || c.name;
 
 // Ask for parameters (and confirmation), run, report. Resolves to the run.
-export async function runCommand(device, c) {
+// The form for a command's parameters: {els, read()}.
+function paramForm(c) {
   const inputs = (c.params || []).map((p) => {
     let input;
     if (p.type === 'bool') input = h('input', { type: 'checkbox', checked: p.default === true });
@@ -33,12 +34,17 @@ export async function runCommand(device, c) {
     }
     return out;
   };
-  const go = () => api(`/api/devices/${enc(device)}/commands/${enc(c.name)}`, { method: 'POST', body: JSON.stringify({ params: read() }) });
+  return { els: inputs.map((x) => x.el), read, any: inputs.length > 0 };
+}
+
+export async function runCommand(device, c) {
+  const form = paramForm(c);
+  const go = () => api(`/api/devices/${enc(device)}/commands/${enc(c.name)}`, { method: 'POST', body: JSON.stringify({ params: form.read() }) });
   let run;
-  if (inputs.length || c.confirm) {
+  if (form.any || c.confirm) {
     run = await modal(`${cmdLabel(c)} on ${device}`, h('div', { class: 'stack' },
       c.confirm && h('p', { class: 'modal-text', text: `This sends "${cmdLabel(c)}" to ${device}${c.kind === 'message' ? ' (it is delivered when the device next listens)' : ''}.` }),
-      inputs.map((x) => x.el)), {
+      form.els), {
       actions: [['Cancel'], [c.kind === 'method' ? 'Run now' : 'Send', go, c.confirm ? 'danger' : 'primary']],
     });
   } else {
@@ -70,8 +76,9 @@ export function commandButtons(device, cmds, after) {
 }
 
 export async function render(el, ctx) {
+  if (ctx.params[0] === 'batch' && ctx.params[1]) return batchView(el, ctx, ctx.params[1]);
   const data = await api('/api/commands');
-  data.commands ||= []; data.devices ||= []; data.history ||= [];
+  data.commands ||= []; data.devices ||= []; data.history ||= []; data.batches ||= [];
   const tab = ['send', 'history', ...(data.canEdit ? ['catalog'] : [])].includes(ctx.params[0]) ? ctx.params[0] : 'send';
   const byName = Object.fromEntries(data.commands.map((c) => [c.name, c]));
   el.append(pageHeader('Commands', {
@@ -80,29 +87,119 @@ export async function render(el, ctx) {
   }), tabs([['send', 'Send'], ['history', 'History', data.history.length], ...(data.canEdit ? [['catalog', 'Catalog', data.commands.length]] : [])],
     tab, (k) => { location.hash = '#/commands/' + k; }));
 
-  if (tab === 'history') { el.append(card(null, {}, historyTable(data.history, { showDevice: true }))); return; }
+  if (tab === 'history') {
+    if (data.batches.length) el.append(card('Sent to many devices', { sub: 'The last 20 batches since the hub started.' }, batchTable(data.batches)));
+    el.append(card(data.batches.length ? 'Every command' : null, {}, historyTable(data.history, { showDevice: true })));
+    return;
+  }
   if (tab === 'catalog') return catalog(el, ctx, data);
 
   const q = h('input', { type: 'search', placeholder: 'Find a device', 'aria-label': 'Find a device' });
   const box = h('div');
+  const bar = h('div');
+  const selected = new Set();
+  let shown = [];
+  const drawBar = () => {
+    bar.replaceChildren();
+    if (!selected.size) return;
+    const sel = data.devices.filter((d) => selected.has(d.id));
+    // Commands offered on at least one selected device; the rest are skipped.
+    const offered = data.commands.map((c) => [c, sel.filter((d) => d.commands.includes(c.name)).length]).filter(([, n]) => n > 0);
+    const pick = h('select', { 'aria-label': 'Command' }, offered.map(([c, n]) => opt(c.name, `${cmdLabel(c)}${n < sel.length ? ` (applies to ${n} of ${sel.length})` : ''}`)));
+    bar.append(h('div', { class: 'bulkbar', role: 'region', 'aria-label': 'Send to selected devices' },
+      h('b', { text: `${sel.length} selected` }),
+      offered.length ? [pick, button('Send to selected…', () => sendMany(byName[pick.value], sel), { kind: 'primary' })]
+        : h('span', { class: 'hint', text: 'No command applies to all of these.' }),
+      h('span', { class: 'spacer' }),
+      button('Clear selection', () => { selected.clear(); draw(); }, { kind: 'small ghost' })));
+  };
   const draw = () => {
     const t = q.value.trim().toLowerCase();
-    const devs = data.devices.filter((d) => d.commands.length && (!t || d.id.toLowerCase().includes(t))).sort((a, b) => a.id.localeCompare(b.id));
+    shown = data.devices.filter((d) => d.commands.length && (!t || d.id.toLowerCase().includes(t))).sort((a, b) => a.id.localeCompare(b.id));
+    const all = h('input', { type: 'checkbox', 'aria-label': 'Select all shown', checked: shown.length > 0 && shown.every((d) => selected.has(d.id)),
+      onchange: (ev) => { for (const d of shown) { if (ev.target.checked) selected.add(d.id); else selected.delete(d.id); } draw(); } });
     box.replaceChildren(card(null, {}, !data.commands.length
       ? empty('No commands yet', data.canEdit ? 'Define commands such as "Reboot" or "Close valve" once, for the devices they apply to.' : 'An admin has not defined any commands yet.',
         data.canEdit && button('New command', () => editCommand(null, ctx), { kind: 'primary' }))
-      : devs.length ? table(['Device', 'Status', 'Commands'], devs.map((d) => {
+      : shown.length ? table([{ text: '', cls: 'sel' }, 'Device', 'Status', 'Commands'], shown.map((d) => {
         const [label, tone] = deviceFreshness(d.lastDataTime, d.expectedIntervalSec);
-        return h('tr', {},
+        return h('tr', { class: selected.has(d.id) ? 'selected' : null },
+          h('td', { class: 'sel' }, h('input', { type: 'checkbox', 'aria-label': 'Select ' + d.id, checked: selected.has(d.id),
+            onchange: (ev) => { if (ev.target.checked) selected.add(d.id); else selected.delete(d.id); draw(); } })),
           h('td', {}, h('div', { class: 'primary-cell' }, h('b', { text: d.id }), h('small', { text: d.lastDataTime ? 'last data ' + ago(d.lastDataTime) : 'no data yet' }))),
           h('td', {}, badge(label, tone), d.connectionState === 'Connected' ? h('span', { class: 'chip', text: 'MQTT connected' }) : null),
           h('td', {}, commandButtons(d.id, d.commands.map((n) => byName[n]).filter(Boolean), () => ctx.reload())));
       })) : empty('No matches', t ? 'No device with commands matches.' : 'No device has a command you may run.')));
+    box.querySelector('th.sel')?.append(all);
+    drawBar();
   };
   q.oninput = draw;
   el.append(h('div', { class: 'toolbar' }, h('div', { class: 'search' }, icon('search'), q),
-    h('span', { class: 'hint', text: 'Methods need the device connected over MQTT; messages wait until it listens.' })), box);
+    h('span', { class: 'hint', text: 'Tick devices to send one command to all of them. Methods need the device connected over MQTT; messages wait until it listens.' })), bar, box);
   draw();
+}
+
+// Send c to many devices: confirm (always: it touches many), then follow
+// the batch on its own page.
+async function sendMany(c, devices) {
+  const run = devices.filter((d) => d.commands.includes(c.name)).map((d) => d.id);
+  const skipped = devices.length - run.length;
+  const form = paramForm(c);
+  const list = run.slice(0, 12).join(', ') + (run.length > 12 ? ` and ${run.length - 12} more` : '');
+  const b = await modal(`${cmdLabel(c)} on ${run.length} device${run.length === 1 ? '' : 's'}`, h('div', { class: 'stack' },
+    h('p', { class: 'modal-text', text: `This sends "${cmdLabel(c)}" to ${list}.${c.kind === 'message' ? ' Each is delivered when the device next listens.' : ' Offline devices are reported, not retried.'}` }),
+    skipped ? h('p', { class: 'hint', text: `${skipped} selected device${skipped === 1 ? ' does' : 's do'} not offer this command and will be skipped.` }) : null,
+    form.els), {
+    actions: [['Cancel'], [`Send to ${run.length}`, () => api(`/api/commands/${enc(c.name)}/run`, { method: 'POST', body: JSON.stringify({ devices: run, params: form.read() }) }),
+      c.confirm ? 'danger' : 'primary']],
+  });
+  if (!b?.id) return;
+  location.hash = '#/commands/batch/' + enc(b.id);
+}
+
+function batchTable(batches) {
+  return table(['When', 'Command', 'By', 'Progress', 'Results'], batches.map((b) => h('tr', { class: 'link', onclick: () => { location.hash = '#/commands/batch/' + enc(b.id); } },
+    h('td', { title: when(b.at), text: ago(b.at) }),
+    h('td', {}, h('a', { href: '#/commands/batch/' + enc(b.id), text: b.label || b.command })),
+    h('td', { text: b.by }),
+    h('td', { text: b.finished ? `done, ${b.total} devices` : `${b.done} of ${b.total}` }),
+    h('td', {}, countBadges(b.counts)))));
+}
+
+function countBadges(counts) {
+  return Object.entries(counts || {}).sort().map(([k, n]) => [runBadge({ status: k === 'skipped' ? 'untracked' : k }, `${n} ${RUN_LABEL[k] || k}`), ' ']);
+}
+
+async function batchView(el, ctx, id) {
+  ctx.crumbs([['Batch']]);
+  const head = h('div'), body = h('div');
+  el.append(head, body);
+  const draw = (b) => {
+    head.replaceChildren(pageHeader(`${b.label || b.command} on ${b.total} device${b.total === 1 ? '' : 's'}`, {
+      back: ['#/commands/history', 'Commands'],
+      sub: h('span', { class: 'page-sub' }, b.finished ? badge('Finished', 'good') : badge('Running', 'info'),
+        h('span', { text: `sent by ${b.by} ${ago(b.at)}` }), b.params && Object.keys(b.params).length ? h('span', { class: 'chip mono', text: JSON.stringify(b.params) }) : null),
+    }));
+    const rank = { pending: 0, error: 1, failed: 2, offline: 3, timeout: 4, skipped: 6 };
+    const rows = [...b.results].sort((x, y) => (rank[x.status] ?? 5) - (rank[y.status] ?? 5) || x.device.localeCompare(y.device));
+    body.replaceChildren(
+      card(null, {}, h('div', { class: 'stack' },
+        h('div', { class: 'row' }, h('b', { text: `${b.done} of ${b.total} done` }), h('span', { class: 'spacer' }), countBadges(b.counts)),
+        meter(b.done, b.total, { tone: 'progress' }))), // a progress bar: never warning-coloured
+      card(null, {}, table(['Device', 'Result', 'Details'], rows.map((r) => h('tr', {},
+        h('td', {}, h('b', { text: r.device })),
+        h('td', {}, r.status === 'pending' ? badge('Waiting…', 'info') : r.status === 'skipped' ? badge('Skipped', 'neutral') : runBadge(r)),
+        h('td', { class: 'mono', text: [r.code || '', r.error || ''].filter(Boolean).join(' ') }))))));
+  };
+  let b = await api('/api/commands/batches/' + enc(id));
+  draw(b);
+  // Follow it until every device has answered.
+  while (!b.finished && ctx.current()) {
+    await new Promise((r) => setTimeout(r, 1000));
+    if (!ctx.current()) return;
+    b = await api('/api/commands/batches/' + enc(id)).catch(() => b);
+    draw(b);
+  }
 }
 
 function catalog(el, ctx, data) {

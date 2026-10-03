@@ -73,6 +73,7 @@ type Run struct {
 	Message string          `json:"messageId,omitempty"`
 	TookMs  int64           `json:"tookMs,omitempty"`
 	Device  string          `json:"device,omitempty"` // in cross-device lists
+	Batch   string          `json:"batch,omitempty"`  // sent as part of a batch
 }
 
 func (c Command) MethodName() string {
@@ -384,14 +385,26 @@ var ErrNotOffered = errors.New("command is not offered on this device")
 // A device that is offline or doesn't answer is a recorded outcome, not an
 // error; errors are for requests that can't run (unknown, bad parameters).
 func (s *Service) RunCommand(ctx context.Context, id, name, by string, params map[string]any) (Run, error) {
-	if err := s.check(id); err != nil {
+	c, err := s.command(name)
+	if err != nil {
 		return Run{}, err
 	}
+	return s.runCommand(ctx, id, c, by, params, "")
+}
+
+func (s *Service) command(name string) (Command, error) {
 	s.mu.Lock()
 	c, ok := s.cmds[name]
 	s.mu.Unlock()
 	if !ok {
-		return Run{}, fmt.Errorf("%w: command %s", ErrNotFound, name)
+		return c, fmt.Errorf("%w: command %s", ErrNotFound, name)
+	}
+	return c, nil
+}
+
+func (s *Service) runCommand(ctx context.Context, id string, c Command, by string, params map[string]any, batch string) (Run, error) {
+	if err := s.check(id); err != nil {
+		return Run{}, err
 	}
 	if !c.Applies(id) {
 		return Run{}, ErrNotOffered
@@ -400,7 +413,7 @@ func (s *Service) RunCommand(ctx context.Context, id, name, by string, params ma
 	if err != nil {
 		return Run{}, err
 	}
-	run := Run{ID: newID(), Command: c.Name, Label: c.Label, Kind: c.Kind, By: by, At: s.now().UnixMilli(), Payload: body}
+	run := Run{ID: newID(), Command: c.Name, Label: c.Label, Kind: c.Kind, By: by, At: s.now().UnixMilli(), Payload: body, Batch: batch}
 	start := time.Now()
 	if c.Kind == "method" {
 		timeout := 30 * time.Second

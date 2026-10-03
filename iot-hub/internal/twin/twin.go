@@ -155,6 +155,7 @@ type Service struct {
 
 	cmds    map[string]Command // the command catalog (commands.go)
 	cmdSave sync.Mutex
+	batches []*Batch // recent batches, newest last (batch.go)
 }
 
 func New(path string, exists func(string) bool) *Service {

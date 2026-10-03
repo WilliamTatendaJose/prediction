@@ -1071,6 +1071,13 @@ curl https://hub:8443/api/commands -H "$OP"                    # catalog, device
 - **Payload.** It is the fixed `payload`, plus each parameter as a key. Parameters are typed: `number` with min/max, `text`, `bool` or `choice`, with defaults and `required`. Unknown parameters and out-of-range values are refused with 400.
 - **Who may run it.** Admins define and edit commands. `role: "operator"` (the default) lets operators run the command; `"admin"` keeps it to admins. Operators can't send raw methods or messages, so the catalog is exactly what they can do to devices.
 - **Outcomes are recorded, not errors.** An offline device, no answer in time, or the device refusing (status ≥ 400) is saved as such and returned with 200. A message run shows the message's current status (queued, delivered, completed, rejected …).
+- **Many devices at once.** `POST /api/commands/{name}/run {"devices":[…],"params":{…}}` starts a **batch** and answers 202 at once. It runs 16 devices at a time in the background, since a method can wait up to 5 minutes per device; poll `GET /api/commands/batches/{id}` for each device's result and the counts.
+  - **Skipped, not refused.** Devices the command isn't offered on, people, unknown ids, or (for an operator) admin-only commands are listed as skipped with the reason.
+  - **Checked before sending.** Parameters are validated once, before anything is sent. A batch with nothing to run is refused with 400.
+  - **Results follow the queue.** Message results move on with the queue (queued → completed …).
+  - **Records.** Every device's run is also in its own history, tagged with the batch id, and the batch is audited (`command.batch`).
+  - **Limits.** At most 1000 devices per batch. The last 20 batches are kept in memory; their runs persist in the device histories.
+  - **In the app:** tick devices on the Commands page (search, then "select all shown"), pick a command (the list says when it applies to only some), confirm, and follow the batch live on its own page. Recent batches are on the History tab.
 - **History.** Each device keeps its last 50 runs; they are audited as `command.run`. The catalog is kept in `commands.json` next to the twins.
 - **Tested:**
   - a real MQTT device answering a command;
@@ -1084,7 +1091,8 @@ curl https://hub:8443/api/commands -H "$OP"                    # catalog, device
   - an admin defined both commands in the UI;
   - an operator ran Reboot on `devicesim` (answered 200), and an out-of-range delay was refused in the dialog;
   - Set valve went from queued to Completed when the device acknowledged it;
-  - an operator sees no catalog editing.
+  - an operator sees no catalog editing;
+  - batches: tested with the race detector. A batch answered 202 while a device was still replying. Results covered ok, offline, every skip reason, bad parameters (nothing sent), a viewer, a batch with nothing to run, the history tags and audit, and a message batch following a device's completion. In the browser, an operator searched "pump", selected all and sent Reboot: 1 done, 2 offline. Set valve to all six devices showed 2 Completed (the live devices) and 4 Queued.
 
 **On the device, over MQTT.** Topics are under `devices/{id}/`, or `{tenant}/devices/{id}/` in multi-tenant mode. Subscribe to `devices/{id}/#`.
 
