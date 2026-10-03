@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -147,7 +148,8 @@ type Service struct {
 	pending map[string]*call
 	dirty   chan struct{}
 	now     func() time.Time
-	flushed int64 // when Data last asked for a save (ms)
+	flushed int64          // when Data last asked for a save (ms)
+	rand    func() float64 // [0,1): retry jitter; replaced in tests
 
 	// OnData, if set, is told about every accepted reading (after Data
 	// records it): the overdue check clears its alarm at once.
@@ -160,7 +162,7 @@ type Service struct {
 
 func New(path string, exists func(string) bool) *Service {
 	return &Service{Exists: exists, path: path, devs: map[string]*rec{}, pending: map[string]*call{},
-		dirty: make(chan struct{}, 1), now: time.Now,
+		dirty: make(chan struct{}, 1), now: time.Now, rand: mrand.Float64,
 		tr: Transport{Listening: func(string, string) bool { return false }, Connected: func(string) bool { return false },
 			Send: func(string, string, []byte) int { return 0 }}}
 }

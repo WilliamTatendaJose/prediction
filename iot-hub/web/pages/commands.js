@@ -151,7 +151,12 @@ export function retryWait(p, n) {
   const cap = p.maxEvery ? dur(p.maxEvery) : 24 * 36e5;
   return Math.min(dur(p.every) * Math.pow(p.backoff > 1 ? p.backoff : 1, n - 1), cap);
 }
-const retryText = (p) => `every ${p.every}${p.backoff > 1 ? ` ×${p.backoff}` : ''}${p.maxEvery ? ` (max ${p.maxEvery})` : ''}`;
+// With jitter, wait n falls in [w(1-j), min(cap, w(1+j))] (twin.RetryPolicy.Jittered).
+export function retryRange(p, n) {
+  const w = retryWait(p, n), j = p.jitter || 0, cap = p.maxEvery ? dur(p.maxEvery) : 24 * 36e5;
+  return [w * (1 - j), Math.min(cap, w * (1 + j))];
+}
+const retryText = (p) => `every ${p.every}${p.backoff > 1 ? ` ×${p.backoff}` : ''}${p.maxEvery ? ` (max ${p.maxEvery})` : ''}${p.jitter ? ` ±${Math.round(p.jitter * 100)}%` : ''}`;
 
 // Retry controls: {el, read() → policy}; attempts 0 = off.
 function retryControls(p) {
@@ -164,24 +169,30 @@ function retryControls(p) {
   const cap = h('select', { 'aria-label': 'Longest wait' }, [['', 'no longer than 24 h'], ['5m', 'no longer than 5 min'], ['15m', 'no longer than 15 min'], ['1h', 'no longer than 1 h'], ['6h', 'no longer than 6 h']]
     .map(([v, t]) => opt(v, t, v === (p?.maxEvery || ''))));
   if (p?.maxEvery && !['5m', '15m', '1h', '6h'].includes(p.maxEvery)) cap.append(opt(p.maxEvery, 'no longer than ' + p.maxEvery, true));
+  const jitter = h('select', { 'aria-label': 'Randomize waits' }, [[0, 'exact waits'], [0.1, 'randomized ±10%'], [0.2, 'randomized ±20%'], [0.5, 'randomized ±50%']]
+    .map(([v, t]) => opt(String(v), t, v === (p?.jitter || 0))));
+  if (p?.jitter && ![0.1, 0.2, 0.5].includes(p.jitter)) jitter.append(opt(String(p.jitter), `randomized ±${Math.round(p.jitter * 100)}%`, true));
   const preview = h('span', { class: 'hint' });
   const read = () => {
     if (!on.checked) return { attempts: 0 };
     const r = { attempts: Number(attempts.value), every: every.value };
     if (Number(backoff.value) > 1) { r.backoff = Number(backoff.value); if (cap.value) r.maxEvery = cap.value; }
+    if (Number(jitter.value) > 0) r.jitter = Number(jitter.value);
     return r;
   };
-  const more = h('div', { class: 'stack', style: 'gap:6px' }, h('div', { class: 'row' }, attempts, every, backoff, cap), preview);
+  const more = h('div', { class: 'stack', style: 'gap:6px' }, h('div', { class: 'row' }, attempts, every, backoff, cap, jitter), preview);
   const sync = () => {
     more.hidden = !on.checked;
     cap.hidden = Number(backoff.value) <= 1;
     const r = read();
     if (!r.attempts) return;
-    const waits = Array.from({ length: r.attempts }, (_, i) => retryWait(r, i + 1));
-    const total = waits.reduce((a, b) => a + b, 0);
-    preview.textContent = `Waits ${waits.map(fmtDur).join(', ')} between tries; the last retry comes about ${fmtDur(total)} after the first try (plus each round's own time).`;
+    const ranges = Array.from({ length: r.attempts }, (_, i) => retryRange(r, i + 1));
+    const one = ([a, b]) => (a === b ? fmtDur(a) : `${fmtDur(a)}–${fmtDur(b)}`);
+    const total = [ranges.reduce((x, [a]) => x + a, 0), ranges.reduce((x, [, b]) => x + b, 0)];
+    preview.textContent = `Waits ${ranges.map(one).join(', ')} between tries; the last retry comes about ${one(total)} after the first try (plus each round's own time).`
+      + (r.jitter ? ' Randomizing keeps batches started together from retrying in lockstep.' : '');
   };
-  for (const x of [on, attempts, every, backoff, cap]) x.onchange = sync;
+  for (const x of [on, attempts, every, backoff, cap, jitter]) x.onchange = sync;
   sync();
   return {
     el: h('div', { class: 'stack', style: 'gap:6px' }, field('Retry devices that are offline or don\'t answer', on, { cls: 'check' }), more,

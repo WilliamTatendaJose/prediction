@@ -183,8 +183,11 @@ func TestCommandBatch(t *testing.T) {
 	if code, _, _ := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"1m","backoff":20}}`); code != 400 {
 		t.Errorf("backoff 20 accepted: %d", code)
 	}
-	code, rb, raw := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"10m","backoff":2,"maxEvery":"30m"}}`)
-	if r, _ := rb["retry"].(map[string]any); code != 202 || r["backoff"] != 2.0 || r["maxEvery"] != "30m" {
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"1m","jitter":0.9}}`); code != 400 {
+		t.Errorf("jitter 0.9 accepted: %d", code)
+	}
+	code, rb, raw := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"10m","backoff":2,"maxEvery":"30m","jitter":0.2}}`)
+	if r, _ := rb["retry"].(map[string]any); code != 202 || r["backoff"] != 2.0 || r["maxEvery"] != "30m" || r["jitter"] != 0.2 {
 		t.Fatalf("backoff policy not kept: %d %s", code, raw)
 	}
 	time.Sleep(300 * time.Millisecond)

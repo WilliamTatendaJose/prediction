@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -671,5 +672,88 @@ func TestRetryBackoff(t *testing.T) {
 	t2 := s.now().UnixMilli()
 	if x := wait(); x.Round != 3 || x.NextRetry-t2 != (4*time.Minute).Milliseconds() {
 		t.Fatalf("third wait %d ms (round %d)", x.NextRetry-t2, x.Round)
+	}
+}
+
+func TestRetryJitter(t *testing.T) {
+	p := RetryPolicy{Attempts: 3, Every: "1m", Jitter: 0.2}
+	if err := p.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for u, want := range map[float64]time.Duration{0: 48 * time.Second, 0.5: time.Minute, 0.75: 66 * time.Second} {
+		if got := p.Jittered(1, u); got != want {
+			t.Errorf("u=%v: %v, want %v", u, got, want)
+		}
+	}
+	// The longest wait still holds: 10m capped, +20% would be 12m.
+	c := RetryPolicy{Attempts: 3, Every: "5m", Backoff: 2, MaxEvery: "10m", Jitter: 0.2}
+	if got := c.Jittered(3, 0.99); got != 10*time.Minute {
+		t.Errorf("cap with jitter: %v", got)
+	}
+	if got := c.Jittered(3, 0); got != 8*time.Minute {
+		t.Errorf("capped wait jittered down: %v, want 8m", got)
+	}
+	for _, j := range []float64{-0.1, 0.6} {
+		if (&RetryPolicy{Attempts: 1, Every: "1m", Jitter: j}).validate() == nil {
+			t.Errorf("jitter %v accepted", j)
+		}
+	}
+	// With the real source: always within ±20%, centred, and actually spread.
+	s, _ := newSvc(t, "")
+	lo, hi, sum := time.Hour, time.Duration(0), time.Duration(0)
+	const n = 5000
+	for i := 0; i < n; i++ {
+		w := p.Jittered(1, s.rand())
+		lo, hi, sum = min(lo, w), max(hi, w), sum+w
+	}
+	if lo < 48*time.Second || hi > 72*time.Second {
+		t.Errorf("out of ±20%%: %v..%v", lo, hi)
+	}
+	if lo > 50*time.Second || hi < 70*time.Second {
+		t.Errorf("not spread: %v..%v", lo, hi)
+	}
+	if mean := sum / n; mean < 59*time.Second || mean > 61*time.Second {
+		t.Errorf("not centred: mean %v", mean)
+	}
+
+	// In a batch: the jittered wait is what gets scheduled …
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s, _ = newSvc(t, path)
+	now := time.UnixMilli(1_000_000_000_000)
+	s.now = func() time.Time { return now }
+	s.rand = func() float64 { return 0 }
+	s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "1s"})
+	b := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 2, Every: "1m", Jitter: 0.2}))
+	nextOf := func(id string) int64 {
+		for i := 0; i < 200; i++ {
+			if x, _ := s.GetBatch(id); x.NextRetry != 0 {
+				return x.NextRetry
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("no retry scheduled")
+		return 0
+	}
+	if got := nextOf(b.ID) - now.UnixMilli(); got != 48_000 {
+		t.Errorf("scheduled %d ms, want 48000 (−20%%)", got)
+	}
+	// … two batches started together don't retry in lockstep …
+	s.rand = mrand.Float64
+	b1 := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 2, Every: "10m", Jitter: 0.5}))
+	b2 := must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{Attempts: 2, Every: "10m", Jitter: 0.5}))
+	if nextOf(b1.ID) == nextOf(b2.ID) {
+		t.Error("two batches retry at the same millisecond")
+	}
+	// … and a restart keeps the chosen time (no re-roll).
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := newSvc(t, path)
+	r.now = s.now
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if x, _ := r.GetBatch(b1.ID); x.NextRetry != nextOf(b1.ID) {
+		t.Errorf("restart changed the retry time: %d vs %d", x.NextRetry, nextOf(b1.ID))
 	}
 }

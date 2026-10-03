@@ -113,6 +113,9 @@ type RetryPolicy struct {
 	Every    string  `json:"every"`              // first wait: 10s to 24h
 	Backoff  float64 `json:"backoff,omitempty"`  // multiplier per retry: 1-10; 0 or 1 = fixed interval
 	MaxEvery string  `json:"maxEvery,omitempty"` // longest single wait (default 24h)
+	// Jitter randomizes each wait by up to ± this fraction (0-0.5), so
+	// batches started together don't retry in lockstep.
+	Jitter float64 `json:"jitter,omitempty"`
 }
 
 const maxWait = 24 * time.Hour
@@ -131,6 +134,9 @@ func (p *RetryPolicy) validate() error {
 	if p.Backoff != 0 && (p.Backoff < 1 || p.Backoff > 10) {
 		return invalid("retry backoff: a multiplier from 1 (fixed) to 10")
 	}
+	if p.Jitter < 0 || p.Jitter > 0.5 {
+		return invalid("retry jitter: 0 to 0.5 (±50%%)")
+	}
 	if p.MaxEvery != "" {
 		m, err := time.ParseDuration(p.MaxEvery)
 		if err != nil || m < d || m > maxWait {
@@ -140,13 +146,10 @@ func (p *RetryPolicy) validate() error {
 	return nil
 }
 
-// Wait is how long to wait before retry n (1-based).
+// Wait is how long to wait before retry n (1-based), before jitter.
 func (p *RetryPolicy) Wait(n int) time.Duration {
 	d, _ := time.ParseDuration(p.Every)
-	limit := maxWait
-	if p.MaxEvery != "" {
-		limit, _ = time.ParseDuration(p.MaxEvery)
-	}
+	limit := p.limit()
 	w := float64(d)
 	if p.Backoff > 1 {
 		w *= math.Pow(p.Backoff, float64(n-1)) // +Inf for huge n: capped below
@@ -155,6 +158,25 @@ func (p *RetryPolicy) Wait(n int) time.Duration {
 		return limit
 	}
 	return time.Duration(w)
+}
+
+func (p *RetryPolicy) limit() time.Duration {
+	if p.MaxEvery != "" {
+		l, _ := time.ParseDuration(p.MaxEvery)
+		return l
+	}
+	return maxWait
+}
+
+// Jittered is Wait(n) moved by u ∈ [0,1) within ±Jitter: u = 0.5 keeps
+// it. It never exceeds the longest wait.
+func (p *RetryPolicy) Jittered(n int, u float64) time.Duration {
+	w := p.Wait(n)
+	if p.Jitter <= 0 {
+		return w
+	}
+	j := float64(w) * (1 + p.Jitter*(2*u-1))
+	return min(time.Duration(j), p.limit())
 }
 
 // AutoRetry: failures a later attempt may fix by itself. A device that
@@ -320,7 +342,7 @@ func (s *Service) afterRoundLocked(b *Batch, now int64) {
 	if again {
 		if b.NextRetry == 0 {
 			// The round that just ran was retry Round-1; the next is Round.
-			b.NextRetry = now + b.Retry.Wait(b.Round).Milliseconds()
+			b.NextRetry = now + b.Retry.Jittered(b.Round, s.rand()).Milliseconds()
 		}
 		return
 	}
