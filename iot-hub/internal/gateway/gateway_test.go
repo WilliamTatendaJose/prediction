@@ -439,7 +439,7 @@ func TestQuotasAndSelfService(t *testing.T) {
 		t.Errorf("sensor quota: %d", code)
 	}
 	// Raising the quota applies at once.
-	call(t, "PATCH", s.url+"/api/admin/tenants/small", super, `{"quota":{"messagesPerSecond":5,"maxDevices":2,"maxSensors":10}}`)
+	call(t, "PATCH", s.url+"/api/admin/tenants/small", super, `{"quota":{"messagesPerSecond":5,"maxDevices":3,"maxSensors":10}}`)
 	time.Sleep(300 * time.Millisecond)
 	if code, _, _ := call(t, "POST", s.url+"/api/sensors/m3/data", adm, `{"v":1}`); code != 202 {
 		t.Errorf("after raising the quota: %d", code)
@@ -447,6 +447,19 @@ func TestQuotasAndSelfService(t *testing.T) {
 	code, m, _ := call(t, "GET", s.url+"/api/admin/tenants/small", super, "")
 	if code != 200 || m["messagesRejected"].(float64) == 0 || m["sensors"].(float64) != 3 {
 		t.Errorf("usage %v", m)
+	}
+	// The tenant's own view of its plan: no operator notes.
+	call(t, "PATCH", s.url+"/api/admin/tenants/small", super, `{"note":"overdue invoice"}`)
+	code, m, _ = call(t, "GET", s.url+"/api/usage", adm, "")
+	if q, _ := m["quota"].(map[string]any); code != 200 || m["sensors"].(float64) != 3 || q["maxSensors"].(float64) != 10 || m["note"] != nil {
+		t.Errorf("tenant usage %d %v", code, m)
+	}
+	viewer := issue(t, s, "small", `{"id":"look","role":"viewer"}`)
+	if code, _, _ := call(t, "GET", s.url+"/api/usage", viewer, ""); code != 200 {
+		t.Errorf("viewer usage: %d", code)
+	}
+	if code, _, _ := call(t, "GET", s.url+"/api/usage?tenant=other", adm, ""); code != 403 {
+		t.Errorf("other tenant's usage: %d", code)
 	}
 	// Bad tenant ids and duplicate creation.
 	for _, bad := range []string{`{"id":"A"}`, `{"id":"admin"}`, `{"id":"x"}`, `{"id":"has_underscore"}`, `{"id":"ok-1","bogus":1}`} {

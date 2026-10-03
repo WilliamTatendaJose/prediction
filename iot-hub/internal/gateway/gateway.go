@@ -52,6 +52,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /api/grafana", g.tenantAdmin(g.grafanaInfo))
 	mux.HandleFunc("PUT /api/grafana/users/{login}", g.tenantAdmin(g.grafanaSetUser))
 	mux.HandleFunc("DELETE /api/grafana/users/{login}", g.tenantAdmin(g.grafanaDeleteUser))
+	mux.HandleFunc("GET /api/usage", g.usage)
 	mux.HandleFunc("/api/", g.dispatch)
 	if g.Static != nil {
 		// "/" without a method: "GET /" would conflict with "/api/admin/".
@@ -254,6 +255,30 @@ func tenantErr(w http.ResponseWriter, err error) {
 	default:
 		writeErr(w, http.StatusBadRequest, err)
 	}
+}
+
+// usage: GET /api/usage is the tenant's plan and how much of it is used,
+// for its own users (the overview page). Notes and Grafana errors are the
+// operator's and stay out.
+func (g *Gateway) usage(w http.ResponseWriter, r *http.Request) {
+	id, _, rt, ok := g.resolve(w, r)
+	if !ok {
+		return
+	}
+	if !id.Can(auth.Read, "") {
+		writeErr(w, http.StatusForbidden, errors.New("not allowed"))
+		return
+	}
+	u, err := g.Platform.Get(rt.ID)
+	if err != nil {
+		tenantErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": u.ID, "name": u.Name, "status": u.Status, "created": u.Created,
+		"quota": u.Effective, "sensors": u.Sensors, "devices": u.Devices,
+		"messagesToday": u.MessagesToday, "messagesRejected": u.Rejected,
+	})
 }
 
 func (g *Gateway) listTenants(w http.ResponseWriter, _ *http.Request) {

@@ -2,39 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>IoT Hub settings</title>
-  <meta name="theme-color" content="#2a78d6">
-  <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="style.css">
-  <script type="module" src="admin.js"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IoT Hub</title>
+  <script src="admin-redirect.js"></script>
 </head>
-<body class="admin">
-  <header>
-    <h1>Settings</h1>
-    <select id="tenant" hidden aria-label="Tenant" title="Tenant"></select>
-    <span class="conn" id="who"></span>
-    <a class="button" href="./">Dashboard</a>
-  </header>
-  <nav class="tabs" role="tablist" aria-label="Settings sections">
-    <button role="tab" data-tab="sensors">Sensors</button>
-    <button role="tab" data-tab="devices">Devices</button>
-    <button role="tab" data-tab="alerts">Alerts &amp; reports</button>
-    <button role="tab" data-tab="jobs">Stream jobs</button>
-    <button role="tab" data-tab="grafana" hidden>Grafana</button>
-    <button role="tab" data-tab="tenants" hidden>Tenants</button>
-  </nav>
-  <div id="toast" role="status" aria-live="polite" hidden></div>
-  <main id="view" class="panel"></main>
-
-  <dialog id="secret">
-    <form method="dialog">
-      <h3>Save these now</h3>
-      <p class="sub">They are shown only once. Anyone holding them can act as this device.</p>
-      <div id="secret-body"></div>
-      <div class="actions"><button class="primary">I have saved them</button></div>
-    </form>
-  </dialog>
-</body>
+<body><p><a href="/">Settings moved into the app.</a></p></body>
 </html>

@@ -8,7 +8,7 @@ A reusable sensor platform in one Go binary of ~19 MB (stripped):
 - **Run as a SaaS platform** (`-tenancy multi`): isolated tenants with quotas, Azure IoT Hub-style device keys and SAS tokens, and store-and-forward from edge hubs.
 - **Stream jobs** (as in Azure Stream Analytics): windowed SQL-like queries into derived sensors, alarms or webhooks.
 - **Detect anomalies** as data streams in: limit breaches, spikes and silent sensors. Each anomaly reaches the dashboard, the database and MQTT.
-- **Dashboard** with no build step: plain JS embedded in the binary. Tiles are plugins.
+- **Web app** with no build step: plain JS embedded in the binary. It covers overview, dashboards, alarms, sensors, devices, jobs, notifications, tenants and backups. Dashboard tiles are plugins.
 
 Adding a sensor takes no setup: publish data and it appears. Adding a tile type means writing one JS function. The backend doesn't change.
 
@@ -264,7 +264,7 @@ curl https://hub:8443/api/grafana -H "Authorization: Bearer $TENANT_ADMIN"   # l
 - **Idempotent provisioning:** provisioning only creates what is missing and updates the rest, so it is safe to repeat.
 - **Deprovisioning order:** it revokes what was granted, then drops the role, before the tenant's schema is dropped. A `CREATEROLE` admin can't use `DROP OWNED`.
 
-The settings page shows each tenant's Grafana (link, failure, a Provision/Repair button) on the **Tenants** tab. Tenant admins get a **Grafana** tab to add users (password shown once), switch Viewer/Editor and remove them.
+The app shows each tenant's Grafana (link or failure) on the **Tenants** page, where **Manage** sets it up or repairs it. Tenant admins get a **Grafana** page to add users (password shown once), switch Viewer/Editor and remove them.
 
 **PostgreSQL only.** SQLite tenants have no database Grafana could reach safely.
 
@@ -900,51 +900,66 @@ curl -H "Authorization: Bearer $ADMIN" -O https://hub:8443/api/backups/iothub-20
 - **Rotation and downloads:** files are rotated, with `0600`/`0700` modes. Path traversal (`../`, wrong names, `.partial` files) is refused. Viewers get 403.
 - **Restore drill:** the built binary, 3000 readings → backup → data directory deleted → snapshot copied back and config imported. Same statistics (n 3000, mean 49.5) and the same sensor definition.
 
-## Settings page
+## The app
 
-`/admin.html` (the **Settings** link on the dashboard, for admins) does everything the API does, without curl:
+The hub serves a single-page web app (no build step; plain JS modules embedded in the binary). Everything the API does can be done from it.
 
-| Tab | |
-|---|---|
-| Sensors | name, kind, location; per field: label, unit, display range, alarm limits, detection on/off. **Calculated fields** (formula or integral) have a **Test** button that evaluates the formula against the sensor's latest values. **OEE** set-up picks the running, counter and planned-stop fields. Server validation errors show next to Save |
-| Devices | create identities with keys (SAS) and/or tokens and an optional expiry. Secrets are shown once with copy buttons, including the connection string. Show keys, issue a 24 h SAS, rotate, disable, delete. A tenant admin without self-service sees the list and a note that the platform operator issues credentials |
-| Alerts & reports | named targets (sent/failed/last error; test; remove), which targets get alarms, kinds, cooldown, escalation levels with repeat, report targets, shifts, time zone, webhook secret |
-| Stream jobs | live counters per job; a query editor with **Test on history** (results table), save, delete |
-| Tenants | superadmin only: usage against quota, create, edit quota and self-service, suspend/resume, delete (type the id to confirm), and **Open** to view a tenant's dashboard |
+| Page | Who | What |
+|---|---|---|
+| **Overview** | everyone | sensors reporting vs silent, unacknowledged alarms, devices connected over MQTT, messages today against the plan; the sensors that most need a look; active alarms; plan and usage (multi-tenant) |
+| **Dashboard** | everyone (admins edit) | the tenant's live tile layout. Edit, add tiles, reorder, save or discard |
+| **Alarms** | everyone (operators act) | active, last 7 days and shelved. Filter by text and kind. Acknowledge with a verdict and note, shelve with a reason, read and add notes |
+| **Sensors** | everyone (admins edit) | searchable list with latest values, freshness (Reporting / Quiet / Silent) and alarms. Each sensor has **Live** (a tile per field plus a live chart), **History** (1 h – 30 d with min–max band, optional forecast, statistics, time to limit), **Alarms** (30 days) and **Settings** (fields, limits, detection, calculated fields with a **Test** button, OEE) |
+| **Devices & access** | admins | devices and services, and people, as separate lists. Adding one shows its secrets once, then opens its page: details, credentials (show keys, 24 h SAS, rotate, replace token), where to connect (MQTT username and topics, HTTP URL), **Twin**, **Direct methods** and **Messages** |
+| **Stream jobs** | admins | jobs with live counters; an editor with a dry run over 1 h – 7 d of history |
+| **Notifications** | admins | targets (health, test, remove), alarm rules, escalation levels, shift reports, time zone, webhook secret |
+| **Grafana** | admins, when set up | the tenant's Grafana link and users |
+| **System** | admins | hub status and uptime, edge forwarding, the current shift report (send now), the **audit log** (filterable), **configuration export/import** and **backups** (back up now, download) |
+| **Tenants** | platform operator | usage against quota per tenant; create, edit plan, suspend/resume, set up or repair Grafana, delete (type the id), **Open** to switch to it |
 
-A multi-tenant superadmin gets a tenant switcher on both the dashboard and the settings page.
+**Around the pages:**
+- **Navigation.** A sidebar groups the pages, with an alarm count on Alarms. A top bar shows the tenant, the page and a live connection dot, plus a bell with the number of unacknowledged alarms. On phones the sidebar becomes a drawer.
+- **Tenant switcher.** A multi-tenant platform operator picks the tenant in the sidebar. Tenant pages show "Choose a tenant" until one is picked.
+- **Roles.** Pages and buttons follow the user's role: viewers see but can't act, operators handle alarms, admins configure. The server enforces the same rules (403); hiding is only for clarity.
+- **Sign-in.** A full sign-in screen replaces the old dialog. When a session ends, the app returns to it.
+- **Destructive actions** use in-app confirmations. Deleting a tenant or a device asks for its id. A configuration import first runs as a **dry run** and lists what would be created, updated, deleted or disconnected.
+- **Old links.** `/admin.html#devices` redirects to `/#/devices`.
+- **Usage.** `GET /api/usage` (any reader in the tenant) returns the tenant's plan and usage for the Overview page. Operator notes and Grafana errors are not included.
 
-**Security of the page:**
+**Security:**
 - **No HTML from data.** Every value from the server is rendered as text, never as HTML, so device-supplied names can't inject markup.
-- **Same CSP as the dashboard.** The page works under the strict Content-Security-Policy, with no inline styles or scripts. The browser test caught one inline style, which was moved to CSS.
+- **Strict CSP.** The app runs under the hub's Content-Security-Policy (`style-src 'self'`, `script-src 'self'`) with no inline scripts or style attributes. Dynamic sizes are set through the CSS object model.
 
-**Tested** in Chromium, end to end against the built binary in multi-tenant mode:
-- **Superadmin journey:** sign in, see the "no tenants" state, create a tenant, open it, then create a keys device and see its connection string.
-- **SAS cross-check:** readings were sent with SAS tokens signed by an independent Node implementation of Azure's algorithm, using the key shown in the UI (60/60 accepted).
-- **Sensor editor:**
-  - a formula test (`rpm / 60` = 23.83) and a broken formula's error;
-  - the server's OEE validation shown inline;
-  - the save keeps learned field types.
-- **Alerts:**
-  - a private webhook refused with the SSRF message;
-  - a Teams target listed redacted (the secret appears nowhere in the page);
-  - notify and escalation settings saved.
-- **Jobs:** a dry run (60 readings → 7 windows) and a saved job shown as running.
-- **Other views:**
-  - a tenant admin with credentials locked to the platform;
-  - dark theme at 390 px with no horizontal page scroll.
-- **Regressions:** the earlier dashboard, PWA and login tests still pass in single-tenant mode.
-- **Bugs found and fixed along the way:**
-  - a crash on a fresh tenant's settings (empty lists omitted by the server);
-  - an inline style blocked by CSP;
-  - a stray "null"/"false" rendered as text;
-  - duplicate field names accepted silently.
+**Tested** in Chromium (Playwright) against the built binary:
+- **Every page** in multi-tenant mode as the platform operator, and in single-tenant mode with authentication off and on: no script errors, and no failed requests except the expected 401s before sign-in and 404/409s from features that were off.
+- **Roles.** A tenant admin without self-service, an operator and a viewer:
+  - each sees only their navigation;
+  - admin-only addresses send the others to Overview;
+  - an operator gets Acknowledge and Shelve, a viewer only Notes;
+  - the locked tenant admin sees no credential buttons (the server refuses them with 403).
+- **Journeys:**
+  - sign in, including a wrong token;
+  - acknowledge an alarm with a verdict and note;
+  - add a device (secrets shown once, then its page);
+  - create, suspend and delete a tenant, with the switcher following;
+  - create a sensor; add a formula field (Test returned 0.987);
+  - dry-run and save a stream job;
+  - back up now and download a backup;
+  - export, then import with a preview that listed an update and a delete. Cancel left the configuration unchanged;
+  - add a tile, save, reload;
+  - follow an old `admin.html` link.
+- **Phone width (390 px), dark theme:** no horizontal page scroll on Overview or a sensor page; the drawer opens and navigates.
+- **Bugs found and fixed:**
+  - a "null" rendered in the bell;
+  - field names cut off in sensor settings;
+  - a new sensor's page not refreshing after it was created;
+  - the platform's Tenants page labelled with a tenant's name.
 
 ## Install as an app (PWA)
 
 The dashboard can be installed on phones, tablets and PCs: it opens in its own window from the home screen or start menu, like a native app. There is nothing extra to deploy, because the hub serves the manifest, icons and service worker.
 
-- **Android / Chrome / Edge:** the **Install** button in the header, or the browser's install icon.
+- **Android / Chrome / Edge:** **Install app** at the bottom of the sidebar, or the browser's install icon.
 - **iPhone / iPad:** Safari → Share → **Add to Home Screen**.
 - **Requires HTTPS** (`-tls-cert`/`-tls-key`, or a TLS reverse proxy), or `localhost`. Browsers only install from a secure origin. On plain HTTP the dashboard still works as a web page.
 
@@ -977,7 +992,7 @@ The dashboard can be installed on phones, tablets and PCs: it opens in its own w
 | `state` | text or on/off with a "normal" value |
 | `eta` | time until a forecast reaches a limit, with range and a reliability label |
 
-The header shows a live count of active anomalies. For `stat`/`meter` thresholds, set `warn` and `crit`; if `crit < warn`, low values are treated as bad. Fields in one `line` tile share a y-axis, so only group fields on the same scale.
+The bell in the top bar shows a live count of unacknowledged alarms. For `stat`/`meter` thresholds, set `warn` and `crit`; if `crit < warn`, low values are treated as bad. Fields in one `line` tile share a y-axis, so only group fields on the same scale.
 
 ### Adding a tile type
 
@@ -1051,7 +1066,7 @@ curl https://hub:8443/api/devices/pump-1/messages -H "$A"            # queued / 
 | Write desired properties | not the device itself |
 | Everyone else | viewers and operators have no access to twins |
 
-The settings page has a **Twin** button per device: tags and desired editors (saved with an etag check, so a concurrent change isn't overwritten), reported properties, method invocation and messages.
+Each device's page in the app has **Twin**, **Direct methods** and **Messages** tabs: tags and desired editors (saved with an etag check, so a concurrent change isn't overwritten), reported properties, method invocation and the message queue.
 
 **Confidentiality.** Device topics are **never routed** through the broker:
 - **Device to hub:** what a device publishes on them is processed by the hub and then dropped.
