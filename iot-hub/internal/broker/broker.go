@@ -50,6 +50,7 @@ type Config struct {
 type DeviceHandler interface {
 	HandleMQTT(id, sub string, payload []byte)
 	Listening(id string)
+	Data(id string) // a reading from id was accepted
 }
 
 // Resolver finds an active tenant's pipeline.
@@ -95,7 +96,7 @@ func New(cfg Config, p *ingest.Pipeline) (*Broker, error) {
 	if err := srv.AddHook(acl, nil); err != nil {
 		return nil, err
 	}
-	if err := srv.AddHook(&ingestHook{p: p, prefix: cfg.Prefix + "/", log: srv.Log, tenants: cfg.Tenants}, nil); err != nil {
+	if err := srv.AddHook(&ingestHook{p: p, prefix: cfg.Prefix + "/", log: srv.Log, tenants: cfg.Tenants, acl: acl, twins: cfg.Twins}, nil); err != nil {
 		return nil, err
 	}
 	if err := srv.AddHook(&deviceHook{acl: acl, twins: cfg.Twins, multi: cfg.Tenants != nil}, nil); err != nil {
@@ -150,6 +151,8 @@ type ingestHook struct {
 	prefix  string
 	log     *slog.Logger
 	tenants Resolver
+	acl     *aclHook
+	twins   func(tenant string) DeviceHandler
 }
 
 func (h *ingestHook) ID() string { return "iot-ingest" }
@@ -187,6 +190,24 @@ func (h *ingestHook) OnPublished(cl *mqtt.Client, pk packets.Packet) {
 	}
 	if _, err := p.Handle(sensor, field, bytes.Clone(pk.Payload)); err != nil {
 		h.log.Debug("mqtt ingest rejected", "topic", pk.TopicName, "err", err)
+		return
+	}
+	h.noteData(cl)
+}
+
+// noteData tells the sender's twin that its data arrived ("last data").
+func (h *ingestHook) noteData(cl *mqtt.Client) {
+	if h.twins == nil || h.acl == nil {
+		return
+	}
+	h.acl.mu.Lock()
+	id := h.acl.ids[cl]
+	h.acl.mu.Unlock()
+	if id == nil || (id.Role != auth.Device && id.Role != auth.Service) {
+		return
+	}
+	if d := h.twins(id.Tenant); d != nil {
+		d.Data(id.ID)
 	}
 }
 

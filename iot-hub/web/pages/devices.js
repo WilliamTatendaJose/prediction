@@ -4,6 +4,7 @@ import {
   h, api, post, patch, del, enc, pageHeader, card, badge, empty, table, tabs, field, opt, button, icon, linkButton,
   modal, confirmDialog, showSecrets, session, isSuper, multiTenant, tenantId, when, ago, toast,
 } from '../core.js';
+import { freshness } from './overview.js';
 
 const THINGS = ['device', 'service'];
 const ROLE_INFO = {
@@ -16,12 +17,17 @@ const ROLE_INFO = {
 // Without self-service the platform operator issues credentials.
 const locked = () => !isSuper() && multiTenant() && !session.me.deviceSelfService;
 
+// A device's state is its last accepted reading (any transport), on the
+// same scale as sensors: under 2 min sending, under 1 h quiet, else silent.
 function status(d, twin) {
   if (d.disabled) return ['Disabled', 'neutral'];
   if (d.expires && d.expires < Date.now()) return ['Expired', 'critical'];
   if (!THINGS.includes(d.role)) return ['Active', 'good'];
-  return twin?.connectionState === 'Connected' ? ['Connected', 'good'] : ['Not connected', 'neutral'];
+  if (!twin?.lastDataTime) return ['Never sent data', 'neutral'];
+  const [label, tone] = freshness(twin.lastDataTime);
+  return [label === 'Reporting' ? 'Sending data' : label, tone];
 }
+const mqttChip = (twin) => (twin?.connectionState === 'Connected' ? h('span', { class: 'chip', title: 'Has an MQTT session now', text: 'MQTT connected' }) : null);
 
 export async function render(el, ctx) {
   if (ctx.params[0]) return detail(el, ctx, ctx.params[0], ctx.params[1]);
@@ -44,13 +50,13 @@ async function list(el, ctx, seg) {
       return h('tr', { class: 'link', onclick: (ev) => { if (!ev.target.closest('a,button')) location.hash = '#/devices/' + enc(d.id); } },
         h('td', {}, h('div', { class: 'primary-cell' }, h('a', { href: '#/devices/' + enc(d.id), text: d.id }), h('small', { text: d.note || ROLE_INFO[d.role] || '' }))),
         h('td', {}, h('span', { class: 'chip', text: d.role })),
-        h('td', {}, badge(label, tone)),
+        h('td', {}, badge(label, tone), seg === 'things' && mqttChip(tw[d.id])),
         seg === 'things' && h('td', {}, (d.sensors || []).map((p) => h('span', { class: 'chip mono', text: p }))),
         h('td', {}, d.keys && h('span', { class: 'chip', text: 'keys / SAS' }), d.token && h('span', { class: 'chip', text: 'token' })),
-        h('td', { class: 'n', text: seg === 'things' ? (tw[d.id]?.lastActivityTime ? ago(tw[d.id].lastActivityTime) : '—') : d.expires ? when(d.expires) : 'never' }));
+        h('td', { class: 'n', text: seg === 'things' ? (tw[d.id]?.lastDataTime ? ago(tw[d.id].lastDataTime) : 'never') : d.expires ? when(d.expires) : 'never' }));
     });
     const heads = seg === 'things'
-      ? ['Device', 'Role', 'Status', 'Sensors', 'Credential', { text: 'Last activity', cls: 'n' }]
+      ? ['Device', 'Role', 'Status', 'Sensors', 'Credential', { text: 'Last data', cls: 'n' }]
       : ['User', 'Role', 'Status', 'Credential', { text: 'Expires', cls: 'n' }];
     box.replaceChildren(card(null, {}, src.length || t ? table(heads, rows, { empty: 'Nothing matches.' })
       : seg === 'things' ? empty('No devices yet', 'Add a device to get a connection string it can use over MQTT or HTTP.', !locked() && button('Add device', () => addIdentity('device'), { kind: 'primary', ico: 'plus' }))
@@ -113,7 +119,8 @@ async function detail(el, ctx, id, tab) {
   const reload = () => ctx.reload();
   el.append(pageHeader(d.id, {
     back: ['#/devices', 'Devices & access'],
-    sub: h('span', { class: 'page-sub' }, badge(label, tone), h('span', { class: 'chip', text: d.role }), d.note && h('span', { text: d.note })),
+    sub: h('span', { class: 'page-sub' }, badge(label, tone), thing && h('span', { text: twin?.lastDataTime ? 'last data ' + ago(twin.lastDataTime) : 'no data yet' }),
+      mqttChip(twin), h('span', { class: 'chip', text: d.role }), d.note && h('span', { text: d.note })),
     actions: !locked() && [
       button(d.disabled ? 'Enable' : 'Disable', async () => {
         if (!d.disabled && !await confirmDialog(`Disable ${d.id}?`, 'It is disconnected now and refused until enabled again. Its credentials are kept.', { ok: 'Disable' })) return;
@@ -142,6 +149,8 @@ async function detail(el, ctx, id, tab) {
       thing && h('dt', { text: 'Sensors' }), thing && h('dd', {}, (d.sensors || []).map((s) => h('span', { class: 'chip mono', text: s }))),
       h('dt', { text: 'Created' }), h('dd', { text: when(d.created) }),
       h('dt', { text: 'Expires' }), h('dd', { text: d.expires ? when(d.expires) : 'Never' }),
+      thing && h('dt', { text: 'Last data' }), thing && h('dd', { text: twin?.lastDataTime ? `${ago(twin.lastDataTime)} (${when(twin.lastDataTime)})` : 'Never' }),
+      thing && h('dt', { text: 'MQTT' }), thing && h('dd', { text: twin?.connectionState === 'Connected' ? 'Connected now' : 'No session now (HTTP devices never have one)' }),
       thing && h('dt', { text: 'Last activity' }), thing && h('dd', { text: twin?.lastActivityTime ? ago(twin.lastActivityTime) : '—' }))),
     card('Credentials', { sub: locked() ? 'Issued by the platform operator.' : 'Rotate one key while the device keeps using the other; tokens are replaced at once.' },
       h('dl', { class: 'dl' },

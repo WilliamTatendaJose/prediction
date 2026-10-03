@@ -342,7 +342,16 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	if s.OnIngest != nil {
 		s.OnIngest(rd)
 	}
+	id, _ := r.Context().Value(identityKey{}).(*auth.Identity)
+	s.noteData(id)
 	writeJSON(w, http.StatusAccepted, rd)
+}
+
+// noteData records "last data" on the sending device's twin.
+func (s *Server) noteData(id *auth.Identity) {
+	if s.Twins != nil && id != nil && (id.Role == auth.Device || id.Role == auth.Service) {
+		s.Twins.Data(id.ID)
+	}
 }
 
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {

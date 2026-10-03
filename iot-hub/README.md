@@ -906,7 +906,7 @@ The hub serves a single-page web app (no build step; plain JS modules embedded i
 
 | Page | Who | What |
 |---|---|---|
-| **Overview** | everyone | sensors reporting vs silent, unacknowledged alarms, devices connected over MQTT, messages today against the plan; the sensors that most need a look; active alarms; plan and usage (multi-tenant) |
+| **Overview** | everyone | sensors reporting vs silent, unacknowledged alarms, devices sending data (with how many are quiet, silent or never sent), messages today against the plan; the sensors that most need a look; active alarms; plan and usage (multi-tenant) |
 | **Dashboard** | everyone (admins edit) | the tenant's live tile layout. Edit, add tiles, reorder, save or discard |
 | **Alarms** | everyone (operators act) | active, last 7 days and shelved. Filter by text and kind. Acknowledge with a verdict and note, shelve with a reason, read and add notes |
 | **Sensors** | everyone (admins edit) | searchable list with latest values, freshness (Reporting / Quiet / Silent) and alarms. Each sensor has **Live** (a tile per field plus a live chart), **History** (1 h – 30 d with min–max band, optional forecast, statistics, time to limit), **Alarms** (30 days) and **Settings** (fields, limits, detection, calculated fields with a **Test** button, OEE) |
@@ -1037,6 +1037,10 @@ curl -X POST 'https://hub:8443/api/devices/pump-1/methods/reboot?timeout=30s' -H
 curl -X POST 'https://hub:8443/api/devices/pump-1/messages?ttl=1h' -H "$A" -d '{"cmd":"close-valve"}'
 curl https://hub:8443/api/devices/pump-1/messages -H "$A"            # queued / delivered / completed / expired / deadlettered
 ```
+
+**Last data.** Every twin carries `lastDataTime`: when the hub last accepted a reading from that identity, over MQTT, `POST …/data` or `/api/ingest/batch`. Refused readings don't count. The app's device status is based on it, using the same scale as sensors: **Sending data** under 2 minutes, **Quiet** under an hour, then **Silent**, or **Never sent data**. `connectionState` still says whether an MQTT session is open now; devices that send over HTTP never have one.
+- **Saving.** The time is saved with the twin at most once a minute (a reading can arrive many times a second). A normal shutdown saves the latest time; after a crash it can be up to a minute old.
+- **Tested** with a device sending over MQTT, one over HTTP and a service using batches, each with a time; plus a refused publish, an admin's reading, and a device that never sent, none of which get one. The same device id in another tenant was unaffected. Removing the MQTT hook fails the test. A unit test covers the once-a-minute save and the reload. In the browser, a device went from Sending data to Quiet after 2 minutes.
 
 **On the device, over MQTT.** Topics are under `devices/{id}/`, or `{tenant}/devices/{id}/` in multi-tenant mode. Subscribe to `devices/{id}/#`.
 

@@ -23,7 +23,7 @@ export function fieldSummary(s, max = 3) {
 }
 
 export async function render(el, ctx) {
-  const [sensors, activeList, recent, usage, devices, twins] = await Promise.all([
+  let [sensors, activeList, recent, usage, devices, twins] = await Promise.all([
     api('/api/sensors'),
     api('/api/anomalies?active=1&limit=1000').catch(() => []),
     api('/api/anomalies?from=-24h&limit=1000').catch(() => []),
@@ -47,6 +47,10 @@ export async function render(el, ctx) {
     const open = [...active.values()];
     const unacked = open.filter((a) => !a.ack).length;
     const things = (devices || []).filter((d) => d.role === 'device' || d.role === 'service');
+    const tw = Object.fromEntries(twins.map((t) => [t.deviceId, t]));
+    const live_ = things.filter((d) => !d.disabled && freshness(tw[d.id]?.lastDataTime, now)[1] === 'good').length;
+    const stale = things.filter((d) => !d.disabled && tw[d.id]?.lastDataTime && freshness(tw[d.id].lastDataTime, now)[1] !== 'good').length;
+    const never = things.filter((d) => !d.disabled && !tw[d.id]?.lastDataTime).length;
     const connected = twins.filter((t) => t.connectionState === 'Connected').length;
     kpis.replaceChildren(
       h('a', { class: 'kpi', href: '#/sensors' },
@@ -59,9 +63,10 @@ export async function render(el, ctx) {
         h('span', { class: 'kpi-foot' }, unacked ? badge('Needs attention', 'critical') : badge(open.length ? `${open.length} active, acknowledged` : 'All clear', open.length ? 'warning' : 'good'),
           `${plural(recent.length, 'alarm')} in 24 h`)),
       devices && h('a', { class: 'kpi', href: '#/devices' },
-        h('span', { class: 'kpi-label' }, icon('device'), 'Devices connected (MQTT)'),
-        h('span', { class: 'kpi-value' }, String(connected), h('small', { text: '/ ' + things.length })),
-        h('span', { class: 'kpi-foot', text: `Devices sending over HTTP count as not connected · ${plural(devices.length - things.length, 'user')}` })),
+        h('span', { class: 'kpi-label' }, icon('device'), 'Devices sending data'),
+        h('span', { class: 'kpi-value' }, String(live_), h('small', { text: '/ ' + things.length })),
+        h('span', { class: 'kpi-foot' }, stale ? badge(`${stale} quiet or silent`, 'warning') : null, never ? badge(`${never} never sent`, 'neutral') : null,
+          !stale && !never && things.length ? badge('All sending', 'good') : null, `${connected} on MQTT now`)),
       msgs != null && h('div', { class: 'kpi' },
         h('span', { class: 'kpi-label' }, icon('jobs'), 'Messages today'),
         h('span', { class: 'kpi-value', text: num(msgs) }),
@@ -162,6 +167,13 @@ export async function render(el, ctx) {
     if (u && ctx.current()) { Object.assign(usage, u); msgs = u.messagesToday; dirty = true; }
   }, 30000) : null;
   ctx.onLeave(() => clearInterval(usageTimer));
+  // Devices' last-data times live on the server (a reading on the stream
+  // doesn't say which device sent it): re-read every 30 s.
+  const twinTimer = devices ? setInterval(async () => {
+    const t = await api('/api/twins').catch(() => null);
+    if (t && ctx.current()) { twins = t; dirty = true; }
+  }, 30000) : null;
+  ctx.onLeave(() => clearInterval(twinTimer));
   const timer = setInterval(() => {
     if (!dirty || !ctx.current()) return;
     dirty = false;

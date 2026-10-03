@@ -292,3 +292,54 @@ func TestCloudToDeviceMessages(t *testing.T) {
 		t.Fatalf("reload: tags %v delivered %d of %d", v.Tags, delivered, len(ms))
 	}
 }
+
+// Last data: recorded per reading, saved at most once a minute, survives a
+// restart, and never invents a twin for an unknown identity.
+func TestLastData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s := New(path, func(id string) bool { return id == "pump-1" })
+	now := time.UnixMilli(1_000_000_000_000)
+	s.now = func() time.Time { return now }
+	pending := func() bool {
+		select {
+		case <-s.dirty:
+			return true
+		default:
+			return false
+		}
+	}
+	s.Data("ghost")
+	if _, err := s.Get("ghost"); err == nil || len(s.devs) != 0 {
+		t.Fatal("data from an unknown identity created a twin")
+	}
+	s.Data("pump-1")
+	if !pending() {
+		t.Fatal("first data did not ask for a save")
+	}
+	now = now.Add(30 * time.Second)
+	s.Data("pump-1")
+	if pending() {
+		t.Error("saved again within a minute")
+	}
+	v, _ := s.Get("pump-1")
+	if v.LastData != now.UnixMilli() || v.LastActivity != now.UnixMilli() {
+		t.Errorf("view %d/%d, want %d", v.LastData, v.LastActivity, now.UnixMilli())
+	}
+	now = now.Add(31 * time.Second)
+	s.Data("pump-1")
+	if !pending() {
+		t.Error("no save after a minute")
+	}
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(path, nil)
+	if err := r.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := r.Get("pump-1"); v.LastData != now.UnixMilli() {
+		t.Errorf("after restart %d, want %d", v.LastData, now.UnixMilli())
+	}
+	var nilSvc *Service
+	nilSvc.Data("pump-1") // a runtime without twins: no panic
+}

@@ -95,6 +95,7 @@ type rec struct {
 	DesiredAt   int64          `json:"desiredAt,omitempty"`
 	ReportedAt  int64          `json:"reportedAt,omitempty"`
 	Activity    int64          `json:"lastActivity,omitempty"`
+	LastData    int64          `json:"lastData,omitempty"` // last accepted reading from this identity
 	Messages    []*Message     `json:"messages,omitempty"`
 }
 
@@ -105,6 +106,7 @@ type View struct {
 	Version         int64          `json:"version"`
 	ConnectionState string         `json:"connectionState"`
 	LastActivity    int64          `json:"lastActivityTime,omitempty"`
+	LastData        int64          `json:"lastDataTime,omitempty"`
 	Tags            map[string]any `json:"tags"`
 	Properties      struct {
 		Desired  map[string]any `json:"desired"`
@@ -142,6 +144,7 @@ type Service struct {
 	pending map[string]*call
 	dirty   chan struct{}
 	now     func() time.Time
+	flushed int64 // when Data last asked for a save (ms)
 }
 
 func New(path string, exists func(string) bool) *Service {
@@ -256,7 +259,7 @@ func size(m map[string]any) int {
 }
 
 func (s *Service) viewLocked(id string, r *rec) View {
-	v := View{DeviceID: id, Version: r.Version, ETag: strconv.Quote(strconv.FormatInt(r.Version, 10)), Tags: r.Tags, LastActivity: r.Activity}
+	v := View{DeviceID: id, Version: r.Version, ETag: strconv.Quote(strconv.FormatInt(r.Version, 10)), Tags: r.Tags, LastActivity: r.Activity, LastData: r.LastData}
 	v.ConnectionState = "Disconnected"
 	if s.tr.Connected(id) {
 		v.ConnectionState = "Connected"
@@ -511,6 +514,33 @@ func (s *Service) Touch(id string) {
 		r.Activity = s.now().UnixMilli()
 	}
 	s.mu.Unlock()
+}
+
+// Data records that a reading from id was accepted (any transport). It is
+// called per reading, so it saves at most once a minute: after a restart
+// the time is at most a minute old.
+func (s *Service) Data(id string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	r := s.devs[id]
+	s.mu.Unlock()
+	if r == nil && s.Exists != nil && !s.Exists(id) {
+		return
+	}
+	now := s.now().UnixMilli()
+	s.mu.Lock()
+	r = s.recLocked(id)
+	r.LastData, r.Activity = now, now
+	save := now-s.flushed >= 60_000
+	if save {
+		s.flushed = now
+	}
+	s.mu.Unlock()
+	if save {
+		s.markDirty()
+	}
 }
 
 // Delete forgets a device (its identity was removed).

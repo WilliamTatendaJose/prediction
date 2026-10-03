@@ -139,6 +139,9 @@ func (s *Server) ingestBatch(w http.ResponseWriter, r *http.Request) {
 	if bid != "" {
 		s.batches.set(bid, line)
 	}
+	if accepted > 0 {
+		s.noteData(id)
+	}
 	writeJSON(w, status, map[string]any{"processed": line, "accepted": accepted, "rejected": rejected,
 		"duplicate": duplicate, "errors": errs})
 }
