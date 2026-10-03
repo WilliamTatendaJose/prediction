@@ -788,6 +788,7 @@ func (s *Service) Settle(id, mid, how string) error {
 // dead-letter state after MaxDeliveries) and delivers what is due.
 func (s *Service) Tick() {
 	now := s.now().UnixMilli()
+	s.tickBatches(now)
 	var redeliver []string
 	s.mu.Lock()
 	for id, r := range s.devs {

@@ -391,11 +391,11 @@ func TestBatchesPersist(t *testing.T) {
 	if _, err := s.SetCommand(Command{Name: "close", Kind: "message"}); err != nil {
 		t.Fatal(err)
 	}
-	done, err := s.RunBatch("close", "ana", []string{"v-1", "v-2", "ghost"}, map[string]string{"ops": "not a device you may command"}, nil)
+	done, err := s.RunBatch("close", "ana", []string{"v-1", "v-2", "ghost"}, map[string]string{"ops": "not a device you may command"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	running, err := s.RunBatch("reboot", "ana", []string{"p-1", "p-2"}, nil, nil)
+	running, err := s.RunBatch("reboot", "ana", []string{"p-1", "p-2"}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,4 +445,154 @@ func TestBatchesPersist(t *testing.T) {
 	if len(ms) != 1 || ms[0].Status != "queued" {
 		t.Fatalf("v-1 queue %+v", ms)
 	}
+}
+
+// Automatic retries: offline devices are tried again each interval until
+// they answer or the attempts run out; refusals are not retried; cancel
+// stops what is pending; a restart carries on.
+func TestBatchRetries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s, d := newSvc(t, path)
+	now := time.UnixMilli(1_000_000_000_000)
+	var mu sync.Mutex
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(dt time.Duration) { mu.Lock(); now = now.Add(dt); mu.Unlock() }
+	s.now = clock
+	d.onMethod = func(sub string, p []byte) {
+		s.HandleMQTT("pump-1", "methods/res/200/"+strings.Split(sub, "/")[2], []byte(`{"ok":true}`))
+	}
+	if _, err := s.SetCommand(Command{Name: "reboot", Kind: "method", Timeout: "1s", Retry: &RetryPolicy{Attempts: 2, Every: "1m"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetCommand(Command{Name: "close", Kind: "message", Retry: &RetryPolicy{Attempts: 2, Every: "1m"}}); err == nil {
+		t.Error("retries accepted on a message command")
+	}
+	if _, err := s.RunBatch("reboot", "ana", []string{"pump-1"}, nil, nil, &RetryPolicy{Attempts: 1, Every: "1s"}); err == nil {
+		t.Error("retry interval under 10s accepted")
+	}
+	settled := func(id string) Batch {
+		t.Helper()
+		for i := 0; i < 200; i++ {
+			b, _ := s.GetBatch(id)
+			s.mu.Lock()
+			busy := false
+			for _, x := range s.batches {
+				busy = busy || x.ID == id && x.running
+			}
+			s.mu.Unlock()
+			if !busy {
+				return b
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("round never ended")
+		return Batch{}
+	}
+	status := func(b Batch) map[string]string {
+		m := map[string]string{}
+		for _, r := range b.Results {
+			m[r.Device] = fmt.Sprintf("%s/%d", r.Status, r.Attempts)
+		}
+		return m
+	}
+
+	// Round 1: both offline (the command's default policy: 2 more attempts).
+	b, err := s.RunBatch("reboot", "ana", []string{"pump-1", "pump-2"}, nil, nil, nil)
+	if err != nil || b.Retry == nil || b.Retry.Attempts != 2 {
+		t.Fatalf("start %+v %v", b, err)
+	}
+	b = settled(b.ID)
+	if st := status(b); st["pump-1"] != "retrying/1" || st["pump-2"] != "retrying/1" || b.Finished != 0 || b.NextRetry != clock().Add(time.Minute).UnixMilli() {
+		t.Fatalf("after round 1: %v next %d finished %d", st, b.NextRetry, b.Finished)
+	}
+	s.Tick() // not due yet
+	if b, _ = s.GetBatch(b.ID); b.Round != 1 {
+		t.Fatal("retried before the interval")
+	}
+	// Round 2: pump-1 is back and answers; pump-2 is still offline.
+	d.mu.Lock()
+	d.listening = true
+	d.mu.Unlock()
+	advance(time.Minute)
+	s.Tick()
+	b = settled(b.ID)
+	if st := status(b); b.Round != 2 || st["pump-1"] != "ok/2" || st["pump-2"] != "retrying/2" || b.Done != 1 {
+		t.Fatalf("after round 2: %v round %d done %d", st, b.Round, b.Done)
+	}
+	// A restart while waiting: the batch carries on.
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := newSvc(t, path)
+	r.now = clock
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if rb, _ := r.GetBatch(b.ID); rb.Finished != 0 || status(rb)["pump-2"] != "retrying/2" || rb.NextRetry != b.NextRetry {
+		t.Fatalf("after restart %+v", rb)
+	}
+	// Round 3 (the last): pump-2 still offline → finished, offline/3.
+	advance(time.Minute)
+	s.Tick()
+	b = settled(b.ID)
+	if st := status(b); st["pump-2"] != "offline/3" || b.Finished == 0 || b.Round != 3 {
+		t.Fatalf("after the last round: %v finished %d", st, b.Finished)
+	}
+	runs := 0
+	for _, x := range s.Runs("pump-2") {
+		if x.Batch == b.ID {
+			runs++
+		}
+	}
+	if runs != 3 {
+		t.Errorf("pump-2 history has %d runs of the batch, want 3", runs)
+	}
+
+	// Refusals are final; cancel stops waiting retries.
+	d.onMethod = func(sub string, p []byte) {
+		s.HandleMQTT("pump-1", "methods/res/500/"+strings.Split(sub, "/")[2], []byte(`{"busy":true}`))
+	}
+	c := settled(must(s.RunBatch("reboot", "ana", []string{"pump-1", "pump-2"}, nil, nil, nil)).ID)
+	if st := status(c); st["pump-1"] != "failed/1" || st["pump-2"] != "retrying/1" {
+		t.Fatalf("refusal retried? %v", st)
+	}
+	c, err = s.CancelBatch(c.ID)
+	if st := status(c); err != nil || st["pump-2"] != "cancelled/1" || c.Finished == 0 || !c.Cancelled {
+		t.Fatalf("cancel %v %+v %v", st, c, err)
+	}
+	if _, err := s.CancelBatch(c.ID); err == nil {
+		t.Error("cancelled a finished batch")
+	}
+	// A restart in the middle of a round: the device being waited on is
+	// interrupted, and with attempts left it is retried after the interval.
+	d.onMethod = func(string, []byte) {} // listens, never answers
+	m := must(s.RunBatch("reboot", "ana", []string{"pump-1"}, nil, nil, nil))
+	time.Sleep(100 * time.Millisecond)
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := newSvc(t, path)
+	r2.now = clock
+	if err := r2.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	mb, _ := r2.GetBatch(m.ID)
+	if st := status(mb); st["pump-1"] != "retrying/1" || !mb.Interrupted || mb.Finished != 0 || mb.NextRetry != clock().Add(time.Minute).UnixMilli() ||
+		!strings.Contains(mb.Results[0].Error, "interrupted") {
+		t.Errorf("restart mid-round: %v %+v", st, mb)
+	}
+	settled(m.ID)
+
+	// Attempts 0 turns the command's default off.
+	n := settled(must(s.RunBatch("reboot", "ana", []string{"pump-2"}, nil, nil, &RetryPolicy{})).ID)
+	if n.Retry != nil || n.Finished == 0 || status(n)["pump-2"] != "offline/1" {
+		t.Errorf("no-retry batch %+v", n)
+	}
+}
+
+func must(b Batch, err error) Batch {
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

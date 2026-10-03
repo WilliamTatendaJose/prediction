@@ -234,8 +234,9 @@ func (s *Server) runBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Devices []string       `json:"devices"`
-		Params  map[string]any `json:"params"`
+		Devices []string          `json:"devices"`
+		Params  map[string]any    `json:"params"`
+		Retry   *twin.RetryPolicy `json:"retry"` // omitted: the command's default; attempts 0: none
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, twin.MaxMessageBody+64<<10))
 	dec.DisallowUnknownFields()
@@ -258,7 +259,7 @@ func (s *Server) runBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	run, skip := s.sortDevices(id, *c, req.Devices)
-	b, err := s.Twins.RunBatch(name, id.ID, run, skip, req.Params)
+	b, err := s.Twins.RunBatch(name, id.ID, run, skip, req.Params, req.Retry)
 	if err != nil {
 		storeErr(w, err)
 		return
@@ -355,4 +356,28 @@ func (s *Server) resendBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "command.resend", of.Command, fmt.Sprintf("batch %s → %s, %d devices", of.ID, b.ID, len(run)))
 	writeJSON(w, http.StatusAccepted, b)
+}
+
+// cancelBatch: POST /api/commands/batches/{batch}/cancel stops a batch's
+// pending automatic retries.
+func (s *Server) cancelBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.twinsOn(w) {
+		return
+	}
+	id := caller(r)
+	b, err := s.Twins.GetBatch(r.PathValue("batch"))
+	if err != nil {
+		storeErr(w, err)
+		return
+	}
+	if !id.Can(auth.Operate, "") && !id.Can(auth.Manage, "") && !(id.Role == auth.Service && b.By == id.ID) {
+		writeErr(w, http.StatusForbidden, errors.New("commands are for operators and admins"))
+		return
+	}
+	if b, err = s.Twins.CancelBatch(b.ID); err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	s.audit(r, "command.cancel", b.Command, "batch "+b.ID)
+	writeJSON(w, http.StatusOK, b)
 }

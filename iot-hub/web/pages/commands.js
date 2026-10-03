@@ -7,8 +7,8 @@ import {
 import { deviceFreshness } from './overview.js';
 
 const RUN_TONE = { ok: 'good', completed: 'good', queued: 'info', delivered: 'info', failed: 'critical', offline: 'warning',
-  timeout: 'warning', interrupted: 'warning', rejected: 'critical', deadlettered: 'critical', expired: 'warning', untracked: 'neutral' };
-const RUN_LABEL = { ok: 'Done', failed: 'Device refused', offline: 'Device offline', timeout: 'No answer', interrupted: 'Interrupted', queued: 'Queued',
+  timeout: 'warning', interrupted: 'warning', retrying: 'info', cancelled: 'neutral', rejected: 'critical', deadlettered: 'critical', expired: 'warning', untracked: 'neutral' };
+const RUN_LABEL = { ok: 'Done', failed: 'Device refused', offline: 'Device offline', timeout: 'No answer', interrupted: 'Interrupted', retrying: 'Will retry', cancelled: 'Retries cancelled', queued: 'Queued',
   delivered: 'Delivered', completed: 'Completed', rejected: 'Rejected', deadlettered: 'Undeliverable', expired: 'Expired', untracked: 'Sent' };
 export const runBadge = (r, text) => badge(text || RUN_LABEL[r.status] || r.status, RUN_TONE[r.status] || 'neutral');
 
@@ -141,16 +141,35 @@ export async function render(el, ctx) {
 
 // Send c to many devices: confirm (always: it touches many), then follow
 // the batch on its own page.
+// Retry controls: {el, read() → {attempts, every}}; attempts 0 = off.
+const EVERY = [['30s', '30 seconds'], ['1m', '1 minute'], ['5m', '5 minutes'], ['15m', '15 minutes'], ['1h', '1 hour']];
+function retryControls(p) {
+  const on = h('input', { type: 'checkbox', checked: !!p?.attempts });
+  const attempts = h('select', { 'aria-label': 'Retry attempts' }, [1, 2, 3, 5, 10].map((n) => opt(String(n), `${n} more time${n === 1 ? '' : 's'}`, n === (p?.attempts || 3))));
+  const every = h('select', { 'aria-label': 'Retry every' }, EVERY.map(([v, t]) => opt(v, 'every ' + t, v === (p?.every || '5m'))));
+  if (p?.every && !EVERY.some(([v]) => v === p.every)) every.append(opt(p.every, 'every ' + p.every, true));
+  const more = h('div', { class: 'row' }, attempts, every);
+  const sync = () => { more.hidden = !on.checked; };
+  on.onchange = sync; sync();
+  return {
+    el: h('div', { class: 'stack', style: 'gap:6px' }, field('Retry devices that are offline or don\'t answer', on, { cls: 'check' }), more,
+      h('span', { class: 'hint', text: 'Only offline, no answer, errors and restarts are retried; a device that refuses is not.' })),
+    read: () => (on.checked ? { attempts: Number(attempts.value), every: every.value } : { attempts: 0 }),
+  };
+}
+
 async function sendMany(c, devices) {
   const run = devices.filter((d) => d.commands.includes(c.name)).map((d) => d.id);
   const skipped = devices.length - run.length;
   const form = paramForm(c);
+  const retry = c.kind === 'method' ? retryControls(c.retry) : null;
   const list = run.slice(0, 12).join(', ') + (run.length > 12 ? ` and ${run.length - 12} more` : '');
   const b = await modal(`${cmdLabel(c)} on ${run.length} device${run.length === 1 ? '' : 's'}`, h('div', { class: 'stack' },
-    h('p', { class: 'modal-text', text: `This sends "${cmdLabel(c)}" to ${list}.${c.kind === 'message' ? ' Each is delivered when the device next listens.' : ' Offline devices are reported, not retried.'}` }),
+    h('p', { class: 'modal-text', text: `This sends "${cmdLabel(c)}" to ${list}.${c.kind === 'message' ? ' Each is delivered when the device next listens.' : ''}` }),
     skipped ? h('p', { class: 'hint', text: `${skipped} selected device${skipped === 1 ? ' does' : 's do'} not offer this command and will be skipped.` }) : null,
-    form.els), {
-    actions: [['Cancel'], [`Send to ${run.length}`, () => api(`/api/commands/${enc(c.name)}/run`, { method: 'POST', body: JSON.stringify({ devices: run, params: form.read() }) }),
+    form.els, retry?.el), {
+    actions: [['Cancel'], [`Send to ${run.length}`, () => api(`/api/commands/${enc(c.name)}/run`, { method: 'POST',
+      body: JSON.stringify({ devices: run, params: form.read(), ...(retry ? { retry: retry.read() } : {}) }) }),
       c.confirm ? 'danger' : 'primary']],
   });
   if (!b?.id) return;
@@ -162,7 +181,8 @@ function batchTable(batches) {
     h('td', { title: when(b.at), text: ago(b.at) }),
     h('td', {}, h('a', { href: '#/commands/batch/' + enc(b.id), text: b.label || b.command })),
     h('td', { text: b.by }),
-    h('td', { text: b.interrupted ? `interrupted, ${b.total} devices` : b.finished ? `done, ${b.total} devices` : `${b.done} of ${b.total}` }),
+    h('td', { text: b.finished ? `${b.cancelled ? 'cancelled' : b.interrupted ? 'interrupted' : 'done'}, ${b.total} devices`
+      : b.nextRetry ? `${b.done} of ${b.total}, retrying ${new Date(b.nextRetry).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : `${b.done} of ${b.total}` }),
     h('td', {}, countBadges(b.counts)))));
 }
 
@@ -171,7 +191,7 @@ function countBadges(counts) {
 }
 
 // Definite failures, resent by "Resend to failed" (twin.Retryable).
-const RETRYABLE = new Set(['offline', 'timeout', 'failed', 'error', 'interrupted', 'rejected', 'deadlettered', 'expired']);
+const RETRYABLE = new Set(['offline', 'timeout', 'failed', 'error', 'interrupted', 'cancelled', 'rejected', 'deadlettered', 'expired']);
 
 async function resend(b) {
   const failed = b.results.filter((r) => RETRYABLE.has(r.status));
@@ -199,28 +219,35 @@ async function batchView(el, ctx, id) {
     const link = (x, text) => h('a', { href: '#/commands/batch/' + enc(x), text });
     head.replaceChildren(pageHeader(`${b.label || b.command} on ${b.total} device${b.total === 1 ? '' : 's'}`, {
       back: ['#/commands/history', 'Commands'],
-      actions: b.finished && failed ? button(`Resend to ${failed} failed`, () => resend(b), { kind: 'primary' }) : null,
-      sub: h('span', { class: 'page-sub' }, b.interrupted ? badge('Interrupted by a restart', 'warning') : b.finished ? badge('Finished', 'good') : badge('Running', 'info'),
+      actions: b.finished && failed ? button(`Resend to ${failed} failed`, () => resend(b), { kind: 'primary' })
+        : !b.finished && b.retry && !b.cancelled ? button('Cancel retries', async () => {
+          if (!await confirmDialog('Cancel the remaining retries?', 'Devices waiting for another attempt are left as they are. Calls already in flight finish.', { ok: 'Cancel retries', danger: true })) return;
+          await api(`/api/commands/batches/${enc(b.id)}/cancel`, { method: 'POST' }); toast('Retries cancelled'); ctx.reload();
+        }) : null,
+      sub: h('span', { class: 'page-sub' }, b.cancelled ? badge('Retries cancelled', 'neutral') : b.finished ? (b.interrupted ? badge('Interrupted by a restart', 'warning') : badge('Finished', 'good'))
+          : b.nextRetry ? badge(`Retrying at ${new Date(b.nextRetry).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`, 'info') : badge('Running', 'info'),
+        b.retry && h('span', { class: 'chip', text: `round ${b.round} of ${b.retry.attempts + 1} · every ${b.retry.every}` }),
         h('span', { text: `sent by ${b.by} ${ago(b.at)}` }), b.params && Object.keys(b.params).length ? h('span', { class: 'chip mono', text: JSON.stringify(b.params) }) : null,
         b.retryOf ? h('span', {}, 'resend of ', link(b.retryOf, 'an earlier batch')) : null,
         b.retries?.length ? h('span', {}, 'resent: ', b.retries.map((x, i) => [i ? ', ' : '', link(x, `#${i + 1}`)])) : null),
     }));
-    const rank = { pending: 0, error: 1, failed: 2, offline: 3, timeout: 4, skipped: 6 };
+    const rank = { pending: 0, retrying: 0, error: 1, failed: 2, offline: 3, timeout: 4, skipped: 6 };
     const rows = [...b.results].sort((x, y) => (rank[x.status] ?? 5) - (rank[y.status] ?? 5) || x.device.localeCompare(y.device));
     body.replaceChildren(
       card(null, {}, h('div', { class: 'stack' },
         h('div', { class: 'row' }, h('b', { text: `${b.done} of ${b.total} done` }), h('span', { class: 'spacer' }), countBadges(b.counts)),
         meter(b.done, b.total, { tone: 'progress' }))), // a progress bar: never warning-coloured
-      card(null, {}, table(['Device', 'Result', 'Details'], rows.map((r) => h('tr', {},
+      card(null, {}, table(['Device', 'Result', ...(b.retry ? [{ text: 'Attempts', cls: 'n' }] : []), 'Details'], rows.map((r) => h('tr', {},
         h('td', {}, h('b', { text: r.device })),
         h('td', {}, r.status === 'pending' ? badge('Waiting…', 'info') : r.status === 'skipped' ? badge('Skipped', 'neutral') : runBadge(r)),
+        b.retry && h('td', { class: 'n', text: r.attempts || '' }),
         h('td', { class: 'mono', text: [r.code || '', r.error || ''].filter(Boolean).join(' ') }))))));
   };
   let b = await api('/api/commands/batches/' + enc(id));
   draw(b);
   // Follow it until every device has answered.
   while (!b.finished && ctx.current()) {
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, b.nextRetry ? 5000 : 1000)); // slower while waiting for a retry
     if (!ctx.current()) return;
     b = await api('/api/commands/batches/' + enc(id)).catch(() => b);
     draw(b);
@@ -255,8 +282,10 @@ async function editCommand(c, ctx) {
   payload.value = c.payload ? JSON.stringify(c.payload, null, 2) : '';
   const role = h('select', {}, opt('operator', 'Operators and admins', c.role !== 'admin'), opt('admin', 'Admins only', c.role === 'admin'));
   const confirm = h('input', { type: 'checkbox', checked: c.confirm });
+  const retry = retryControls(c.retry);
+  const retryField = h('div', {}, h('span', { class: 'field-label', text: 'Default for batches' }), retry.el);
   const methodField = field('Method name', method), timeoutField = field('Wait for the answer', timeout), ttlField = field('Delivery', ttl);
-  const syncKind = () => { methodField.hidden = timeoutField.hidden = kind.value !== 'method'; ttlField.hidden = kind.value !== 'message'; };
+  const syncKind = () => { methodField.hidden = timeoutField.hidden = retryField.hidden = kind.value !== 'method'; ttlField.hidden = kind.value !== 'message'; };
   kind.onchange = syncKind; syncKind();
 
   const params = h('tbody');
@@ -297,7 +326,8 @@ async function editCommand(c, ctx) {
       button('Add parameter', () => params.append(paramRow()), { kind: 'small', ico: 'plus' })),
     h('div', { class: 'tbl-wrap', style: 'margin:0;padding:0' }, h('table', { class: 'tbl fields' },
       h('thead', {}, h('tr', {}, ['Name', 'Label', 'Type', 'Range / choices', 'Default', 'Required', ''].map((x) => h('th', { text: x })))), params))),
-    h('div', { class: 'form-grid' }, field('Who may run it', role), h('div', { class: 'field', style: 'justify-content:end' }, field('Ask for confirmation', confirm, { cls: 'check' })))), {
+    h('div', { class: 'form-grid' }, field('Who may run it', role), h('div', { class: 'field', style: 'justify-content:end' }, field('Ask for confirmation', confirm, { cls: 'check' }))),
+    retryField), {
     wide: true,
     actions: [['Cancel'], ['Save command', async () => {
       let pl;
@@ -305,7 +335,10 @@ async function editCommand(c, ctx) {
       const body = { name: name.value.trim(), label: label.value.trim() || undefined, kind: kind.value,
         devices: devices.value.split(',').map((x) => x.trim()).filter(Boolean), payload: pl,
         params: [...params.children].map((r) => r.read()).filter((p) => p.name), role: role.value, confirm: confirm.checked || undefined };
-      if (kind.value === 'method') { body.method = method.value.trim() || undefined; body.timeout = timeout.value; } else body.ttl = ttl.value;
+      if (kind.value === 'method') {
+        body.method = method.value.trim() || undefined; body.timeout = timeout.value;
+        const r = retry.read(); if (r.attempts) body.retry = r;
+      } else body.ttl = ttl.value;
       if (!body.name) throw new Error('Give the command an id.');
       return put('/api/commands/' + enc(body.name), body);
     }, 'primary']],

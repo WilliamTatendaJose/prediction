@@ -158,6 +158,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/commands/{name}/run", s.requireAny(s.runBatch))
 	mux.HandleFunc("GET /api/commands/batches/{batch}", s.requireAny(s.getBatch))
 	mux.HandleFunc("POST /api/commands/batches/{batch}/resend", s.requireAny(s.resendBatch))
+	mux.HandleFunc("POST /api/commands/batches/{batch}/cancel", s.requireAny(s.cancelBatch))
 	mux.HandleFunc("GET /api/devices/{id}/commands", s.requireAny(s.deviceCommands))
 	mux.HandleFunc("POST /api/devices/{id}/commands/{name}", s.requireAny(s.runCommand)) // per command: see mayRun
 	mux.HandleFunc("PUT /api/devices/{id}/expected-interval", s.require(auth.Manage, s.setExpected))

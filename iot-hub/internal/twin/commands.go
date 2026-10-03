@@ -53,6 +53,7 @@ type Command struct {
 	TTL     string          `json:"ttl,omitempty"`     // message: how long it may wait to be delivered (default 1h)
 	Confirm bool            `json:"confirm,omitempty"` // ask "are you sure?" first
 	Role    string          `json:"role,omitempty"`    // who may run it: operator (default) | admin
+	Retry   *RetryPolicy    `json:"retry,omitempty"`   // default for batches (methods only)
 }
 
 // Run is one execution, kept in the device's history.
@@ -132,6 +133,15 @@ func (c *Command) validate() error {
 	}
 	if c.Role == "" {
 		c.Role = "operator"
+	}
+	if err := c.Retry.validate(); err != nil {
+		return err
+	}
+	if c.Retry != nil && c.Retry.Attempts == 0 {
+		c.Retry = nil
+	}
+	if c.Retry != nil && c.Kind != "method" {
+		return invalid("automatic retries are for direct methods; messages are redelivered by the queue")
 	}
 	if c.Role != "operator" && c.Role != "admin" {
 		return invalid("role: operator or admin")

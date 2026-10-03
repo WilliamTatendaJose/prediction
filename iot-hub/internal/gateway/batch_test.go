@@ -172,7 +172,45 @@ func TestCommandBatch(t *testing.T) {
 	if code, _, _ := call(t, "GET", s.url+"/api/commands/batches/"+id, view, ""); code != 403 {
 		t.Errorf("viewer read a batch: %d", code)
 	}
+	// Automatic retries through the API, and cancelling them.
+	issue(t, s, "acme", `{"id":"pump-9","role":"device","sensors":["pump-9"]}`) // offline
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"2s"}}`); code != 400 {
+		t.Errorf("retry every 2s accepted: %d", code)
+	}
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/close/run", op, `{"devices":["valve-1"],"retry":{"attempts":3,"every":"1m"}}`); code != 400 {
+		t.Errorf("retries on a message command accepted: %d", code)
+	}
+	code, rb, raw := call(t, "POST", s.url+"/api/commands/reboot/run", op, `{"devices":["pump-9"],"retry":{"attempts":3,"every":"10m"}}`)
+	if code != 202 {
+		t.Fatalf("retry batch %d %s", code, raw)
+	}
+	time.Sleep(300 * time.Millisecond)
+	_, rb, raw = call(t, "GET", s.url+"/api/commands/batches/"+rb["id"].(string), op, "")
+	if r0 := rb["results"].([]any)[0].(map[string]any); r0["status"] != "retrying" || rb["nextRetry"] == nil || rb["finished"] != nil {
+		t.Fatalf("waiting to retry: %s", raw)
+	}
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/batches/"+rb["id"].(string)+"/resend", op, ""); code != 409 {
+		t.Errorf("manual resend while retries are pending: %d", code)
+	}
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/batches/"+rb["id"].(string)+"/cancel", view, ""); code != 403 {
+		t.Errorf("viewer cancelled: %d", code)
+	}
+	code, rb, raw = call(t, "POST", s.url+"/api/commands/batches/"+rb["id"].(string)+"/cancel", op, "")
+	if r0 := rb["results"].([]any)[0].(map[string]any); code != 200 || r0["status"] != "cancelled" || rb["finished"] == nil {
+		t.Errorf("cancel %d %s", code, raw)
+	}
+	if code, _, _ := call(t, "POST", s.url+"/api/commands/batches/"+rb["id"].(string)+"/cancel", op, ""); code != 409 {
+		t.Errorf("cancel twice: %d", code)
+	}
+	// A device whose retries were cancelled can still be resent by hand.
+	if code, m, raw := call(t, "POST", s.url+"/api/commands/batches/"+rb["id"].(string)+"/resend", op, ""); code != 202 || !strings.Contains(raw, `"device":"pump-9"`) || m["retry"] == nil {
+		t.Errorf("resend after cancel %d %s", code, raw)
+	}
+
 	_, _, raw = call(t, "GET", s.url+"/api/audit?limit=50", adm, "")
+	if !strings.Contains(raw, `"command.cancel"`) {
+		t.Error("cancel not audited")
+	}
 	if !strings.Contains(raw, `"command.batch"`) {
 		t.Error("batch not audited")
 	}
