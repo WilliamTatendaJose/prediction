@@ -1,7 +1,7 @@
 // App shell: sign-in, navigation, tenant switcher, hash router, live status
 // and the alarm bell. Pages live in pages/*.js and are loaded on first visit.
 import {
-  $, h, icon, api, session, role, isSuper, canManage, multiTenant, hasTenant, tenantLabel, safeGet, safeSet,
+  $, h, icon, api, session, role, isSuper, canManage, canOperate, multiTenant, hasTenant, tenantLabel, safeGet, safeSet,
   whenSignedOut, Unauthorized, live, connectLive, disconnectLive, empty, linkButton, toast,
 } from './core.js';
 
@@ -13,6 +13,7 @@ const ROUTES = [
   { path: 'alarms', label: 'Alarms', icon: 'alarm', group: 'Monitor', tenant: true },
   { path: 'sensors', label: 'Sensors', icon: 'sensor', group: 'Assets', tenant: true },
   { path: 'devices', label: 'Devices & access', icon: 'device', group: 'Assets', tenant: true, show: canManage },
+  { path: 'commands', label: 'Commands', icon: 'command', group: 'Assets', tenant: true, show: canOperate },
   { path: 'jobs', label: 'Stream jobs', icon: 'jobs', group: 'Automate', tenant: true, show: canManage },
   { path: 'notifications', label: 'Notifications', icon: 'bell', group: 'Automate', tenant: true, show: canManage },
   { path: 'grafana', label: 'Grafana', icon: 'grafana', group: 'Analyze', tenant: true, show: () => canManage() && session.me.grafana },

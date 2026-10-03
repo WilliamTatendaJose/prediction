@@ -910,7 +910,8 @@ The hub serves a single-page web app (no build step; plain JS modules embedded i
 | **Dashboard** | everyone (admins edit) | the tenant's live tile layout. Edit, add tiles, reorder, save or discard |
 | **Alarms** | everyone (operators act) | active, last 7 days and shelved. Filter by text and kind. Acknowledge with a verdict and note, shelve with a reason, read and add notes |
 | **Sensors** | everyone (admins edit) | searchable list with latest values, freshness (Reporting / Quiet / Silent) and alarms. Each sensor has **Live** (a tile per field plus a live chart), **History** (1 h – 30 d with min–max band, optional forecast, statistics, time to limit), **Alarms** (30 days) and **Settings** (fields, limits, detection, calculated fields with a **Test** button, OEE) |
-| **Devices & access** | admins | devices and services, and people, as separate lists. Adding one shows its secrets once, then opens its page: details, credentials (show keys, 24 h SAS, rotate, replace token), where to connect (MQTT username and topics, HTTP URL), **Twin**, **Direct methods** and **Messages** |
+| **Devices & access** | admins | devices and services, and people, as separate lists. Adding one shows its secrets once, then opens its page: details (including the **expected interval**), credentials (show keys, 24 h SAS, rotate, replace token), where to connect (MQTT username and topics, HTTP URL), **Commands**, **Twin**, **Direct methods** and **Messages** |
+| **Commands** | operators and admins | send named commands to devices with one click (with parameters and confirmation where defined), the history of what was sent, by whom and the result; admins edit the **catalog** |
 | **Stream jobs** | admins | jobs with live counters; an editor with a dry run over 1 h – 7 d of history |
 | **Notifications** | admins | targets (health, test, remove), alarm rules, escalation levels, shift reports, time zone, webhook secret |
 | **Grafana** | admins, when set up | the tenant's Grafana link and users |
@@ -1041,6 +1042,42 @@ curl https://hub:8443/api/devices/pump-1/messages -H "$A"            # queued / 
 **Last data.** Every twin carries `lastDataTime`: when the hub last accepted a reading from that identity, over MQTT, `POST …/data` or `/api/ingest/batch`. Refused readings don't count. The app's device status is based on it, using the same scale as sensors: **Sending data** under 2 minutes, **Quiet** under an hour, then **Silent**, or **Never sent data**. `connectionState` still says whether an MQTT session is open now; devices that send over HTTP never have one.
 - **Saving.** The time is saved with the twin at most once a minute (a reading can arrive many times a second). A normal shutdown saves the latest time; after a crash it can be up to a minute old.
 - **Tested** with a device sending over MQTT, one over HTTP and a service using batches, each with a time; plus a refused publish, an admin's reading, and a device that never sent, none of which get one. The same device id in another tenant was unaffected. Removing the MQTT hook fails the test. A unit test covers the once-a-minute save and the reload. In the browser, a device went from Sending data to Quiet after 2 minutes.
+
+**Expected interval.** Set how often each device should send (`PUT /api/devices/{id}/expected-interval {"interval":"5m"}`, `""` clears; 1 s to 7 days; admins). The twin shows it as `expectedIntervalSec`, and the app marks the device **Overdue** once twice the interval has passed without data (at least interval + 30 s, for jitter). Without one, the default scale above applies.
+
+### Commands
+
+Named commands defined once per tenant and offered on every device whose id matches, so operators send "Reboot" or "Close valve" instead of writing JSON:
+
+```bash
+curl -X PUT https://hub:8443/api/commands/reboot -H "$A" -d '{"label":"Reboot","devices":["pump-*"],"kind":"method","timeout":"10s",
+  "confirm":true,"params":[{"name":"delay","label":"Delay (s)","type":"number","min":0,"max":60,"default":5}]}'
+curl -X PUT https://hub:8443/api/commands/set-valve -H "$A" -d '{"devices":["valve-*"],"kind":"message","ttl":"1h",
+  "payload":{"cmd":"valve"},"params":[{"name":"position","type":"choice","choices":["open","closed"],"required":true}]}'
+curl -X POST https://hub:8443/api/devices/pump-1/commands/reboot -H "$OP" -d '{"params":{"delay":3}}'
+#   → {"status":"ok","code":200,"result":{…},"by":"shift","payload":{"delay":3},…}
+curl https://hub:8443/api/devices/pump-1/commands -H "$OP"     # what you may run there, and its last 50 runs
+curl https://hub:8443/api/commands -H "$OP"                    # catalog, devices with their commands, recent runs
+```
+
+- **Kinds.** A command is either a **direct method**, which runs now and waits for the device's answer, or a **message**, queued until the device listens.
+- **Payload.** It is the fixed `payload`, plus each parameter as a key. Parameters are typed: `number` with min/max, `text`, `bool` or `choice`, with defaults and `required`. Unknown parameters and out-of-range values are refused with 400.
+- **Who may run it.** Admins define and edit commands. `role: "operator"` (the default) lets operators run the command; `"admin"` keeps it to admins. Operators can't send raw methods or messages, so the catalog is exactly what they can do to devices.
+- **Outcomes are recorded, not errors.** An offline device, no answer in time, or the device refusing (status ≥ 400) is saved as such and returned with 200. A message run shows the message's current status (queued, delivered, completed, rejected …).
+- **History.** Each device keeps its last 50 runs; they are audited as `command.run`. The catalog is kept in `commands.json` next to the twins.
+- **Tested:**
+  - a real MQTT device answering a command;
+  - defaults applied;
+  - range, unknown-parameter and required-parameter errors;
+  - an operator refused an admin-only command, a viewer refused, a command refused on a device it doesn't apply to and on a person, and another tenant refused;
+  - history order and audit entries;
+  - the catalog and history surviving a restart.
+
+  In the browser:
+  - an admin defined both commands in the UI;
+  - an operator ran Reboot on `devicesim` (answered 200), and an out-of-range delay was refused in the dialog;
+  - Set valve went from queued to Completed when the device acknowledged it;
+  - an operator sees no catalog editing.
 
 **On the device, over MQTT.** Topics are under `devices/{id}/`, or `{tenant}/devices/{id}/` in multi-tenant mode. Subscribe to `devices/{id}/#`.
 

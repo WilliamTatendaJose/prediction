@@ -152,6 +152,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/devices/{id}/methods/{method}", s.require(auth.Control, s.invokeMethod))
 	mux.HandleFunc("POST /api/devices/{id}/messages", s.require(auth.Control, s.sendMessage))
 	mux.HandleFunc("GET /api/devices/{id}/messages", s.require(auth.Control, s.listMessages))
+	mux.HandleFunc("GET /api/commands", s.requireAny(s.listCommands))
+	mux.HandleFunc("PUT /api/commands/{name}", s.require(auth.Manage, s.putCommand))
+	mux.HandleFunc("DELETE /api/commands/{name}", s.require(auth.Manage, s.deleteCommand))
+	mux.HandleFunc("GET /api/devices/{id}/commands", s.requireAny(s.deviceCommands))
+	mux.HandleFunc("POST /api/devices/{id}/commands/{name}", s.requireAny(s.runCommand)) // per command: see mayRun
+	mux.HandleFunc("PUT /api/devices/{id}/expected-interval", s.require(auth.Manage, s.setExpected))
 	mux.HandleFunc("GET /api/device/twin", s.requireAny(s.deviceTwin))
 	mux.HandleFunc("PATCH /api/device/twin/reported", s.requireAny(s.deviceReport))
 	mux.HandleFunc("GET /api/device/messages", s.requireAny(s.deviceReceive))

@@ -299,7 +299,7 @@ func Open(parent context.Context, id string, o Options) (*Runtime, error) {
 
 	// Device twins, direct methods and cloud-to-device messages.
 	r.Twins = twin.New(o.TwinsPath, o.Creds.Exists)
-	if err := r.Twins.Load(); err != nil {
+	if err := r.Twins.LoadAll(); err != nil {
 		return fail(err)
 	}
 	if h.SendToDevice != nil {

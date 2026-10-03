@@ -95,7 +95,9 @@ type rec struct {
 	DesiredAt   int64          `json:"desiredAt,omitempty"`
 	ReportedAt  int64          `json:"reportedAt,omitempty"`
 	Activity    int64          `json:"lastActivity,omitempty"`
-	LastData    int64          `json:"lastData,omitempty"` // last accepted reading from this identity
+	LastData    int64          `json:"lastData,omitempty"`    // last accepted reading from this identity
+	ExpectedSec int64          `json:"expectedSec,omitempty"` // how often it should send data; 0 = not set
+	Runs        []Run          `json:"runs,omitempty"`        // command history, oldest first
 	Messages    []*Message     `json:"messages,omitempty"`
 }
 
@@ -107,6 +109,7 @@ type View struct {
 	ConnectionState string         `json:"connectionState"`
 	LastActivity    int64          `json:"lastActivityTime,omitempty"`
 	LastData        int64          `json:"lastDataTime,omitempty"`
+	Expected        int64          `json:"expectedIntervalSec,omitempty"`
 	Tags            map[string]any `json:"tags"`
 	Properties      struct {
 		Desired  map[string]any `json:"desired"`
@@ -145,6 +148,9 @@ type Service struct {
 	dirty   chan struct{}
 	now     func() time.Time
 	flushed int64 // when Data last asked for a save (ms)
+
+	cmds    map[string]Command // the command catalog (commands.go)
+	cmdSave sync.Mutex
 }
 
 func New(path string, exists func(string) bool) *Service {
@@ -259,7 +265,7 @@ func size(m map[string]any) int {
 }
 
 func (s *Service) viewLocked(id string, r *rec) View {
-	v := View{DeviceID: id, Version: r.Version, ETag: strconv.Quote(strconv.FormatInt(r.Version, 10)), Tags: r.Tags, LastActivity: r.Activity, LastData: r.LastData}
+	v := View{DeviceID: id, Version: r.Version, ETag: strconv.Quote(strconv.FormatInt(r.Version, 10)), Tags: r.Tags, LastActivity: r.Activity, LastData: r.LastData, Expected: r.ExpectedSec}
 	v.ConnectionState = "Disconnected"
 	if s.tr.Connected(id) {
 		v.ConnectionState = "Connected"
@@ -893,6 +899,14 @@ func (s *Service) Load() error {
 		}
 	}
 	return nil
+}
+
+// LoadAll reads the twins and the command catalog.
+func (s *Service) LoadAll() error {
+	if err := s.Load(); err != nil {
+		return err
+	}
+	return s.loadCommands()
 }
 
 func (s *Service) save() error {

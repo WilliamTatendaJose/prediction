@@ -1,10 +1,11 @@
 // Devices & access: every device, service and person with a credential;
 // one page per identity (credentials, twin, direct methods, messages).
 import {
-  h, api, post, patch, del, enc, pageHeader, card, badge, empty, table, tabs, field, opt, button, icon, linkButton,
+  h, api, post, put, patch, del, enc, pageHeader, card, badge, empty, table, tabs, field, opt, button, icon, linkButton,
   modal, confirmDialog, showSecrets, session, isSuper, multiTenant, tenantId, when, ago, toast,
 } from '../core.js';
-import { freshness } from './overview.js';
+import { deviceFreshness, every } from './overview.js';
+import { commandButtons, historyTable } from './commands.js';
 
 const THINGS = ['device', 'service'];
 const ROLE_INFO = {
@@ -17,15 +18,13 @@ const ROLE_INFO = {
 // Without self-service the platform operator issues credentials.
 const locked = () => !isSuper() && multiTenant() && !session.me.deviceSelfService;
 
-// A device's state is its last accepted reading (any transport), on the
-// same scale as sensors: under 2 min sending, under 1 h quiet, else silent.
+// A device's state is its last accepted reading (any transport), against
+// its expected interval when one is set (see deviceFreshness).
 function status(d, twin) {
   if (d.disabled) return ['Disabled', 'neutral'];
   if (d.expires && d.expires < Date.now()) return ['Expired', 'critical'];
   if (!THINGS.includes(d.role)) return ['Active', 'good'];
-  if (!twin?.lastDataTime) return ['Never sent data', 'neutral'];
-  const [label, tone] = freshness(twin.lastDataTime);
-  return [label === 'Reporting' ? 'Sending data' : label, tone];
+  return deviceFreshness(twin?.lastDataTime, twin?.expectedIntervalSec);
 }
 const mqttChip = (twin) => (twin?.connectionState === 'Connected' ? h('span', { class: 'chip', title: 'Has an MQTT session now', text: 'MQTT connected' }) : null);
 
@@ -53,7 +52,8 @@ async function list(el, ctx, seg) {
         h('td', {}, badge(label, tone), seg === 'things' && mqttChip(tw[d.id])),
         seg === 'things' && h('td', {}, (d.sensors || []).map((p) => h('span', { class: 'chip mono', text: p }))),
         h('td', {}, d.keys && h('span', { class: 'chip', text: 'keys / SAS' }), d.token && h('span', { class: 'chip', text: 'token' })),
-        h('td', { class: 'n', text: seg === 'things' ? (tw[d.id]?.lastDataTime ? ago(tw[d.id].lastDataTime) : 'never') : d.expires ? when(d.expires) : 'never' }));
+        h('td', { class: 'n' }, seg === 'things' ? [tw[d.id]?.lastDataTime ? ago(tw[d.id].lastDataTime) : 'never',
+          tw[d.id]?.expectedIntervalSec ? h('div', { class: 'hint', text: 'every ' + every(tw[d.id].expectedIntervalSec) }) : null] : d.expires ? when(d.expires) : 'never'));
     });
     const heads = seg === 'things'
       ? ['Device', 'Role', 'Status', 'Sensors', 'Credential', { text: 'Last data', cls: 'n' }]
@@ -112,7 +112,7 @@ async function detail(el, ctx, id, tab) {
   if (!d) { el.append(pageHeader(id, { back: ['#/devices', 'Devices & access'] }), empty('Not found', `"${id}" has no credential in this tenant.`, linkButton('All devices', '#/devices'))); return; }
   const thing = THINGS.includes(d.role);
   const twin = thing ? await api('/api/twins/' + enc(id)).catch(() => null) : null;
-  tab = (thing ? ['overview', 'twin', 'methods', 'messages'] : ['overview']).includes(tab) ? tab : 'overview';
+  tab = (thing ? ['overview', 'commands', 'twin', 'methods', 'messages'] : ['overview']).includes(tab) ? tab : 'overview';
   ctx.crumbs([[d.id]]);
   const [label, tone] = status(d, twin);
   const p = '/api/devices/' + enc(id);
@@ -132,9 +132,10 @@ async function detail(el, ctx, id, tab) {
       }, { kind: 'danger' }),
     ],
   }));
-  if (thing) el.append(tabs([['overview', 'Overview'], ['twin', 'Twin'], ['methods', 'Direct methods'], ['messages', 'Messages']], tab, (k) => { location.hash = `#/devices/${enc(id)}/${k}`; }));
+  if (thing) el.append(tabs([['overview', 'Overview'], ['commands', 'Commands'], ['twin', 'Twin'], ['methods', 'Direct methods'], ['messages', 'Messages']], tab, (k) => { location.hash = `#/devices/${enc(id)}/${k}`; }));
   const body = h('div');
   el.append(body);
+  if (tab === 'commands') return commandsTab(body, ctx, id);
   if (tab === 'twin') return twinTab(body, ctx, id, twin);
   if (tab === 'methods') return methodsTab(body, id, twin);
   if (tab === 'messages') return messagesTab(body, id);
@@ -149,6 +150,8 @@ async function detail(el, ctx, id, tab) {
       thing && h('dt', { text: 'Sensors' }), thing && h('dd', {}, (d.sensors || []).map((s) => h('span', { class: 'chip mono', text: s }))),
       h('dt', { text: 'Created' }), h('dd', { text: when(d.created) }),
       h('dt', { text: 'Expires' }), h('dd', { text: d.expires ? when(d.expires) : 'Never' }),
+      thing && h('dt', { text: 'Expected every' }), thing && h('dd', {}, twin?.expectedIntervalSec ? every(twin.expectedIntervalSec) : 'Not set',
+        ' ', button('Change', () => expectedDialog(id, twin?.expectedIntervalSec, reload), { kind: 'small ghost' })),
       thing && h('dt', { text: 'Last data' }), thing && h('dd', { text: twin?.lastDataTime ? `${ago(twin.lastDataTime)} (${when(twin.lastDataTime)})` : 'Never' }),
       thing && h('dt', { text: 'MQTT' }), thing && h('dd', { text: twin?.connectionState === 'Connected' ? 'Connected now' : 'No session now (HTTP devices never have one)' }),
       thing && h('dt', { text: 'Last activity' }), thing && h('dd', { text: twin?.lastActivityTime ? ago(twin.lastActivityTime) : '—' }))),
@@ -175,6 +178,33 @@ async function detail(el, ctx, id, tab) {
       h('dt', { text: 'HTTP' }), h('dd', { class: 'mono', text: `POST ${location.protocol}//${host}${location.port ? ':' + location.port : ''}/api/sensors/{sensor}/data` }),
       h('dt', { text: 'Twin, methods, messages' }), h('dd', { class: 'mono', text: `${multiTenant() ? (d.tenant || tenantId()) + '/' : ''}devices/${d.id}/#` }))));
   }
+}
+
+async function expectedDialog(id, cur, reload) {
+  const presets = [['', 'Not set (Quiet after 2 min, Silent after 1 h)'], ['10s', '10 seconds'], ['30s', '30 seconds'], ['1m', '1 minute'],
+    ['5m', '5 minutes'], ['15m', '15 minutes'], ['1h', '1 hour'], ['6h', '6 hours'], ['24h', '24 hours'], ['custom', 'Other…']];
+  const curText = cur ? (cur % 3600 === 0 ? cur / 3600 + 'h' : cur % 60 === 0 ? cur / 60 + 'm' : cur + 's') : '';
+  const sel = h('select', {}, presets.map(([v, t]) => opt(v, t, v === curText)));
+  const custom = h('input', { placeholder: 'e.g. 90s, 2m, 12h', value: curText });
+  const customField = field('Interval', custom, { hint: 'A duration from 1s to 7 days' });
+  if (curText && !presets.some(([v]) => v === curText)) sel.value = 'custom';
+  const sync = () => { customField.hidden = sel.value !== 'custom'; };
+  sel.onchange = sync; sync();
+  const ok = await modal('How often does ' + id + ' send data?', h('div', { class: 'stack' },
+    h('p', { class: 'modal-text', text: 'The device shows as Overdue once twice this interval passes without data (at least the interval plus 30 seconds).' }),
+    field('Expected interval', sel), customField), {
+    actions: [['Cancel'], ['Save', () => put(`/api/devices/${enc(id)}/expected-interval`, { interval: sel.value === 'custom' ? custom.value.trim() : sel.value }), 'primary']],
+  });
+  if (ok) { toast('Expected interval saved'); reload(); }
+}
+
+async function commandsTab(body, ctx, id) {
+  const r = await api(`/api/devices/${enc(id)}/commands`);
+  body.append(
+    card('Send a command', { sub: 'Commands come from the catalog on the Commands page.' },
+      r.commands.length ? commandButtons(id, r.commands, () => ctx.reload())
+        : empty('No commands for this device', 'Define one under Commands, with a device pattern that matches it.', h('a', { class: 'btn', href: '#/commands/catalog' }, 'Open the catalog'))),
+    card('History', { sub: 'The last 50 commands sent to this device.' }, historyTable(r.history)));
 }
 
 const pretty = (o) => JSON.stringify(o, null, 2);

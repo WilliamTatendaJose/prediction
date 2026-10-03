@@ -57,7 +57,7 @@ export async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers, credentials: 'same-origin' });
   if (res.status === 401) { for (const fn of onUnauthorized) fn(); throw new Unauthorized('Sign in to continue.'); }
   const body = res.status === 204 ? null : await res.json().catch(() => null);
-  if (!res.ok) { const e = new Error(body?.error || res.statusText || 'Request failed'); e.status = res.status; throw e; }
+  if (!res.ok) { const e = new Error(String(body?.error || res.statusText || 'Request failed').replace(/^invalid: /, '')); e.status = res.status; throw e; }
   return body;
 }
 const json = (method) => (path, obj) => api(path, { method, body: JSON.stringify(obj ?? {}) });
@@ -113,6 +113,7 @@ const PATHS = {
   tenants: 'M3 21V7l9-4 9 4v14M9 21v-6h6v6M8 10h.01M12 10h.01M16 10h.01',
   system: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z',
   menu: 'M3 6h18M3 12h18M3 18h18',
+  command: 'M4 17l6-6-6-6M12 19h8',
   close: 'M18 6 6 18M6 6l12 12',
   sun: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
   logout: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',

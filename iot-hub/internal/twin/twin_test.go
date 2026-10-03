@@ -343,3 +343,32 @@ func TestLastData(t *testing.T) {
 	var nilSvc *Service
 	nilSvc.Data("pump-1") // a runtime without twins: no panic
 }
+
+// The catalog and each device's command history survive a restart.
+func TestCommandsPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "twins.json")
+	s := New(path, func(id string) bool { return id == "valve-1" })
+	if _, err := s.SetCommand(Command{Name: "close", Kind: "message", Payload: json.RawMessage(`{"cmd":"close"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.RunCommand(context.Background(), "valve-1", "close", "ana", nil)
+	if err != nil || run.Status != "queued" {
+		t.Fatalf("run %+v %v", run, err)
+	}
+	if _, err := s.RunCommand(context.Background(), "ghost", "close", "ana", nil); err == nil {
+		t.Error("ran on an unknown device")
+	}
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(path, func(string) bool { return true })
+	if err := r.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if cs := r.Commands(); len(cs) != 1 || cs[0].Role != "operator" {
+		t.Errorf("catalog after restart %+v", cs)
+	}
+	if h := r.Runs("valve-1"); len(h) != 1 || h[0].By != "ana" || h[0].Status != "queued" {
+		t.Errorf("history after restart %+v", h)
+	}
+}

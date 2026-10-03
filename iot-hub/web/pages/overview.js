@@ -14,6 +14,26 @@ export function freshness(lastSeen, now = Date.now()) {
   return ['Silent', 'critical'];
 }
 
+// A device's state from its last data. With an expected interval it is
+// overdue once twice the interval has passed (at least interval + 30 s, for
+// jitter); without one, the sensor scale above applies.
+export function deviceFreshness(lastData, expectedSec, now = Date.now()) {
+  if (!lastData) return ['Never sent data', 'neutral'];
+  if (expectedSec) {
+    const late = now - lastData > Math.max(2 * expectedSec, expectedSec + 30) * 1000;
+    return late ? ['Overdue', 'critical'] : ['Sending data', 'good'];
+  }
+  const [label, tone] = freshness(lastData, now);
+  return [label === 'Reporting' ? 'Sending data' : label, tone];
+}
+export function every(sec) {
+  if (!sec) return '';
+  if (sec % 86400 === 0) return sec / 86400 + ' d';
+  if (sec % 3600 === 0) return sec / 3600 + ' h';
+  if (sec % 60 === 0) return sec / 60 + ' min';
+  return sec + ' s';
+}
+
 export function fieldSummary(s, max = 3) {
   const f = s.fields || {};
   return Object.keys(s.last || {}).sort().slice(0, max).map((k) => {
@@ -48,8 +68,9 @@ export async function render(el, ctx) {
     const unacked = open.filter((a) => !a.ack).length;
     const things = (devices || []).filter((d) => d.role === 'device' || d.role === 'service');
     const tw = Object.fromEntries(twins.map((t) => [t.deviceId, t]));
-    const live_ = things.filter((d) => !d.disabled && freshness(tw[d.id]?.lastDataTime, now)[1] === 'good').length;
-    const stale = things.filter((d) => !d.disabled && tw[d.id]?.lastDataTime && freshness(tw[d.id].lastDataTime, now)[1] !== 'good').length;
+    const st = (d) => deviceFreshness(tw[d.id]?.lastDataTime, tw[d.id]?.expectedIntervalSec, now)[1];
+    const live_ = things.filter((d) => !d.disabled && st(d) === 'good').length;
+    const stale = things.filter((d) => !d.disabled && tw[d.id]?.lastDataTime && st(d) !== 'good').length;
     const never = things.filter((d) => !d.disabled && !tw[d.id]?.lastDataTime).length;
     const connected = twins.filter((t) => t.connectionState === 'Connected').length;
     kpis.replaceChildren(
@@ -65,7 +86,7 @@ export async function render(el, ctx) {
       devices && h('a', { class: 'kpi', href: '#/devices' },
         h('span', { class: 'kpi-label' }, icon('device'), 'Devices sending data'),
         h('span', { class: 'kpi-value' }, String(live_), h('small', { text: '/ ' + things.length })),
-        h('span', { class: 'kpi-foot' }, stale ? badge(`${stale} quiet or silent`, 'warning') : null, never ? badge(`${never} never sent`, 'neutral') : null,
+        h('span', { class: 'kpi-foot' }, stale ? badge(`${stale} overdue, quiet or silent`, 'warning') : null, never ? badge(`${never} never sent`, 'neutral') : null,
           !stale && !never && things.length ? badge('All sending', 'good') : null, `${connected} on MQTT now`)),
       msgs != null && h('div', { class: 'kpi' },
         h('span', { class: 'kpi-label' }, icon('jobs'), 'Messages today'),
