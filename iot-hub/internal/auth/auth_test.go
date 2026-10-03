@@ -1,8 +1,9 @@
-package auth
+﻿package auth
 
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -73,7 +74,9 @@ func TestStoreLifecycle(t *testing.T) {
 		t.Fatal("wrong token accepted")
 	}
 	b, _ := os.ReadFile(p)
-	if st, _ := os.Stat(p); st.Mode().Perm() != 0o600 {
+	// Windows has no POSIX mode bits (access is by ACL), and Go reports 0666
+	// there whatever the file was created with.
+	if st, _ := os.Stat(p); runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("file mode %v", st.Mode().Perm())
 	}
 	if contains(b, tok) {

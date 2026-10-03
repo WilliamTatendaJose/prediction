@@ -1,4 +1,4 @@
-package backup
+﻿package backup
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -161,7 +162,8 @@ func TestSchedulerRotation(t *testing.T) {
 	}
 	fi, _ := os.Stat(filepath.Join(s.Dir, want[1]))
 	di, _ := os.Stat(s.Dir)
-	if fi.Mode().Perm() != 0o600 || di.Mode().Perm() != 0o700 {
+	// Windows has no POSIX mode bits (access is by ACL).
+	if runtime.GOOS != "windows" && (fi.Mode().Perm() != 0o600 || di.Mode().Perm() != 0o700) {
 		t.Errorf("modes %v %v", fi.Mode(), di.Mode())
 	}
 	var c Config

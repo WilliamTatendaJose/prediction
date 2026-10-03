@@ -1,4 +1,4 @@
-package gateway_test
+﻿package gateway_test
 
 import (
 	"encoding/json"
@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -90,8 +91,13 @@ func TestTenantSettings(t *testing.T) {
 	}
 	// Stored per tenant, private, and reloaded after a restart.
 	p := filepath.Join(s.dir, "tenants", "acme", "settings.json")
-	if st, err := os.Stat(p); err != nil || st.Mode().Perm() != 0o600 {
+	fi, err := os.Stat(p)
+	if err != nil {
 		t.Fatalf("settings file: %v", err)
+	}
+	// Windows has no POSIX mode bits (access is by ACL).
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Fatalf("settings file mode %v, want 0600", fi.Mode().Perm())
 	}
 	call(t, "PATCH", s.url+"/api/admin/tenants/acme", super, `{"status":"suspended"}`)
 	call(t, "PATCH", s.url+"/api/admin/tenants/acme", super, `{"status":"active"}`)
